@@ -31,7 +31,7 @@ pub enum Prefilter {
         max_lookback: usize,
     },
     /// Multi-byte literal prefix search using memmem.
-    Literal(memchr::memmem::Finder<'static>),
+    Literal(Box<memchr::memmem::Finder<'static>>),
     /// Pattern starts with a digit (0-9). Uses memchr to find digit positions.
     StartsWithDigit,
     /// Multi-pattern search using aho-corasick packed searcher (for prefix candidates).
@@ -112,7 +112,7 @@ impl Prefilter {
             if !prefix.is_empty() {
                 // Use memchr's memmem for single literal search
                 let finder = memchr::memmem::Finder::new(prefix).into_owned();
-                return Self::Literal(finder);
+                return Self::Literal(Box::new(finder));
             }
             return Self::None;
         }
@@ -172,7 +172,7 @@ impl Prefilter {
                     // Scalar fallback: search for any digit
                     slice
                         .iter()
-                        .position(|&b| b >= b'0' && b <= b'9')
+                        .position(|&b| b.is_ascii_digit())
                         .map(|i| pos + i)
                 }
             }
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_literal_prefilter() {
         let finder = memchr::memmem::Finder::new(b"world").into_owned();
-        let pf = Prefilter::Literal(finder);
+        let pf = Prefilter::Literal(Box::new(finder));
         assert_eq!(pf.find_candidate(b"hello world", 0), Some(6));
         assert_eq!(pf.find_candidate(b"hello world", 7), None);
     }

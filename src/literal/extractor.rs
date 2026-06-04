@@ -95,14 +95,8 @@ fn starts_with_digit_class(expr: &HirExpr) -> bool {
             }
             false
         }
-        HirExpr::Repeat(rep) => {
-            // Repeat of digits still starts with digit
-            if rep.min > 0 {
-                starts_with_digit_class(&rep.expr)
-            } else {
-                false
-            }
-        }
+        // Repeat of digits still starts with digit
+        HirExpr::Repeat(rep) if rep.min > 0 => starts_with_digit_class(&rep.expr),
         HirExpr::Capture(cap) => starts_with_digit_class(&cap.expr),
         _ => false,
     }

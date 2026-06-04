@@ -250,15 +250,11 @@ impl Thread {
         let mut current = self.capture_head.as_ref();
         while let Some(node) = current {
             match &node.action {
-                CaptureAction::Start(idx, pos) if *idx == group_idx => {
-                    if start.is_none() {
-                        start = Some(*pos);
-                    }
+                CaptureAction::Start(idx, pos) if *idx == group_idx && start.is_none() => {
+                    start = Some(*pos);
                 }
-                CaptureAction::End(idx, pos) if *idx == group_idx => {
-                    if end.is_none() {
-                        end = Some(*pos);
-                    }
+                CaptureAction::End(idx, pos) if *idx == group_idx && end.is_none() => {
+                    end = Some(*pos);
                 }
                 _ => {}
             }

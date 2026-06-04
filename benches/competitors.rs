@@ -14,7 +14,8 @@
 
 mod utils;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use std::time::Duration;
 use utils::test_data::{generate_unicode_data, get_test_data};
 

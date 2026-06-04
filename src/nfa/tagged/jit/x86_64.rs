@@ -211,11 +211,8 @@ impl TaggedNfaJitCompiler {
             for step in alt_steps.iter() {
                 match step {
                     // Nested alternation - supported via recursive emit
-                    PatternStep::Alt(inner_alts) => {
-                        // Recursively check nested alternation
-                        if Self::has_unsupported_in_alt(inner_alts) {
-                            return true;
-                        }
+                    PatternStep::Alt(inner_alts) if Self::has_unsupported_in_alt(inner_alts) => {
+                        return true;
                     }
                     // Non-greedy patterns not supported in alternation JIT
                     PatternStep::NonGreedyPlus(_, _) | PatternStep::NonGreedyStar(_, _) => {
