@@ -267,6 +267,7 @@ fn emit_dispatch(
 }
 
 /// Analyzes if a state has a self-loop pattern suitable for fast-forward optimization.
+#[allow(clippy::type_complexity)]
 fn analyze_self_loop(
     state: &MaterializedState,
 ) -> Option<(Vec<(u8, u8)>, Vec<(u8, u8, DfaStateId)>)> {

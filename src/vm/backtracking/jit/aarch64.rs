@@ -259,7 +259,7 @@ impl BacktrackingCompiler {
                 ; ldrb w0, [x19, x21]
 
                 // Compare with expected byte
-                ; cmp w0, #(byte as u32)
+                ; cmp w0, #byte as u32
                 ; b.ne =>self.backtrack_label
 
                 // Advance position
@@ -289,16 +289,16 @@ impl BacktrackingCompiler {
             if start == end {
                 dynasm!(self.asm
                     ; .arch aarch64
-                    ; cmp w0, #(start as u32)
+                    ; cmp w0, #start as u32
                     ; b.eq =>match_ok
                 );
             } else {
                 let next_range = self.asm.new_dynamic_label();
                 dynasm!(self.asm
                     ; .arch aarch64
-                    ; cmp w0, #(start as u32)
+                    ; cmp w0, #start as u32
                     ; b.lo =>next_range
-                    ; cmp w0, #(end as u32)
+                    ; cmp w0, #end as u32
                     ; b.ls =>match_ok
                     ; =>next_range
                 );
@@ -428,7 +428,7 @@ impl BacktrackingCompiler {
             if let Some(max_val) = max {
                 dynasm!(self.asm
                     ; .arch aarch64
-                    ; cmp x25, #(max_val as u32)
+                    ; cmp x25, #max_val
                     ; b.hs =>loop_done
                 );
             }
@@ -496,7 +496,7 @@ impl BacktrackingCompiler {
 
             // Update capture end if inside a capture
             if let Some(cap_idx) = self.current_capture {
-                let end_offset = (cap_idx as u32) * 16 + 8;
+                let end_offset = cap_idx * 16 + 8;
                 if end_offset < 4096 {
                     dynasm!(self.asm
                         ; .arch aarch64
@@ -507,7 +507,7 @@ impl BacktrackingCompiler {
 
             dynasm!(self.asm
                 ; .arch aarch64
-                ; cmp x25, #(min as u32)
+                ; cmp x25, #min
                 ; b.lo =>self.backtrack_label
                 ; b =>loop_done
             );
@@ -521,7 +521,7 @@ impl BacktrackingCompiler {
                 );
             }
 
-            if max.map_or(true, |m| m > min) {
+            if max.is_none_or(|m| m > min) {
                 let loop_start = self.asm.new_dynamic_label();
                 let try_more = self.asm.new_dynamic_label();
 
@@ -533,7 +533,7 @@ impl BacktrackingCompiler {
                 if let Some(max_val) = max {
                     dynasm!(self.asm
                         ; .arch aarch64
-                        ; cmp x25, #(max_val as u32)
+                        ; cmp x25, #max_val
                         ; b.hs =>loop_done
                     );
                 }
@@ -564,7 +564,7 @@ impl BacktrackingCompiler {
         dynasm!(self.asm
             ; .arch aarch64
             ; =>loop_done
-            ; cmp x25, #(min as u32)
+            ; cmp x25, #min
             ; b.lo =>self.backtrack_label
         );
 
@@ -595,7 +595,7 @@ impl BacktrackingCompiler {
 
     /// Emits code for a capture group.
     fn emit_capture(&mut self, index: u32, expr: &HirExpr) -> Result<()> {
-        let start_offset = (index as u32) * 16;
+        let start_offset = index * 16;
         let end_offset = start_offset + 8;
 
         // Record start position
@@ -626,7 +626,7 @@ impl BacktrackingCompiler {
 
     /// Emits code for a backreference.
     fn emit_backref(&mut self, group: u32) -> Result<()> {
-        let start_offset = (group as u32) * 16;
+        let start_offset = group * 16;
         let end_offset = start_offset + 8;
         let backref_ok = self.asm.new_dynamic_label();
 

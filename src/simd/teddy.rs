@@ -248,13 +248,13 @@ impl Teddy {
 
     /// Scalar search starting from a base offset.
     fn find_scalar_from(&self, haystack: &[u8], base_offset: usize) -> Option<(usize, usize)> {
-        for (i, window) in haystack.windows(1).enumerate() {
+        for i in 0..haystack.len() {
             let pos = base_offset + i;
 
             // Quick nibble check (x86_64 only - uses precomputed nibble tables)
             #[cfg(target_arch = "x86_64")]
             let pattern_mask = {
-                let first_byte = window[0];
+                let first_byte = haystack[i];
                 self.lo_nibble_table[(first_byte & 0x0F) as usize]
                     & self.hi_nibble_table[(first_byte >> 4) as usize]
             };

@@ -38,7 +38,9 @@ pub(super) struct TaggedNfaJitCompiler {
     match_found_label: dynasmrt::DynamicLabel,
     done_label: dynasmrt::DynamicLabel,
     add_thread_label: dynasmrt::DynamicLabel,
+    #[allow(clippy::vec_box)]
     codepoint_classes: Vec<Box<CodepointClass>>,
+    #[allow(clippy::vec_box)]
     lookaround_nfas: Vec<Box<Nfa>>,
 }
 
@@ -122,10 +124,8 @@ impl TaggedNfaJitCompiler {
         for alt_steps in alternatives {
             for step in alt_steps {
                 match step {
-                    PatternStep::Alt(inner) => {
-                        if Self::has_unsupported_in_alt(inner) {
-                            return true;
-                        }
+                    PatternStep::Alt(inner) if Self::has_unsupported_in_alt(inner) => {
+                        return true;
                     }
                     PatternStep::NonGreedyPlus(_, _) | PatternStep::NonGreedyStar(_, _) => {
                         return true;
@@ -154,9 +154,7 @@ impl TaggedNfaJitCompiler {
             | PatternStep::GreedyPlusLookahead(_, _, _)
             | PatternStep::GreedyStarLookahead(_, _, _)
             | PatternStep::Backref(_) => true,
-            PatternStep::Alt(alts) => alts
-                .iter()
-                .any(|a| a.iter().any(|s| Self::step_consumes_input(s))),
+            PatternStep::Alt(alts) => alts.iter().any(|a| a.iter().any(Self::step_consumes_input)),
             _ => false,
         }
     }
@@ -474,7 +472,8 @@ impl TaggedNfaJitCompiler {
         extern "C" fn check_membership(cp: u32, cls: *const CodepointClass) -> bool {
             unsafe { &*cls }.contains(cp)
         }
-        let fn_ptr = check_membership as usize as u64;
+        let check_fn: extern "C" fn(u32, *const CodepointClass) -> bool = check_membership;
+        let fn_ptr = check_fn as usize as u64;
         let cpclass_ptr_u64 = cpclass_ptr as u64;
 
         // Split 64-bit pointers into 16-bit chunks for movz/movk (ARM64 requirement)
@@ -920,7 +919,7 @@ impl TaggedNfaJitCompiler {
                 }
                 PatternStep::GreedyPlus(bc) => {
                     let remaining = &steps[si + 1..];
-                    let needs_bt = remaining.iter().any(|s| Self::step_consumes_input(s));
+                    let needs_bt = remaining.iter().any(Self::step_consumes_input);
                     if needs_bt {
                         self.emit_greedy_plus_with_backtracking(
                             &bc.ranges,
@@ -940,7 +939,7 @@ impl TaggedNfaJitCompiler {
                 }
                 PatternStep::GreedyStar(bc) => {
                     let remaining = &steps[si + 1..];
-                    let needs_bt = remaining.iter().any(|s| Self::step_consumes_input(s));
+                    let needs_bt = remaining.iter().any(Self::step_consumes_input);
                     if needs_bt {
                         self.emit_greedy_star_with_backtracking(
                             &bc.ranges,
@@ -962,7 +961,7 @@ impl TaggedNfaJitCompiler {
                 }
                 PatternStep::GreedyCodepointPlus(cp) => {
                     let remaining = &steps[si + 1..];
-                    let needs_bt = remaining.iter().any(|s| Self::step_consumes_input(s));
+                    let needs_bt = remaining.iter().any(Self::step_consumes_input);
                     if needs_bt {
                         self.emit_greedy_codepoint_plus_with_backtracking(
                             cp,
@@ -1743,8 +1742,7 @@ impl TaggedNfaJitCompiler {
                 if !state.transitions.iter().all(|(_, t)| *t == target) {
                     return Vec::new();
                 }
-                let ranges: Vec<ByteRange> =
-                    state.transitions.iter().map(|(r, _)| r.clone()).collect();
+                let ranges: Vec<ByteRange> = state.transitions.iter().map(|(r, _)| *r).collect();
                 let ts = &self.nfa.states[target as usize];
                 if ts.epsilon.len() == 2 && ts.transitions.is_empty() {
                     let (e0, e1) = (ts.epsilon[0], ts.epsilon[1]);
@@ -1808,7 +1806,7 @@ impl TaggedNfaJitCompiler {
                             let t = pst.transitions[0].1;
                             if pst.transitions.iter().all(|(_, tt)| *tt == t) {
                                 let ranges: Vec<ByteRange> =
-                                    pst.transitions.iter().map(|(r, _)| r.clone()).collect();
+                                    pst.transitions.iter().map(|(r, _)| *r).collect();
                                 let exit = e0s.epsilon[0];
                                 if let Some(suf) = self.extract_single_step(exit) {
                                     steps.push(PatternStep::NonGreedyStar(
@@ -1879,8 +1877,7 @@ impl TaggedNfaJitCompiler {
                 if !state.transitions.iter().all(|(_, tt)| *tt == t) {
                     return Vec::new();
                 }
-                let ranges: Vec<ByteRange> =
-                    state.transitions.iter().map(|(r, _)| r.clone()).collect();
+                let ranges: Vec<ByteRange> = state.transitions.iter().map(|(r, _)| *r).collect();
                 let ts = &inner.states[t as usize];
                 if ts.transitions.is_empty() && ts.epsilon.len() == 2 {
                     let (e0, e1) = (ts.epsilon[0], ts.epsilon[1]);
@@ -1969,7 +1966,7 @@ impl TaggedNfaJitCompiler {
         if !ls.transitions.iter().all(|(_, tt)| *tt == t) {
             return None;
         }
-        let ranges: Vec<ByteRange> = ls.transitions.iter().map(|(r, _)| r.clone()).collect();
+        let ranges: Vec<ByteRange> = ls.transitions.iter().map(|(r, _)| *r).collect();
         let ts = &inner.states[t as usize];
         if ts.epsilon.len() == 1 {
             let back = ts.epsilon[0];
@@ -2115,8 +2112,7 @@ impl TaggedNfaJitCompiler {
                 if !state.transitions.iter().all(|(_, tt)| *tt == t) {
                     return None;
                 }
-                let ranges: Vec<ByteRange> =
-                    state.transitions.iter().map(|(r, _)| r.clone()).collect();
+                let ranges: Vec<ByteRange> = state.transitions.iter().map(|(r, _)| *r).collect();
                 return if ranges.len() == 1 && ranges[0].start == ranges[0].end {
                     Some(PatternStep::Byte(ranges[0].start))
                 } else {
