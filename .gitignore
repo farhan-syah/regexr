@@ -20,8 +20,6 @@ CLAUDE.md
 .DS_Store
 Thumbs.db
 
-# Cargo lock (library crate)
-Cargo.lock
 
 .python-version
 .cargo
