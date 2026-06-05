@@ -17,16 +17,24 @@ use crate::nfa::StateId;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-/// Thread scheduled for a future position (used for backrefs).
+/// Thread scheduled for a future input position.
+///
+/// Threads are popped in `(pos ascending, seq ascending)` order. `seq` is a
+/// monotonic counter assigned in priority order when the thread is scheduled, so
+/// among threads landing at the same position the higher-priority (lower `seq`)
+/// one is processed first. This is what gives the VM correct leftmost-first
+/// semantics across both fixed-width (byte) and variable-width (codepoint)
+/// transitions — they share one priority-ordered queue.
 #[derive(Debug)]
 pub struct PendingThread {
     pub pos: usize,
+    pub seq: u64,
     pub thread: Thread,
 }
 
 impl PartialEq for PendingThread {
     fn eq(&self, other: &Self) -> bool {
-        self.pos == other.pos
+        self.pos == other.pos && self.seq == other.seq
     }
 }
 
@@ -40,8 +48,12 @@ impl PartialOrd for PendingThread {
 
 impl Ord for PendingThread {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse because BinaryHeap is a max-heap, we want min position first
-        other.pos.cmp(&self.pos)
+        // BinaryHeap is a max-heap but we want the smallest (pos, seq) first, so
+        // reverse: order by position ascending, then by seq (priority) ascending.
+        other
+            .pos
+            .cmp(&self.pos)
+            .then_with(|| other.seq.cmp(&self.seq))
     }
 }
 
@@ -49,16 +61,18 @@ impl Ord for PendingThread {
 /// Reusing this context across multiple captures() calls avoids repeated allocations.
 #[derive(Debug)]
 pub struct PikeVmContext {
-    /// Thread storage for current position
+    /// Thread storage for the position currently being processed.
     pub current_threads: Vec<Thread>,
-    /// Thread storage for next position
-    pub next_threads: Vec<Thread>,
-    /// Threads waiting for future positions (for backrefs)
+    /// Threads scheduled for future positions, ordered by `(position, seq)`. All
+    /// consuming transitions (byte and codepoint) flow through this single queue.
     pub future_threads: BinaryHeap<PendingThread>,
     /// O(1) deduplication: `visited[state_id] == generation` means state already visited
     pub visited: Vec<usize>,
     /// Current generation counter (incremented per position/step)
     pub generation: usize,
+    /// Monotonic priority sequence assigned to scheduled threads. Lower = higher
+    /// priority. Assigned in priority order so the queue stays leftmost-first.
+    pub seq_counter: u64,
     /// Capture slot storage (reused across calls)
     #[allow(dead_code)]
     pub capture_slots: Vec<Option<(usize, usize)>>,
@@ -76,10 +90,10 @@ impl PikeVmContext {
     pub fn new(capture_count: usize, state_count: usize) -> Self {
         Self {
             current_threads: Vec::with_capacity(32),
-            next_threads: Vec::with_capacity(32),
             future_threads: BinaryHeap::new(),
             visited: vec![0; state_count],
             generation: 0,
+            seq_counter: 0,
             capture_slots: vec![None; capture_count + 1],
             epsilon_stack: Vec::with_capacity(32),
             lookaround_cache: HashMap::new(),
@@ -90,13 +104,13 @@ impl PikeVmContext {
     #[inline]
     pub fn reset(&mut self) {
         self.current_threads.clear();
-        self.next_threads.clear();
         self.future_threads.clear();
         self.epsilon_stack.clear();
         // Don't clear visited or reset generation - the sparse set approach
         // relies on keeping generation incrementing to invalidate old entries.
         // Just increment once to ensure fresh start
         self.generation = self.generation.wrapping_add(1);
+        self.seq_counter = 0;
         for slot in &mut self.capture_slots {
             *slot = None;
         }
@@ -155,9 +169,6 @@ pub struct Thread {
     pub capture_head: Option<Arc<CaptureNode>>,
     /// Number of capture groups (needed for reconstruction).
     pub capture_count: usize,
-    /// Whether this thread passed through a non-greedy exit.
-    /// If true, a match found by this thread should be returned immediately.
-    pub non_greedy_exit: bool,
 }
 
 impl Thread {
@@ -168,7 +179,6 @@ impl Thread {
             state,
             capture_head: None,
             capture_count,
-            non_greedy_exit: false,
         }
     }
 
@@ -179,7 +189,6 @@ impl Thread {
             state,
             capture_head: self.capture_head.clone(), // Rc::clone is O(1)
             capture_count: self.capture_count,
-            non_greedy_exit: self.non_greedy_exit,
         }
     }
 
@@ -274,19 +283,12 @@ impl Thread {
 
 /// Result of processing an instruction during epsilon closure.
 pub enum InstructionResult {
-    /// Continue with epsilon transitions at current position
+    /// Continue with epsilon transitions at the current position.
     Continue,
-    /// Thread should be killed (assertion failed)
+    /// Thread should be killed (assertion failed).
     Kill,
-    /// Thread should jump to a different position (for backrefs)
+    /// Thread should jump to a different position (for backrefs).
     Jump(usize),
-    /// Mark thread as having passed through a non-greedy exit
-    NonGreedyExit,
-    /// Transition to target state after consuming `bytes_consumed` bytes (for CodepointClass)
-    CodepointTransition {
-        bytes_consumed: usize,
-        target: StateId,
-    },
 }
 
 /// Decodes a single UTF-8 codepoint from a byte slice.

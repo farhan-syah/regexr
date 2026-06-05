@@ -47,6 +47,10 @@ impl PikeVm {
     /// Finds the first match, returning (start, end).
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
         for start in 0..=input.len() {
+            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+            if !crate::nfa::is_utf8_boundary(input, start) {
+                continue;
+            }
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));
             }
@@ -57,6 +61,9 @@ impl PikeVm {
     /// Returns capture groups for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         for start in 0..=input.len() {
+            if !crate::nfa::is_utf8_boundary(input, start) {
+                continue;
+            }
             if let Some(captures) = self.captures_at(input, start) {
                 return Some(captures);
             }
@@ -116,188 +123,119 @@ impl PikeVm {
 
         let capture_count = self.nfa.capture_count as usize;
 
-        // Initialize with start state
-        let initial_thread = Thread::new(self.nfa.start, capture_count);
-
-        // Start new generation for initial epsilon closure
-        ctx.generation += 1;
-        self.add_thread_optimized(ctx, initial_thread, input, start_pos);
+        // Schedule the initial thread. All threads — whether they advance by a byte
+        // or by a multi-byte codepoint — flow through a single priority-ordered
+        // queue keyed on (position, seq). `seq` is assigned in priority order as
+        // threads are scheduled, so at any position the highest-priority thread is
+        // processed first. Greedy vs non-greedy is encoded entirely in the NFA's
+        // epsilon ordering (preserved by the closure), so no special non-greedy
+        // bookkeeping is needed here.
+        let seq = ctx.seq_counter;
+        ctx.seq_counter += 1;
+        ctx.future_threads.push(PendingThread {
+            pos: start_pos,
+            seq,
+            thread: Thread::new(self.nfa.start, capture_count),
+        });
 
         let mut matched: Option<Vec<Option<(usize, usize)>>> = None;
-        let mut pos = start_pos;
 
-        // Main loop: process positions until we run out of threads
-        while pos <= input.len() {
-            // Move threads from heap to current if scheduled for this position
-            // Need fresh generation for threads joining at this position
-            let mut has_future_threads_at_pos = false;
-            while let Some(pt) = ctx.future_threads.peek() {
-                if pt.pos == pos {
-                    if !has_future_threads_at_pos {
-                        // First future thread at this position - start new generation
-                        ctx.generation += 1;
-                        has_future_threads_at_pos = true;
-                    }
-                    let pt = ctx.future_threads.pop().unwrap();
-                    // Add thread from future - instruction already processed, just need to
-                    // add to current_threads and follow epsilon transitions
-                    self.add_future_thread(ctx, pt.thread, input, pos);
-                } else if pt.pos < pos {
-                    // Should not happen, but safe cleanup
-                    ctx.future_threads.pop();
-                } else {
-                    break; // All remaining threads are for future positions
-                }
+        // Buffer for the consuming successors scheduled at each position.
+        let mut sched: Vec<(usize, Thread)> = Vec::new();
+
+        // Copy `pos` out of the peeked thread so the borrow ends before the body
+        // pops from / pushes to `future_threads` below.
+        while let Some(pos) = ctx.future_threads.peek().map(|pt| pt.pos) {
+            if pos > input.len() {
+                break;
             }
 
-            if ctx.current_threads.is_empty() {
-                // If we have no threads now, but have future threads, jump forward
-                if let Some(pt) = ctx.future_threads.peek() {
-                    pos = pt.pos;
-                    continue;
-                } else {
-                    break; // No work left
-                }
+            // Fresh generation for per-position state deduplication.
+            ctx.generation = ctx.generation.wrapping_add(1);
+            ctx.current_threads.clear();
+
+            // Drain every thread scheduled for this position. The heap yields them
+            // in (seq) priority order; the epsilon closure expands each into
+            // `current_threads`, preserving that order.
+            while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                let pt = ctx.future_threads.pop().unwrap();
+                self.add_thread(ctx, pt.thread, input, pos);
             }
 
+            // The first (highest-priority) thread to reach a match wins at this
+            // position and preempts every lower-priority thread. A higher-priority
+            // thread that is still consuming may overwrite this match at a later
+            // position (it comes from a more-preferred path).
+            let match_idx = ctx
+                .current_threads
+                .iter()
+                .position(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false));
+            if let Some(i) = match_idx {
+                let mut caps = ctx.current_threads[i].reconstruct_captures();
+                caps[0] = Some((start_pos, pos));
+                matched = Some(caps);
+            }
+            // Only threads strictly higher priority than the match advance.
+            let limit = match_idx.unwrap_or(ctx.current_threads.len());
+
+            // Schedule consuming successors in priority order so `seq` keeps
+            // reflecting pattern priority. A state may consume a byte (byte-range
+            // transitions) or a codepoint (`CodepointClass` instruction).
             let byte = input.get(pos).copied();
-
-            // Find match threads and process transitions
-            let mut match_thread_idx: Option<usize> = None;
-
-            for (idx, thread) in ctx.current_threads.iter().enumerate() {
+            sched.clear();
+            for thread in &ctx.current_threads[..limit] {
                 let state = match self.nfa.get(thread.state) {
                     Some(s) => s,
                     None => continue,
                 };
-
-                if state.is_match {
-                    match match_thread_idx {
-                        None => match_thread_idx = Some(idx),
-                        Some(existing_idx) => {
-                            // Prefer non-greedy exit thread
-                            if thread.non_greedy_exit
-                                && !ctx.current_threads[existing_idx].non_greedy_exit
-                            {
-                                match_thread_idx = Some(idx);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Handle match
-            if let Some(idx) = match_thread_idx {
-                let thread = &ctx.current_threads[idx];
-                if thread.non_greedy_exit {
-                    // Reconstruct captures from linked list (only done on match)
-                    let mut caps = thread.reconstruct_captures();
-                    caps[0] = Some((start_pos, pos));
-                    return Some(caps);
-                }
-                // Greedy: record but continue
-                let mut caps = thread.reconstruct_captures();
-                caps[0] = Some((start_pos, pos));
-                matched = Some(caps);
-            }
-
-            // New generation for next position
-            ctx.generation += 1;
-            ctx.next_threads.clear();
-
-            // Process byte transitions - collect next threads first to avoid borrow conflict
-            if let Some(b) = byte {
-                // Collect threads that need transitions
-                let mut next_states: Vec<Thread> = Vec::new();
-
-                for thread in &ctx.current_threads {
-                    let state = match self.nfa.get(thread.state) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-
+                if let Some(b) = byte {
                     for (range, target) in &state.transitions {
                         if range.contains(b) {
-                            next_states.push(thread.clone_with_state(*target));
+                            sched.push((pos + 1, thread.clone_with_state(*target)));
                         }
                     }
                 }
-
-                // Now process the collected threads
-                for next_thread in next_states {
-                    self.add_thread_to_next(ctx, next_thread, input, pos + 1);
+                if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
+                    if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
+                        if cpclass.contains(cp) {
+                            sched.push((pos + len, thread.clone_with_state(*target)));
+                        }
+                    }
                 }
             }
-
-            // Swap current and next
-            std::mem::swap(&mut ctx.current_threads, &mut ctx.next_threads);
-            pos += 1;
+            for (npos, th) in sched.drain(..) {
+                let seq = ctx.seq_counter;
+                ctx.seq_counter += 1;
+                ctx.future_threads.push(PendingThread {
+                    pos: npos,
+                    seq,
+                    thread: th,
+                });
+            }
         }
 
         matched
     }
 
-    /// Add a thread that jumped from a future position (e.g., backref).
-    /// The instruction has already been processed, so we just add to current_threads
-    /// and follow epsilon transitions.
-    #[inline]
-    fn add_future_thread(&self, ctx: &mut PikeVmContext, thread: Thread, input: &[u8], pos: usize) {
-        let state_id = thread.state as usize;
-
-        // O(1) deduplication check
-        if ctx.visited.get(state_id).copied() == Some(ctx.generation) {
-            return;
-        }
-
-        // Mark as visited
-        if state_id < ctx.visited.len() {
-            ctx.visited[state_id] = ctx.generation;
-        }
-
-        let state = match self.nfa.get(thread.state) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Add to current threads (instruction already processed)
-        ctx.current_threads.push(thread.clone());
-
-        // Follow epsilon transitions - push to stack and process iteratively
-        for &next_id in &state.epsilon {
-            ctx.epsilon_stack.push(thread.clone_with_state(next_id));
-        }
-        self.process_epsilon_stack_current(ctx, input, pos);
-    }
-
-    /// Optimized thread addition with O(1) deduplication.
-    /// Uses iterative epsilon closure to avoid stack overflow on deep epsilon chains.
-    #[inline]
-    fn add_thread_optimized(
-        &self,
-        ctx: &mut PikeVmContext,
-        thread: Thread,
-        input: &[u8],
-        pos: usize,
-    ) {
-        // Push initial thread and process the stack iteratively
+    /// Epsilon closure for one seed thread at `pos`, adding all reachable states
+    /// to `ctx.current_threads` in priority order.
+    ///
+    /// Epsilons are pushed onto the LIFO stack in REVERSE order so the first
+    /// (highest-priority) epsilon is popped first — preserving the leftmost-first
+    /// ordering that encodes greedy vs non-greedy. A `CodepointClass` state is a
+    /// *consuming* state (like a byte-transition state): it rests in
+    /// `current_threads` and the caller performs the consume, so the closure does
+    /// not follow it. Backreferences (`Jump`) schedule their continuations into
+    /// the shared priority queue.
+    fn add_thread(&self, ctx: &mut PikeVmContext, thread: Thread, input: &[u8], pos: usize) {
         ctx.epsilon_stack.push(thread);
-        self.process_epsilon_stack_current(ctx, input, pos);
-    }
-
-    /// Process the epsilon stack, adding threads to current_threads.
-    /// This is the core iterative epsilon closure implementation.
-    #[inline]
-    fn process_epsilon_stack_current(&self, ctx: &mut PikeVmContext, input: &[u8], pos: usize) {
         while let Some(mut thread) = ctx.epsilon_stack.pop() {
             let state_id = thread.state as usize;
 
-            // O(1) deduplication check
+            // O(1) per-generation deduplication: highest-priority arrival wins.
             if ctx.visited.get(state_id).copied() == Some(ctx.generation) {
-                // State already visited in this generation
                 continue;
             }
-
-            // Mark as visited
             if state_id < ctx.visited.len() {
                 ctx.visited[state_id] = ctx.generation;
             }
@@ -307,7 +245,16 @@ impl PikeVm {
                 None => continue,
             };
 
-            // Handle instructions
+            // A codepoint class consumes input; rest here and let the caller do the
+            // consume (so byte and codepoint consumption share one priority queue).
+            if matches!(
+                state.instruction,
+                Some(NfaInstruction::CodepointClass(_, _))
+            ) {
+                ctx.current_threads.push(thread);
+                continue;
+            }
+
             if let Some(ref instruction) = state.instruction {
                 let current_state_id = thread.state;
                 match self.process_instruction(
@@ -320,125 +267,26 @@ impl PikeVm {
                 ) {
                     InstructionResult::Continue => {}
                     InstructionResult::Kill => continue,
-                    InstructionResult::NonGreedyExit => {
-                        thread.non_greedy_exit = true;
-                    }
                     InstructionResult::Jump(new_pos) => {
-                        // For backrefs: push threads for epsilon transitions from this state
-                        // to be processed at the new position (after the matched backref text).
+                        // Backref consumed text: schedule continuations at new_pos.
                         for &next_id in &state.epsilon {
-                            let next_thread = thread.clone_with_state(next_id);
+                            let seq = ctx.seq_counter;
+                            ctx.seq_counter += 1;
                             ctx.future_threads.push(PendingThread {
                                 pos: new_pos,
-                                thread: next_thread,
+                                seq,
+                                thread: thread.clone_with_state(next_id),
                             });
                         }
                         continue;
                     }
-                    InstructionResult::CodepointTransition {
-                        bytes_consumed,
-                        target,
-                    } => {
-                        // Schedule thread at new position
-                        let next_thread = thread.clone_with_state(target);
-                        ctx.future_threads.push(PendingThread {
-                            pos: pos + bytes_consumed,
-                            thread: next_thread,
-                        });
-                        continue;
-                    }
                 }
             }
 
-            // Add to current threads
             ctx.current_threads.push(thread.clone());
 
-            // Push epsilon transitions to stack (instead of recursive call)
-            for &next_id in &state.epsilon {
-                ctx.epsilon_stack.push(thread.clone_with_state(next_id));
-            }
-        }
-    }
-
-    /// Add thread to next_threads list with O(1) deduplication.
-    /// Uses iterative epsilon closure to avoid stack overflow on deep epsilon chains.
-    #[inline]
-    fn add_thread_to_next(
-        &self,
-        ctx: &mut PikeVmContext,
-        thread: Thread,
-        input: &[u8],
-        pos: usize,
-    ) {
-        // Push initial thread and process the stack iteratively
-        ctx.epsilon_stack.push(thread);
-        self.process_epsilon_stack_next(ctx, input, pos);
-    }
-
-    /// Process the epsilon stack, adding threads to next_threads.
-    #[inline]
-    fn process_epsilon_stack_next(&self, ctx: &mut PikeVmContext, input: &[u8], pos: usize) {
-        while let Some(mut thread) = ctx.epsilon_stack.pop() {
-            let state_id = thread.state as usize;
-
-            // O(1) deduplication check
-            if ctx.visited.get(state_id).copied() == Some(ctx.generation) {
-                continue;
-            }
-
-            // Mark as visited
-            if state_id < ctx.visited.len() {
-                ctx.visited[state_id] = ctx.generation;
-            }
-
-            let state = match self.nfa.get(thread.state) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Handle instructions
-            if let Some(ref instruction) = state.instruction {
-                let current_state_id = thread.state;
-                match self.process_instruction(
-                    instruction,
-                    &mut thread,
-                    input,
-                    pos,
-                    current_state_id,
-                    &mut ctx.lookaround_cache,
-                ) {
-                    InstructionResult::Continue => {}
-                    InstructionResult::Kill => continue,
-                    InstructionResult::NonGreedyExit => {
-                        thread.non_greedy_exit = true;
-                    }
-                    InstructionResult::Jump(new_pos) => {
-                        // For backrefs: push the thread to be processed at the new position
-                        ctx.future_threads.push(PendingThread {
-                            pos: new_pos,
-                            thread,
-                        });
-                        continue;
-                    }
-                    InstructionResult::CodepointTransition {
-                        bytes_consumed,
-                        target,
-                    } => {
-                        let next_thread = thread.clone_with_state(target);
-                        ctx.future_threads.push(PendingThread {
-                            pos: pos + bytes_consumed,
-                            thread: next_thread,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            // Add to next threads
-            ctx.next_threads.push(thread.clone());
-
-            // Push epsilon transitions to stack (instead of recursive call)
-            for &next_id in &state.epsilon {
+            // Reverse-order push so epsilon[0] (highest priority) is popped first.
+            for &next_id in state.epsilon.iter().rev() {
                 ctx.epsilon_stack.push(thread.clone_with_state(next_id));
             }
         }
@@ -480,10 +328,10 @@ impl PikeVm {
                 }
             }
             NfaInstruction::EndOfText => {
-                if pos != input.len() {
-                    InstructionResult::Kill
-                } else {
+                if crate::nfa::at_end_or_before_final_newline(input, pos) {
                     InstructionResult::Continue
+                } else {
+                    InstructionResult::Kill
                 }
             }
             NfaInstruction::StartOfLine => {
@@ -547,9 +395,11 @@ impl PikeVm {
                     };
                 }
 
-                // Arc::clone is O(1) - just increments reference count
+                // A lookahead `(?=X)` requires X to match *anchored at* `pos`, not
+                // merely somewhere ahead. Run the inner anchored at `pos` against the
+                // full input so inner anchors (`\z`, `\b`) see the real context.
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                let matched = inner_vm.is_match(&input[pos..]);
+                let matched = inner_vm.match_at(input, pos).is_some();
 
                 // Cache the result
                 lookaround_cache.insert((state_id, pos), matched);
@@ -570,9 +420,9 @@ impl PikeVm {
                     };
                 }
 
-                // Arc::clone is O(1) - just increments reference count
+                // `(?!X)` succeeds iff X does NOT match anchored at `pos`.
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                let matched = !inner_vm.is_match(&input[pos..]);
+                let matched = inner_vm.match_at(input, pos).is_none();
 
                 // Cache the result (true = lookaround succeeded, i.e., inner did NOT match)
                 lookaround_cache.insert((state_id, pos), matched);
@@ -650,30 +500,14 @@ impl PikeVm {
                 }
             }
             NfaInstruction::NonGreedyExit => {
-                // Mark this thread as having taken a non-greedy exit path
-                InstructionResult::NonGreedyExit
+                // The non-greedy preference is encoded in the epsilon ordering, so
+                // this marker is just a pass-through.
+                InstructionResult::Continue
             }
-            NfaInstruction::CodepointClass(cpclass, target) => {
-                // Try to decode a UTF-8 codepoint at the current position
-                if pos >= input.len() {
-                    return InstructionResult::Kill;
-                }
-
-                // Decode the codepoint
-                let remaining = &input[pos..];
-                if let Some((codepoint, len)) = decode_utf8_codepoint(remaining) {
-                    if cpclass.contains(codepoint) {
-                        InstructionResult::CodepointTransition {
-                            bytes_consumed: len,
-                            target: *target,
-                        }
-                    } else {
-                        InstructionResult::Kill
-                    }
-                } else {
-                    // Invalid UTF-8
-                    InstructionResult::Kill
-                }
+            // A `CodepointClass` is a consuming state, handled directly in the
+            // closure (`add_thread`) before `process_instruction` is ever called.
+            NfaInstruction::CodepointClass(_, _) => {
+                unreachable!("CodepointClass is consumed in the closure, not here")
             }
         }
     }
