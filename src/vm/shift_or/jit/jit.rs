@@ -112,7 +112,7 @@ impl JitShiftOr {
         if self.has_start_anchor {
             if let Some(end) = self.match_at(input) {
                 // For end anchor: must match entire input
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     return None;
                 }
                 return Some((0, end));
@@ -140,7 +140,7 @@ impl JitShiftOr {
                 let end = (packed & 0xFFFF_FFFF) as usize;
 
                 // For end anchor: only accept matches that end at input end
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     // Need to search for a match that ends at input.len()
                     return self.find_with_end_anchor(input);
                 }
@@ -163,7 +163,7 @@ impl JitShiftOr {
     fn find_with_end_anchor(&self, input: &[u8]) -> Option<(usize, usize)> {
         for start in 0..=input.len() {
             if let Some(end) = self.match_at(&input[start..]) {
-                if start + end == input.len() {
+                if crate::nfa::at_end_or_before_final_newline(input, start + end) {
                     return Some((start, start + end));
                 }
             }
@@ -296,7 +296,7 @@ impl JitShiftOr {
                 return None;
             }
             if let Some(end) = self.match_at(input) {
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     return None;
                 }
                 return Some((0, end));
@@ -340,7 +340,8 @@ impl JitShiftOr {
         let slice = &input[pos..];
         if let Some(end) = self.match_at(slice) {
             // For end anchor: must match to end of input
-            if self.has_end_anchor && pos + end != input.len() {
+            if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, pos + end)
+            {
                 return None;
             }
             return Some((pos, pos + end));

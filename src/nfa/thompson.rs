@@ -532,15 +532,20 @@ impl NfaBuilder {
     /// Builds a backreference.
     fn build_backref(&mut self, n: u32) -> Result<Fragment> {
         let state = self.add_state();
+        // Separate continuation state so the backref's "consume" is decoupled from
+        // the match/continuation point. After the backref consumes its text the
+        // thread advances (via this epsilon) to `end`; `end` is what a following
+        // element — or the overall match — attaches to. Without this, a trailing
+        // backref state would be both the consuming state and the match state
+        // (empty epsilon), and a Pike-VM jump would have nowhere to land.
+        let end = self.add_state();
 
         if let Some(s) = self.nfa.get_mut(state) {
             s.instruction = Some(NfaInstruction::Backref(n));
+            s.add_epsilon(end);
         }
 
-        Ok(Fragment {
-            start: state,
-            end: state,
-        })
+        Ok(Fragment { start: state, end })
     }
 }
 

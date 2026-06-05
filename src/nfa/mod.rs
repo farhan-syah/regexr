@@ -29,6 +29,24 @@ pub use thompson::*;
 use crate::error::Result;
 use crate::hir::Hir;
 
+/// Whether `pos` satisfies the `$`/`\Z` end anchor (`NfaInstruction::EndOfText`):
+/// it holds at the end of the input, or immediately before a single trailing
+/// newline (PCRE/Python `$` semantics, non-multiline). `\z` (strict end) is
+/// compiled separately and does not use this.
+#[inline]
+pub fn at_end_or_before_final_newline(input: &[u8], pos: usize) -> bool {
+    pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n')
+}
+
+/// Whether `pos` is a UTF-8 codepoint boundary in `input` (start of a codepoint,
+/// or the end). Matches are only attempted at boundaries so a zero-width/optional
+/// construct can't match in the middle of a multi-byte codepoint — the Unicode
+/// semantics of PCRE/Python on valid UTF-8, which regexr targets for tokenization.
+#[inline]
+pub fn is_utf8_boundary(input: &[u8], pos: usize) -> bool {
+    pos >= input.len() || (input[pos] & 0xC0) != 0x80
+}
+
 /// Compiles an HIR to a Thompson NFA.
 pub fn compile(hir: &Hir) -> Result<Nfa> {
     let mut builder = NfaBuilder::new();

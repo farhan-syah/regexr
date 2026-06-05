@@ -151,8 +151,10 @@ impl CompiledRegex {
 
         // Validate anchor assertions
         if self.has_anchors {
-            // EndOfText: must be at end of input
-            if self.match_needs_end_of_text && end_pos != input.len() {
+            // `$`/`\Z` (EndOfText): at end of input, or just before a final newline.
+            if self.match_needs_end_of_text
+                && !crate::nfa::at_end_or_before_final_newline(input, end_pos)
+            {
                 return false;
             }
 

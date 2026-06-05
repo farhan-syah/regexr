@@ -217,7 +217,7 @@ impl ShiftOr {
         if self.has_start_anchor {
             if let Some(end) = self.match_at(input, 0) {
                 // For end anchor: only accept if match ends at input end
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     return None;
                 }
                 return Some((0, end));
@@ -233,7 +233,7 @@ impl ShiftOr {
         for start in 0..=input.len() {
             if let Some(end) = self.match_at(input, start) {
                 // For end anchor: only accept if match ends at input end
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     continue;
                 }
                 return Some((start, end));
@@ -266,7 +266,7 @@ impl ShiftOr {
         for start in search_start..=input.len() {
             if let Some(end) = self.match_at(input, start) {
                 // For end anchor: only accept if match ends at input end
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     if self.has_start_anchor {
                         // Can't match anywhere else
                         return None;
@@ -294,7 +294,7 @@ impl ShiftOr {
         match self.match_at(input, pos) {
             Some(end) => {
                 // For end anchor: must match to end of input
-                if self.has_end_anchor && end != input.len() {
+                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
                     return None;
                 }
                 Some((pos, end))
@@ -365,6 +365,24 @@ impl ShiftOr {
 }
 
 /// Checks if an HIR is suitable for Shift-Or.
+/// Whether `expr` can match the empty string. Such patterns have a leftmost
+/// zero-width match that bit-parallel Shift-Or can't represent.
+fn hir_is_nullable(expr: &crate::hir::HirExpr) -> bool {
+    use crate::hir::HirExpr;
+    match expr {
+        HirExpr::Empty => true,
+        HirExpr::Literal(b) => b.is_empty(),
+        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) | HirExpr::Backref(_) => false,
+        HirExpr::Concat(es) => es.iter().all(hir_is_nullable),
+        HirExpr::Alt(es) => es.iter().any(hir_is_nullable),
+        HirExpr::Repeat(r) => r.min == 0 || hir_is_nullable(&r.expr),
+        HirExpr::Capture(c) => hir_is_nullable(&c.expr),
+        // Anchors and lookarounds are zero-width assertions.
+        HirExpr::Anchor(_) | HirExpr::Lookaround(_) => true,
+    }
+}
+
+/// Whether `hir` can be matched by the (narrow) Shift-Or engine.
 pub fn is_shift_or_compatible(hir: &Hir) -> bool {
     // Backrefs, lookarounds, and word boundaries require different engines.
     // Word boundaries (\b, \B) are complex to handle correctly in shift-or;
@@ -378,6 +396,14 @@ pub fn is_shift_or_compatible(hir: &Hir) -> bool {
         || hir.props.has_word_boundary
         || hir.props.has_non_greedy
     {
+        return false;
+    }
+
+    // Nullable patterns (those that can match the empty string, e.g. `a*`, ` *`,
+    // `a*|b`) are not Shift-Or compatible: the Glushkov automaton has no empty-match
+    // representation, so Shift-Or skips to the first literal occurrence and misses
+    // the leftmost zero-width match. Route them to LazyDFA, which matches empty.
+    if hir_is_nullable(&hir.expr) {
         return false;
     }
 
@@ -583,6 +609,11 @@ pub fn is_shift_or_wide_compatible(hir: &Hir) -> bool {
         || hir.props.has_word_boundary
         || hir.props.has_non_greedy
     {
+        return false;
+    }
+
+    // Nullable patterns can't be represented (see `is_shift_or_compatible`).
+    if hir_is_nullable(&hir.expr) {
         return false;
     }
 

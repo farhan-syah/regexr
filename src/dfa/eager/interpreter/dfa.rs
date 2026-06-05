@@ -336,9 +336,10 @@ impl EagerDfa {
             }
         }
 
-        // For patterns with end anchor, verify match ends at end of input
+        // For patterns with end anchor (`$`/`\Z`), verify the match ends at end of
+        // input or just before a final newline (PCRE/Python semantics).
         if let Some(end_pos) = last_match {
-            if self.has_end_anchor && end_pos != input.len() {
+            if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end_pos) {
                 return None;
             }
         }

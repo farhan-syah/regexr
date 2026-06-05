@@ -509,11 +509,13 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         });
     }
 
-    // Patterns with lookaround or non-greedy → TaggedNfa interpreter
-    // Both require NFA semantics with proper thread ordering.
-    // TaggedNfa uses liveness analysis for efficient capture copying.
-    // NOTE: This is always available (no JIT required).
-    if hir.props.has_lookaround || hir.props.has_non_greedy {
+    // Patterns with lookaround → TaggedNfa interpreter (it handles lookahead via
+    // the step model). Non-greedy quantifiers, however, need the precise thread
+    // priority of the Pike VM: the step model does not represent non-greedy
+    // faithfully (e.g. a bounded repeat followed by `+?` lets the lazy match
+    // zero), so any non-greedy pattern falls through to `select_engine_from_hir`,
+    // which routes it to PikeVm. (Non-greedy is not on the tiktoken hot path.)
+    if hir.props.has_lookaround && !hir.props.has_non_greedy {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;
@@ -714,11 +716,36 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         });
     }
 
+    // Non-greedy quantifiers → PikeVm, checked BEFORE the large-unicode-class and
+    // lookaround routes (which would otherwise grab codepoint lazy patterns like
+    // `\S+?`). The step-based TaggedNfa(JIT) does not represent non-greedy
+    // faithfully (a bounded repeat followed by `+?` can let the lazy match zero);
+    // PikeVm has the precise thread-priority semantics. Backref patterns are left
+    // for the backtracking engine below.
+    if hir.props.has_non_greedy && !hir.props.has_backrefs {
+        let literals = extract_literals(hir);
+        let prefilter = Prefilter::from_literals(&literals);
+        let nfa = nfa::compile(hir)?;
+        return Ok(CompiledRegex {
+            inner: CompiledInner::PikeVm(PikeVm::new(nfa)),
+            prefilter,
+            capture_nfa: RwLock::new(None),
+            capture_vm: RwLock::new(None),
+            capture_ctx: RwLock::new(None),
+            backtracking_vm: None,
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            backtracking_jit: None,
+        });
+    }
+
     // 1. Complex Unicode patterns with large unicode classes → TaggedNfa JIT
     // These patterns use CodepointClass instructions which DFA cannot handle.
     // Route them to TaggedNfa JIT which supports CodepointClass.
+    // (Backreference patterns are excluded — TaggedNfa can't handle backrefs;
+    // they must reach the backtracking engine below even when they also contain
+    // a large unicode class such as Unicode `\s`.)
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    if hir.props.has_large_unicode_class {
+    if hir.props.has_large_unicode_class && !hir.props.has_backrefs {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;
@@ -752,9 +779,10 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         }
     }
 
-    // Non-JIT: Large unicode classes go to TaggedNfa interpreter
+    // Non-JIT: Large unicode classes go to TaggedNfa interpreter (but not
+    // backreference patterns — TaggedNfa can't handle backrefs).
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    if hir.props.has_large_unicode_class {
+    if hir.props.has_large_unicode_class && !hir.props.has_backrefs {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;
@@ -792,23 +820,31 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 });
             }
             Err(_) => {
-                // Backtracking JIT failed, fall back to PikeVM
-                return compile_with_pikevm(hir);
+                // Backtracking JIT failed (e.g. the pattern also contains a large
+                // Unicode class like Unicode `\s`). Fall back to the BacktrackingVm
+                // interpreter, which handles backreferences — PikeVM does not.
+                return Ok(CompiledRegex {
+                    inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
+                    prefilter,
+                    capture_nfa: RwLock::new(None),
+                    capture_vm: RwLock::new(None),
+                    capture_ctx: RwLock::new(None),
+                    backtracking_vm: None,
+                    backtracking_jit: None,
+                });
             }
         }
     }
 
-    // 2a. Patterns with lookaround or non-greedy quantifiers → TaggedNfa JIT
-    // Both lookaround and non-greedy require NFA semantics for correct matching.
-    // TaggedNfa uses single-pass capture extraction with sparse copying and
-    // memoized lookaround evaluation.
+    // 2a. Patterns with lookaround → TaggedNfa JIT (handles lookahead via the
+    // step model with memoized lookaround evaluation).
     //
     // NOTE: Patterns with captures but NO non-greedy/lookaround should use DFA JIT
     // because DFA JIT is much faster. DFA JIT handles captures via two-pass:
     // 1. Fast DFA JIT for find()
     // 2. PikeVM on matched substring for captures() only when needed
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    if hir.props.has_lookaround || hir.props.has_non_greedy {
+    if hir.props.has_lookaround {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;

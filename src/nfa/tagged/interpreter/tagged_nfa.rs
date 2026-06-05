@@ -16,6 +16,10 @@ impl TaggedNfa {
     /// Finds the first match in the input.
     pub fn find(steps: &[PatternStep], input: &[u8]) -> Option<(usize, usize)> {
         for start in 0..=input.len() {
+            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+            if !crate::nfa::is_utf8_boundary(input, start) {
+                continue;
+            }
             if let Some(end) = Self::match_at(steps, input, start) {
                 return Some((start, end));
             }
@@ -202,7 +206,7 @@ impl TaggedNfa {
                     }
                 }
                 PatternStep::EndOfText => {
-                    if pos != input.len() {
+                    if !crate::nfa::at_end_or_before_final_newline(input, pos) {
                         return None;
                     }
                 }
@@ -431,7 +435,7 @@ impl TaggedNfa {
                 Self::check_lookahead_recursive(rest, input, pos)
             }
             PatternStep::EndOfText => {
-                if pos != input.len() {
+                if !crate::nfa::at_end_or_before_final_newline(input, pos) {
                     return false;
                 }
                 Self::check_lookahead_recursive(rest, input, pos)

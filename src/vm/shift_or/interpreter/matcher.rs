@@ -28,7 +28,7 @@ impl<'a> ShiftOrInterpreter<'a> {
             if let Some(end) = self.match_at(input, 0) {
                 // If end anchor, must match entire input
                 if self.shift_or.has_end_anchor {
-                    if end == input.len() {
+                    if crate::nfa::at_end_or_before_final_newline(input, end) {
                         return Some((0, end));
                     }
                     return None;
@@ -52,7 +52,7 @@ impl<'a> ShiftOrInterpreter<'a> {
         if self.shift_or.has_end_anchor {
             for start in 0..=input.len() {
                 if let Some(end) = self.match_at(input, start) {
-                    if end == input.len() {
+                    if crate::nfa::at_end_or_before_final_newline(input, end) {
                         return Some((start, end));
                     }
                 }
@@ -93,7 +93,7 @@ impl<'a> ShiftOrInterpreter<'a> {
             }
             if let Some(end) = self.match_at(input, 0) {
                 if self.shift_or.has_end_anchor {
-                    if end == input.len() {
+                    if crate::nfa::at_end_or_before_final_newline(input, end) {
                         return Some((0, end));
                     }
                     return None;
@@ -107,7 +107,7 @@ impl<'a> ShiftOrInterpreter<'a> {
         if self.shift_or.has_end_anchor {
             for start in pos..=input.len() {
                 if let Some(end) = self.match_at(input, start) {
-                    if end == input.len() {
+                    if crate::nfa::at_end_or_before_final_newline(input, end) {
                         return Some((start, end));
                     }
                 }

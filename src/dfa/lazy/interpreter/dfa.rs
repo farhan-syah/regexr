@@ -545,7 +545,9 @@ impl LazyDfa {
         let potential_match = self.find_at_with_state_fast(input, start, state);
 
         if let Some(end_pos) = potential_match {
-            if self.ctx.has_end_anchor && end_pos != input.len() {
+            if self.ctx.has_end_anchor
+                && !crate::nfa::at_end_or_before_final_newline(input, end_pos)
+            {
                 return None;
             }
         }
