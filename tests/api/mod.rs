@@ -292,7 +292,10 @@ mod prefix_opt {
 
         let text = "the cat that sat on them made they jump";
         let matches: Vec<_> = re.find_iter(text).map(|m| m.as_str()).collect();
-        assert_eq!(matches, vec!["the", "that", "them", "they"]);
+        // Leftmost-first/PCRE semantics: the first alternative `the` wins wherever
+        // it matches, so "them" and "they" both match as their prefix "the".
+        // (Python: re.findall(r"the|that|them|they", text) == ['the','that','the','the'].)
+        assert_eq!(matches, vec!["the", "that", "the", "the"]);
     }
 }
 
