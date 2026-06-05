@@ -68,7 +68,7 @@ impl CompiledRegex {
     /// This method calls JIT-compiled machine code. The code is generated
     /// to be safe, but it's marked unsafe because it executes dynamically
     /// generated code.
-    fn execute_with_class(&self, input: &[u8], prev_class: CharClass) -> Option<(usize, usize)> {
+    fn raw_match(&self, input: &[u8], prev_class: CharClass) -> Option<(usize, usize)> {
         // Function signature: fn(input_ptr: *const u8, len: usize) -> i64
         // Returns: packed (start << 32 | end) or -1 for no match
         type MatchFn = unsafe extern "C" fn(*const u8, usize) -> i64;
@@ -89,15 +89,68 @@ impl CompiledRegex {
             let packed = result as u64;
             let start_pos = (packed >> 32) as usize;
             let end_pos = (packed & 0xFFFF_FFFF) as usize;
-
-            // Validate end assertions (word boundaries and anchors)
-            if !self.validate_end_assertions(input, start_pos, end_pos, prev_class) {
-                return None;
-            }
-
             Some((start_pos, end_pos))
         } else {
             None
+        }
+    }
+
+    /// Executes the JIT machine code over `input`, returning the leftmost match
+    /// (with greedy end) WITHOUT validating end assertions. The end-of-text /
+    /// end-of-line / word-boundary assertions are stripped from the DFA, so the
+    /// raw result must still be checked by `validate_end_assertions`.
+    #[inline]
+    fn execute_with_class(&self, input: &[u8], prev_class: CharClass) -> Option<(usize, usize)> {
+        let (start_pos, end_pos) = self.raw_match(input, prev_class)?;
+        if !self.validate_end_assertions(input, start_pos, end_pos, prev_class) {
+            return None;
+        }
+        Some((start_pos, end_pos))
+    }
+
+    /// Whether a matched candidate can be rejected by `validate_end_assertions`.
+    /// Only end anchors and word boundaries are post-validated; when none are
+    /// present, the JIT's leftmost match is always the answer.
+    #[inline]
+    fn has_post_validated_assertions(&self) -> bool {
+        self.match_needs_end_of_text
+            || self.match_needs_end_of_line
+            || (self.has_word_boundary
+                && (self.match_needs_word_boundary || self.match_needs_not_word_boundary))
+    }
+
+    /// Unanchored search that correctly handles post-validated assertions
+    /// (`$`/`\Z`, end-of-line, word boundaries).
+    ///
+    /// The JIT strips these zero-width assertions from the DFA and validates them
+    /// after the fact. A single scan returns the leftmost match with a greedy end;
+    /// if that candidate fails its end assertion (e.g. `x?$` matches empty at the
+    /// leftmost position, but `$` does not hold there), we must continue scanning
+    /// from the next start position rather than giving up. This iterates start
+    /// positions, taking the JIT's match at each, until one satisfies the
+    /// assertion. For end anchors this is complete: `$` only holds at end-of-text
+    /// or before a final `\n`, so the greedy end is the sole `$`-satisfying
+    /// candidate at any start (no shorter end can satisfy it).
+    fn execute_unanchored_validated(&self, input: &[u8]) -> Option<(usize, usize)> {
+        let mut from = 0usize;
+        loop {
+            let prev_class = if self.has_word_boundary && from > 0 {
+                CharClass::from_byte(input[from - 1])
+            } else {
+                CharClass::NonWord
+            };
+            let (rel_start, rel_end) = self.raw_match(&input[from..], prev_class)?;
+            let start = from + rel_start;
+            let end = from + rel_end;
+            if self.validate_end_assertions(input, start, end, prev_class) {
+                return Some((start, end));
+            }
+            // This start's candidate failed its end assertion; advance past it.
+            let next = start + 1;
+            if next > input.len() {
+                return None;
+            }
+            from = next;
         }
     }
 
@@ -216,10 +269,16 @@ impl CompiledRegex {
                 // Non-multiline: only try position 0
                 self.find_at(input, 0)
             }
+        } else if self.has_post_validated_assertions() {
+            // Unanchored patterns whose match end can be rejected by a stripped
+            // assertion (`$`/`\Z`, end-of-line, word boundary): a single scan may
+            // return a leftmost candidate that fails the assertion while a later
+            // start succeeds (e.g. `x?$` on "abc" → empty match at the end). Scan
+            // start positions, validating each candidate.
+            self.execute_unanchored_validated(input)
         } else {
-            // Unanchored patterns (including word boundaries): JIT does the search internally.
-            // The JIT tracks prev_char_class in r13 and uses dispatch to select the correct
-            // start state based on character class context.
+            // Unanchored patterns with no post-validated assertion: the JIT's
+            // single internal scan returns the correct leftmost match directly.
             self.execute(input)
         }
     }

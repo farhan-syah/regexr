@@ -22,6 +22,34 @@ fn hir_uses_codepoint_class(expr: &HirExpr) -> bool {
     }
 }
 
+/// Recursively checks whether an HIR expression contains a user alternation
+/// (`a|b`). A DFA/Shift-Or matcher returns at its first/longest accepting state
+/// and therefore cannot honour ALTERNATION BRANCH PRIORITY: `ab|a` on "ab" must
+/// be `ab` (the first branch) under leftmost-first/PCRE semantics, but a DFA
+/// stops at the shorter `a`; `\d+|\w+` on "12ab" must be `12`, but Shift-Or takes
+/// the longest `12ab`. Only an ordered NFA simulation (PikeVM) gets these right,
+/// so any pattern containing an alternation is routed there. (Unicode and byte
+/// classes are `UnicodeCpClass`/`Class`, never `Alt`, so this does not perturb
+/// class handling.)
+pub fn hir_has_alternation(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Alt(branches) => branches.len() >= 2 || branches.iter().any(hir_has_alternation),
+        HirExpr::Concat(exprs) => exprs.iter().any(hir_has_alternation),
+        HirExpr::Repeat(r) => hir_has_alternation(&r.expr),
+        HirExpr::Capture(c) => hir_has_alternation(&c.expr),
+        // A lookaround body matches independently (it is a zero-width sub-pattern),
+        // so an alternation *inside* it does not affect the outer match's branch
+        // priority and need not force PikeVM on its own account.
+        HirExpr::Lookaround(_)
+        | HirExpr::Empty
+        | HirExpr::Literal(_)
+        | HirExpr::Class(_)
+        | HirExpr::UnicodeCpClass(_)
+        | HirExpr::Anchor(_)
+        | HirExpr::Backref(_) => false,
+    }
+}
+
 /// The selected engine type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineType {
@@ -76,6 +104,12 @@ pub fn select_engine_from_hir(hir: &Hir) -> EngineType {
     // instead of byte-level DFA transitions. LazyDFA cannot handle these -
     // only PikeVM and TaggedNFA support CodepointClass instructions.
     if hir_uses_codepoint_class(&hir.expr) {
+        return EngineType::PikeVm;
+    }
+
+    // Alternations need leftmost-first branch priority, which DFA/Shift-Or cannot
+    // express (see `hir_has_alternation`). Route them to the ordered PikeVM.
+    if hir_has_alternation(&hir.expr) {
         return EngineType::PikeVm;
     }
 

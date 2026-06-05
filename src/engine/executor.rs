@@ -538,7 +538,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
     // Anchors: NOW SUPPORTED! LazyDFA/JIT handle start anchor optimization
     // internally, so prefilter can still be used for patterns with anchors.
     let literals = extract_literals(hir);
-    let prefilter = Prefilter::from_literals(&literals);
+    let mut prefilter = Prefilter::from_literals(&literals);
 
     // For patterns with captures (but no lookaround), we use a hybrid approach:
     // - find() uses LazyDfa (fast)
@@ -547,6 +547,12 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
     let has_simple_captures = hir.props.capture_count > 0 && !hir.props.has_lookaround;
 
     let engine = select_engine_from_hir(hir);
+
+    // The PikeVM owns the leftmost-first match decision, so a full-match literal
+    // prefilter must not short-circuit it (see `Prefilter::into_candidate_only`).
+    if engine == EngineType::PikeVm {
+        prefilter = prefilter.into_candidate_only();
+    }
 
     let (inner, capture_nfa) = match engine {
         EngineType::PikeVm => {
@@ -674,7 +680,12 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
 pub fn compile_with_pikevm(hir: &Hir) -> Result<CompiledRegex> {
     let literals = extract_literals(hir);
     // Word boundaries and anchors: NOW SUPPORTED via full input context.
-    let prefilter = Prefilter::from_literals(&literals);
+    // Demote any full-match prefilter to candidate-only: the PikeVM is the
+    // leftmost-first authority and must determine the match span itself. A
+    // full-match literal prefilter resolves overlaps by length/order, not by
+    // alternation branch priority (`ab|a` → it returns "a", PikeVM needs "ab"),
+    // and all alternations are routed here.
+    let prefilter = Prefilter::from_literals(&literals).into_candidate_only();
     let nfa = nfa::compile(hir)?;
 
     Ok(CompiledRegex {
@@ -723,19 +734,10 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
     // PikeVm has the precise thread-priority semantics. Backref patterns are left
     // for the backtracking engine below.
     if hir.props.has_non_greedy && !hir.props.has_backrefs {
-        let literals = extract_literals(hir);
-        let prefilter = Prefilter::from_literals(&literals);
-        let nfa = nfa::compile(hir)?;
-        return Ok(CompiledRegex {
-            inner: CompiledInner::PikeVm(PikeVm::new(nfa)),
-            prefilter,
-            capture_nfa: RwLock::new(None),
-            capture_vm: RwLock::new(None),
-            capture_ctx: RwLock::new(None),
-            backtracking_vm: None,
-            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            backtracking_jit: None,
-        });
+        // `compile_with_pikevm` demotes any full-match literal prefilter to
+        // candidate-only so it cannot short-circuit the leftmost-first match
+        // (e.g. `a+?| $`, a non-greedy branch in an alternation).
+        return compile_with_pikevm(hir);
     }
 
     // 1. Complex Unicode patterns with large unicode classes → TaggedNfa JIT
@@ -903,6 +905,15 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
     // For backrefs without JIT, fall back to PikeVM
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     if hir.props.has_backrefs {
+        return compile_with_pikevm(hir);
+    }
+
+    // Alternations require leftmost-first branch priority. The DFA JIT and
+    // JitShiftOr below resolve to the first/longest accepting state and so return
+    // the wrong branch (`ab|a` → `a`, `\d+|\w+` → the longer `\w+`). Route any
+    // alternation to the ordered PikeVM instead. (Patterns with lookaround,
+    // backrefs, non-greedy or codepoint classes were already dispatched above.)
+    if crate::engine::selector::hir_has_alternation(&hir.expr) {
         return compile_with_pikevm(hir);
     }
 

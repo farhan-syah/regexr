@@ -223,6 +223,26 @@ impl Prefilter {
         }
     }
 
+    /// Demotes a full-match prefilter (`AhoCorasickFull`/`TeddyFull`) to its
+    /// candidate-only counterpart, so `find()` will not short-circuit and return
+    /// the prefilter's match directly.
+    ///
+    /// The full-match fast path assumes the literal matcher's choice equals the
+    /// regex match, but a multi-literal matcher resolves overlaps by literal
+    /// length / list order, NOT by alternation branch priority. For `ab|a` the
+    /// literals may be ordered `["a","ab"]`, so the prefilter returns "a" while
+    /// leftmost-first semantics require "ab". Engines that must own the match
+    /// decision (the PikeVM, to which all alternations are routed) demote the
+    /// prefilter to candidate-only and let the NFA determine the span.
+    pub fn into_candidate_only(self) -> Self {
+        match self {
+            Self::AhoCorasickFull { ac } => Self::AhoCorasick { ac },
+            #[cfg(feature = "simd")]
+            Self::TeddyFull { teddy, .. } => Self::Teddy(teddy),
+            other => other,
+        }
+    }
+
     /// Returns true if this prefilter can provide complete matches.
     pub fn is_full_match(&self) -> bool {
         matches!(self, Self::AhoCorasickFull { .. }) || {
