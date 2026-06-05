@@ -16,6 +16,17 @@ use super::{
     HirLookaroundKind, HirProps, HirRepeat,
 };
 
+/// Builds the HIR for `\z` (strict end of text): the negative lookahead
+/// `(?![\s\S])` — "no character ahead". Lets `HirAnchor::End` carry the common
+/// `$`/`\Z` before-newline semantics while `\z` stays exactly strict.
+fn strict_end_of_text_lookahead() -> HirExpr {
+    let any_byte = HirExpr::Class(HirClass::new(vec![(0, 255)], false));
+    HirExpr::Lookaround(Box::new(HirLookaround {
+        expr: any_byte,
+        kind: HirLookaroundKind::NegativeLookahead,
+    }))
+}
+
 /// Translator from AST to HIR.
 pub struct HirTranslator {
     props: HirProps,
@@ -118,10 +129,22 @@ impl HirTranslator {
                         self.props.has_start_anchor = true;
                         HirAnchor::Start
                     }
-                    Anchor::EndOfString | Anchor::EndOfInput => {
+                    // `$` and `\Z` — end of text OR just before a final newline
+                    // (PCRE/Python). `HirAnchor::End` carries that semantics and
+                    // stays a fast anchor (Shift-Or/DFA/JIT handle it directly).
+                    Anchor::EndOfString | Anchor::EndOfInputBeforeNewline => {
                         self.props.has_anchors = true;
                         self.props.has_end_anchor = true;
                         HirAnchor::End
+                    }
+                    // `\z` — strict end of text (rare). Encoded as `(?![\s\S])`
+                    // (no char ahead), reusing the lookaround machinery so `End`
+                    // can carry the common before-newline `$` semantics.
+                    Anchor::EndOfInput => {
+                        self.props.has_anchors = true;
+                        self.props.has_end_anchor = true;
+                        self.props.has_lookaround = true;
+                        return Ok(strict_end_of_text_lookahead());
                     }
                     Anchor::StartOfLine => {
                         self.props.has_anchors = true;
@@ -142,11 +165,6 @@ impl HirTranslator {
                     Anchor::NotWordBoundary => {
                         self.props.has_word_boundary = true;
                         HirAnchor::NotWordBoundary
-                    }
-                    Anchor::EndOfInputBeforeNewline => {
-                        self.props.has_anchors = true;
-                        self.props.has_end_anchor = true;
-                        HirAnchor::End
                     }
                 };
                 Ok(HirExpr::Anchor(hir_anchor))
@@ -193,11 +211,19 @@ impl HirTranslator {
 
     /// Translates a Perl shorthand class to HIR.
     fn translate_perl_class(&mut self, kind: PerlClassKind) -> Result<HirExpr> {
-        if self.flags.unicode {
-            // Unicode mode - use full Unicode properties
+        // `\s`/`\S` always use the full Unicode `White_Space` set, matching the
+        // Rust `regex`/Python defaults and the reference tokenizer engines (onig,
+        // PCRE2+UCP) — e.g. `\s` includes U+00A0 and U+2000-U+200A. It's a small
+        // set (~25 codepoints). `\w`/`\d`/`\b` stay gated on Unicode mode (`(?u)`)
+        // since their Unicode forms are huge and would bloat the byte engines.
+        let unicode = self.flags.unicode
+            || matches!(
+                kind,
+                PerlClassKind::Whitespace | PerlClassKind::NotWhitespace
+            );
+        if unicode {
             self.translate_perl_class_unicode(kind)
         } else {
-            // ASCII mode - use ASCII-only ranges
             self.translate_perl_class_ascii(kind)
         }
     }
@@ -451,6 +477,16 @@ impl HirTranslator {
 
     /// Translates a group.
     fn translate_group(&mut self, group: &Group) -> Result<HirExpr> {
+        // A `(?flags:...)` group applies its flags only to its body, so push them
+        // while translating the inner expression, then restore.
+        if let GroupKind::Flagged(flags) = &group.kind {
+            let saved = self.flags;
+            self.flags = *flags;
+            let expr = self.translate_expr(&group.expr)?;
+            self.flags = saved;
+            return Ok(expr);
+        }
+
         let expr = self.translate_expr(&group.expr)?;
 
         match &group.kind {
@@ -474,6 +510,8 @@ impl HirTranslator {
                 })))
             }
             GroupKind::NonCapturing => Ok(expr),
+            // Handled by the early return above; listed for exhaustiveness.
+            GroupKind::Flagged(_) => Ok(expr),
         }
     }
 
@@ -486,9 +524,40 @@ impl HirTranslator {
         let mut byte_ranges: Vec<(u8, u8)> = Vec::new();
         let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
 
+        // Under `(?i)`, a character class matches all case variants of its members
+        // (e.g. `(?i:[sdmt])` must match `M`). Single literals are folded in
+        // `translate_literal`; classes are folded here by adding case-equivalent
+        // code points. The complement (for `[^...]`) is taken afterward, so a
+        // negated case-insensitive class excludes all variants too.
+        let folded: Vec<ClassRange>;
+        let ranges: &[ClassRange] = if self.flags.case_insensitive {
+            let mut out = class.ranges.clone();
+            for r in &class.ranges {
+                let (s, e) = (r.start as u32, r.end as u32);
+                // Skip very large ranges (already broad; folding adds nothing useful
+                // and would be expensive to enumerate).
+                if e.saturating_sub(s) >= 0x1000 {
+                    continue;
+                }
+                for cp in s..=e {
+                    for &fc in unicode_data::case_fold_equivalents(cp).iter() {
+                        if fc != cp {
+                            if let Some(fch) = char::from_u32(fc) {
+                                out.push(ClassRange::new(fch, fch));
+                            }
+                        }
+                    }
+                }
+            }
+            folded = out;
+            &folded
+        } else {
+            &class.ranges
+        };
+
         // Collect codepoint ranges for potential fast matching
         let mut codepoint_ranges: Vec<(u32, u32)> = Vec::new();
-        for range in &class.ranges {
+        for range in ranges {
             codepoint_ranges.push((range.start as u32, range.end as u32));
             self.collect_class_ranges(range, &mut byte_ranges, &mut utf8_sequences);
         }

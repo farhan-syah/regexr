@@ -148,6 +148,9 @@ pub enum GroupKind {
     },
     /// A non-capturing group (?:...).
     NonCapturing,
+    /// A non-capturing group with scoped inline flags, `(?flags:...)`. The flags
+    /// are the *effective* flags inside the group and apply only to its body.
+    Flagged(Flags),
 }
 
 /// A character class.
@@ -310,7 +313,7 @@ impl fmt::Display for Expr {
             Expr::Group(g) => match &g.kind {
                 GroupKind::Capturing(_) => write!(f, "({})", g.expr),
                 GroupKind::NamedCapturing { name, .. } => write!(f, "(?<{}>{})", name, g.expr),
-                GroupKind::NonCapturing => write!(f, "(?:{})", g.expr),
+                GroupKind::NonCapturing | GroupKind::Flagged(_) => write!(f, "(?:{})", g.expr),
             },
             Expr::Class(cls) => {
                 write!(f, "[")?;

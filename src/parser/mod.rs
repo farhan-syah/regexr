@@ -513,16 +513,26 @@ impl<'a> Parser<'a> {
 
                 // Flags (?imsx-imsx) or (?imsx:...)
                 TokenKind::Literal(c) if is_flag_char(*c) => {
+                    // Flags set by `(?flags:...)` are scoped to the group only, so
+                    // remember the outer flags to restore them afterward. Without
+                    // this, e.g. `'(?i:[sdmt])\p{L}` would leak case-insensitivity
+                    // onto the trailing `\p{L}`.
+                    let saved_flags = self.flags;
                     self.parse_flags()?;
 
                     if matches!(self.current.kind, TokenKind::Colon) {
-                        // (?flags:...)
+                        // (?flags:...) — flags apply only within this group. Record
+                        // the effective flags on the group so the HIR builder can
+                        // scope case-folding/unicode to the body, then restore the
+                        // outer flags for the rest of the pattern.
+                        let group_flags = self.flags;
                         self.advance()?;
                         let expr = self.parse_alternation()?;
                         self.expect_close_paren(start_span)?;
+                        self.flags = saved_flags;
                         Ok(Expr::Group(Box::new(Group {
                             expr,
-                            kind: GroupKind::NonCapturing,
+                            kind: GroupKind::Flagged(group_flags),
                         })))
                     } else if matches!(self.current.kind, TokenKind::CloseParen) {
                         // (?flags) - just set flags
@@ -640,6 +650,20 @@ impl<'a> Parser<'a> {
         }
 
         while !matches!(self.current.kind, TokenKind::CloseBracket | TokenKind::Eof) {
+            // Nested character class (set union), e.g. `[a[b-c]]` or the bracketed
+            // alternation `[^(\s|[.,!])]`. Parse it recursively and union its
+            // members into the parent (complementing a negated nested class).
+            if matches!(self.current.kind, TokenKind::OpenBracket) {
+                if let Expr::Class(c) = self.parse_class()? {
+                    if c.negated {
+                        ranges.extend(complement_ranges(&c.ranges));
+                    } else {
+                        ranges.extend(c.ranges);
+                    }
+                }
+                continue;
+            }
+
             let item = self.parse_class_item()?;
 
             match item {
@@ -939,23 +963,14 @@ impl<'a> Parser<'a> {
                     }
                     EscapeKind::Whitespace => {
                         self.advance()?;
-                        Ok(ClassItem::Ranges(vec![
-                            ClassRange::single(' '),
-                            ClassRange::single('\t'),
-                            ClassRange::single('\n'),
-                            ClassRange::single('\r'),
-                            ClassRange::single('\x0C'), // form feed
-                            ClassRange::single('\x0B'), // vertical tab
-                        ]))
+                        // Full Unicode `White_Space` set (see `translate_perl_class`).
+                        Ok(ClassItem::Ranges(unicode_whitespace_ranges()))
                     }
                     EscapeKind::NotWhitespace => {
                         self.advance()?;
-                        // [^\s] = everything except whitespace
-                        Ok(ClassItem::Ranges(vec![
-                            ClassRange::new('\x00', '\x08'),    // before \t
-                            ClassRange::new('\x0E', '\x1F'),    // between \r and space
-                            ClassRange::new('!', '\u{10FFFF}'), // after space
-                        ]))
+                        Ok(ClassItem::Ranges(complement_ranges(
+                            &unicode_whitespace_ranges(),
+                        )))
                     }
                     // Single character escapes
                     EscapeKind::Literal(c) => {
@@ -1048,6 +1063,77 @@ enum ClassItem {
 /// Returns true if the character is a valid flag.
 fn is_flag_char(c: char) -> bool {
     matches!(c, 'i' | 'm' | 's' | 'x' | 'u')
+}
+
+/// The Unicode `White_Space` property as character ranges (for `\s`/`\S`).
+fn unicode_whitespace_ranges() -> Vec<ClassRange> {
+    const WS: &[(u32, u32)] = &[
+        (0x0009, 0x000D),
+        (0x0020, 0x0020),
+        (0x0085, 0x0085),
+        (0x00A0, 0x00A0),
+        (0x1680, 0x1680),
+        (0x2000, 0x200A),
+        (0x2028, 0x2029),
+        (0x202F, 0x202F),
+        (0x205F, 0x205F),
+        (0x3000, 0x3000),
+    ];
+    WS.iter()
+        .map(|&(s, e)| ClassRange::new(char::from_u32(s).unwrap(), char::from_u32(e).unwrap()))
+        .collect()
+}
+
+/// Complement of a sorted-or-unsorted set of character ranges over the Unicode
+/// scalar value space (skipping the surrogate gap `U+D800..=U+DFFF`).
+fn complement_ranges(ranges: &[ClassRange]) -> Vec<ClassRange> {
+    let mut pts: Vec<(u32, u32)> = ranges
+        .iter()
+        .map(|r| (r.start as u32, r.end as u32))
+        .collect();
+    pts.sort_by_key(|r| r.0);
+    let mut out = Vec::new();
+    let mut next = 0u32;
+    for (s, e) in pts {
+        if s > next {
+            push_scalar_range(&mut out, next, s - 1);
+        }
+        if e + 1 > next {
+            next = e + 1;
+        }
+    }
+    if next <= 0x10FFFF {
+        push_scalar_range(&mut out, next, 0x10FFFF);
+    }
+    out
+}
+
+/// Push `start..=end` as `ClassRange`(s), splitting around the surrogate gap.
+fn push_scalar_range(out: &mut Vec<ClassRange>, start: u32, end: u32) {
+    const SUR_LO: u32 = 0xD800;
+    const SUR_HI: u32 = 0xDFFF;
+    if start > end {
+        return;
+    }
+    if end < SUR_LO || start > SUR_HI {
+        out.push(ClassRange::new(
+            char::from_u32(start).unwrap(),
+            char::from_u32(end).unwrap(),
+        ));
+    } else {
+        if start < SUR_LO {
+            out.push(ClassRange::new(
+                char::from_u32(start).unwrap(),
+                char::from_u32(SUR_LO - 1).unwrap(),
+            ));
+        }
+        if end > SUR_HI {
+            out.push(ClassRange::new(
+                char::from_u32(SUR_HI + 1).unwrap(),
+                char::from_u32(end).unwrap(),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

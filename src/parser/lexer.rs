@@ -125,8 +125,9 @@ pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::CharIndices<'a>>,
     /// Current position in bytes.
     pos: usize,
-    /// Whether we're inside a character class.
-    in_class: bool,
+    /// Nesting depth of character classes (0 = outside any class). Tracked as a
+    /// depth (not a bool) so nested classes like `[a[b]c]` lex correctly.
+    class_depth: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -136,7 +137,7 @@ impl<'a> Lexer<'a> {
             src,
             chars: src.char_indices().peekable(),
             pos: 0,
-            in_class: false,
+            class_depth: 0,
         }
     }
 
@@ -159,9 +160,14 @@ impl<'a> Lexer<'a> {
         result
     }
 
-    /// Sets whether we're inside a character class.
+    /// Enter (`true`) or exit (`false`) a character class, maintaining the
+    /// nesting depth so nested classes lex in class mode until fully closed.
     pub fn set_in_class(&mut self, in_class: bool) {
-        self.in_class = in_class;
+        if in_class {
+            self.class_depth += 1;
+        } else {
+            self.class_depth = self.class_depth.saturating_sub(1);
+        }
     }
 
     /// Returns the next token.
@@ -176,7 +182,7 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        let kind = if self.in_class {
+        let kind = if self.class_depth > 0 {
             self.lex_class_char(c, start)?
         } else {
             self.lex_char(c, start)?
@@ -220,6 +226,9 @@ impl<'a> Lexer<'a> {
     fn lex_class_char(&mut self, c: char, start: usize) -> Result<TokenKind> {
         match c {
             ']' => Ok(TokenKind::CloseBracket),
+            // `[` opens a nested class (set union), matching the Rust `regex`
+            // crate / HuggingFace tokenizers — e.g. `[a[b-c]]` or `[^(\s|[.,!])]`.
+            '[' => Ok(TokenKind::OpenBracket),
             '-' => Ok(TokenKind::Hyphen),
             '^' => Ok(TokenKind::Caret),
             '\\' => self.lex_escape(start),
