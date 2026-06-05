@@ -312,6 +312,52 @@ impl TaggedNfaJitCompiler {
             ));
         }
 
+        // Soundness guard (mirrors `StepExtractor::extract`): a quantifier split
+        // (`X?`, `X*`, `X{n,m}`) is modeled as an `Alt` that stops at the split,
+        // silently dropping any assertion that follows it (the `(?=x)` in
+        // `a{1,3}(?=x)`, the `$` in `a{1,3}$`). Emitting code for such a truncated
+        // program returns wrong matches. If extraction lost an assertion, refuse
+        // to JIT and let the executor fall back to the TaggedNfa interpreter,
+        // which applies the same guard and defers to the correct PikeVm.
+        if crate::nfa::tagged::count_assertions_in_steps(&steps)
+            != crate::nfa::tagged::count_assertions_in_nfa(&self.nfa)
+        {
+            return Err(Error::new(
+                ErrorKind::Jit("step extraction dropped or duplicated an assertion".to_string()),
+                "",
+            ));
+        }
+
+        // Tie correctness to the interpreter's authority: the JIT uses its own
+        // step extractor, which can keep an assertion present yet still mis-model
+        // the quantifier it follows. The interpreter's `StepExtractor` returns
+        // `None` for shapes it cannot represent faithfully, deferring them to the
+        // PikeVm. If it bails, the JIT must bail too — the executor then routes to
+        // the TaggedNfa interpreter (→ PikeVm), which is correct.
+        if crate::nfa::tagged::StepExtractor::new(&self.nfa)
+            .extract()
+            .is_none()
+        {
+            return Err(Error::new(
+                ErrorKind::Jit("interpreter cannot represent pattern as steps".to_string()),
+                "",
+            ));
+        }
+
+        // The JIT's emitted backtracking is unreliable for a greedy quantifier
+        // combined with a lookaround (`[\r\n]+(?=\S)`) or for adjacent greedy
+        // quantifiers (`\S+\S+\S`). The TaggedNfa interpreter handles both
+        // correctly via boundary-backtracking + recursion, and it is the engine
+        // the tiktoken hot path already uses, so defer these shapes to it.
+        if crate::nfa::tagged::jit_must_defer(&steps) {
+            return Err(Error::new(
+                ErrorKind::Jit(
+                    "greedy+lookaround/adjacent-greedy deferred to interpreter".to_string(),
+                ),
+                "",
+            ));
+        }
+
         // Check if top-level has unsupported patterns (like nested Alt)
         // This prevents orphan labels during code generation
         for step in &steps {

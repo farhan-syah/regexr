@@ -64,6 +64,144 @@ pub fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep
     result
 }
 
+/// Per-kind tally of zero-width assertions. Comparing tallies kind-by-kind (not
+/// just a single total) is essential: a quantifier `Alt` can simultaneously
+/// DUPLICATE one assertion and DROP another (`a*(?=\S)$` keeps the lookahead in
+/// both branches but loses the `$`), and the two errors would cancel in a single
+/// total (2 == 1+1) yet differ per kind (lookahead 2≠1, anchor 0≠1).
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct AssertionTally {
+    lookahead: usize,
+    lookbehind: usize,
+    anchor: usize,
+    word_boundary: usize,
+    backref: usize,
+}
+
+/// Tallies zero-width assertions present in an NFA's own states. Inner
+/// lookaround NFAs are held behind `Arc` and are not part of `nfa.states`, so
+/// each top-level assertion is counted exactly once.
+pub(crate) fn count_assertions_in_nfa(nfa: &Nfa) -> AssertionTally {
+    let mut t = AssertionTally::default();
+    for s in &nfa.states {
+        match s.instruction {
+            Some(NfaInstruction::PositiveLookahead(_) | NfaInstruction::NegativeLookahead(_)) => {
+                t.lookahead += 1
+            }
+            Some(NfaInstruction::PositiveLookbehind(_) | NfaInstruction::NegativeLookbehind(_)) => {
+                t.lookbehind += 1
+            }
+            Some(
+                NfaInstruction::StartOfText
+                | NfaInstruction::EndOfText
+                | NfaInstruction::StartOfLine
+                | NfaInstruction::EndOfLine,
+            ) => t.anchor += 1,
+            Some(NfaInstruction::WordBoundary | NfaInstruction::NotWordBoundary) => {
+                t.word_boundary += 1
+            }
+            Some(NfaInstruction::Backref(_)) => t.backref += 1,
+            _ => {}
+        }
+    }
+    t
+}
+
+/// Tallies zero-width assertions in a step program, recursing into `Alt`
+/// branches. A genuine alternation carries each assertion in exactly one branch,
+/// so summing branches reproduces the NFA tally; a quantifier `Alt` duplicates
+/// (and/or drops) assertions, producing a tally that differs from the NFA's.
+pub(crate) fn count_assertions_in_steps(steps: &[PatternStep]) -> AssertionTally {
+    let mut t = AssertionTally::default();
+    for step in steps {
+        match step {
+            PatternStep::PositiveLookahead(_)
+            | PatternStep::NegativeLookahead(_)
+            | PatternStep::GreedyPlusLookahead(_, _, _)
+            | PatternStep::GreedyStarLookahead(_, _, _) => t.lookahead += 1,
+            PatternStep::PositiveLookbehind(_, _) | PatternStep::NegativeLookbehind(_, _) => {
+                t.lookbehind += 1
+            }
+            PatternStep::StartOfText
+            | PatternStep::EndOfText
+            | PatternStep::StartOfLine
+            | PatternStep::EndOfLine => t.anchor += 1,
+            PatternStep::WordBoundary | PatternStep::NotWordBoundary => t.word_boundary += 1,
+            PatternStep::Backref(_) => t.backref += 1,
+            PatternStep::Alt(branches) => {
+                for b in branches {
+                    let bt = count_assertions_in_steps(b);
+                    t.lookahead += bt.lookahead;
+                    t.lookbehind += bt.lookbehind;
+                    t.anchor += bt.anchor;
+                    t.word_boundary += bt.word_boundary;
+                    t.backref += bt.backref;
+                }
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
+/// Whether a step program must be executed by the TaggedNfa **interpreter**
+/// rather than the JIT, because the JIT's emitted backtracking is unreliable for
+/// the shape. Two shapes are deferred:
+///
+/// - a greedy quantifier together with a lookaround (the quantifier must give
+///   characters back until the assertion holds, e.g. `[\r\n]+(?=\S)`), and
+/// - two or more greedy quantifiers (adjacent greedy needs nested backtracking,
+///   e.g. `\S+\S+\S`).
+///
+/// The interpreter (`TaggedNfa::find`) handles both correctly via its
+/// boundary-backtracking + recursion, and it is the engine the tiktoken hot path
+/// already uses (the JIT defers all Unicode-class greedy+lookaround to it), so
+/// deferring these byte-class shapes costs nothing on real workloads.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn jit_must_defer(steps: &[PatternStep]) -> bool {
+    let (greedy, lookaround) = count_greedy_and_lookaround(steps);
+    greedy >= 2 || (greedy >= 1 && lookaround >= 1)
+}
+
+/// Returns `(greedy_quantifier_count, lookaround_count)` over a step program,
+/// recursing into `Alt` branches (taking the per-branch max, since only one
+/// branch executes). A combined `Greedy*Lookahead` counts as both.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn count_greedy_and_lookaround(steps: &[PatternStep]) -> (usize, usize) {
+    let mut greedy = 0;
+    let mut look = 0;
+    for step in steps {
+        match step {
+            PatternStep::GreedyPlus(_)
+            | PatternStep::GreedyStar(_)
+            | PatternStep::GreedyCodepointPlus(_)
+            | PatternStep::NonGreedyPlus(_, _)
+            | PatternStep::NonGreedyStar(_, _) => greedy += 1,
+            PatternStep::GreedyPlusLookahead(_, _, _)
+            | PatternStep::GreedyStarLookahead(_, _, _) => {
+                greedy += 1;
+                look += 1;
+            }
+            PatternStep::PositiveLookahead(_)
+            | PatternStep::NegativeLookahead(_)
+            | PatternStep::PositiveLookbehind(_, _)
+            | PatternStep::NegativeLookbehind(_, _) => look += 1,
+            PatternStep::Alt(branches) => {
+                let (mut bg, mut bl) = (0, 0);
+                for b in branches {
+                    let (g, l) = count_greedy_and_lookaround(b);
+                    bg = bg.max(g);
+                    bl = bl.max(l);
+                }
+                greedy += bg;
+                look += bl;
+            }
+            _ => {}
+        }
+    }
+    (greedy, look)
+}
+
 /// Extracts pattern steps from an NFA for fast matching.
 pub struct StepExtractor<'a> {
     nfa: &'a Nfa,
@@ -79,15 +217,24 @@ impl<'a> StepExtractor<'a> {
     pub fn extract(&self) -> Option<Vec<PatternStep>> {
         let mut visited = vec![false; self.nfa.states.len()];
         let steps = self.extract_from_state(self.nfa.start, &mut visited);
-        // #[cfg(debug_assertions)]
-        {
-            if steps.is_empty() {
-                // eprintln!("DEBUG extract: extract_from_state returned empty");
-            } else {
-                // eprintln!("DEBUG extract: got {} steps", steps.len());
-            }
-        }
         if steps.is_empty() {
+            return None;
+        }
+        // Soundness guard: the linear step extractor mis-models a quantifier split
+        // (`X?`, `X*`, `X{n,m}`) as an `Alt`, which corrupts any zero-width
+        // assertion attached to the quantifier in one of two ways:
+        //   * it DROPS the trailing assertion (`a{1,3}(?=x)` loses the lookahead,
+        //     `a{1,3}$` loses the `$`) — the step count is then LESS than the NFA's;
+        //   * it DUPLICATES the assertion into each branch (`a*(?=\S)$` puts the
+        //     `(?=\S)$` in both the "took some" and "took none" branches) — the
+        //     step count is then GREATER than the NFA's.
+        // Either way the step program no longer faithfully represents the pattern
+        // and the interpreter's non-backtracking `Alt` handler diverges. A genuine
+        // alternation instead carries each assertion in exactly one branch, so its
+        // count matches the NFA. Bail on any mismatch to the PikeVM, which is
+        // correct; tiktoken's `\s+(?!\S)` and the full cl100k/o200k patterns match
+        // exactly and stay on the fast path.
+        if count_assertions_in_steps(&steps) != count_assertions_in_nfa(self.nfa) {
             return None;
         }
         // Combine greedy quantifiers with following lookahead
@@ -97,22 +244,17 @@ impl<'a> StepExtractor<'a> {
     fn extract_from_state(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
         let mut steps = Vec::new();
         let mut current = start;
-        // #[cfg(debug_assertions)]
         let mut iteration = 0;
 
         loop {
-            // #[cfg(debug_assertions)]
             {
                 iteration += 1;
                 if iteration > 1000 {
-                    // eprintln!("DEBUG: too many iterations (>1000) at state {}", current);
                     return Vec::new();
                 }
             }
 
             if current as usize >= self.nfa.states.len() {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG: state {} out of bounds", current);
                 return Vec::new();
             }
 
@@ -267,9 +409,6 @@ impl<'a> StepExtractor<'a> {
 
             // Multiple epsilon = alternation
             if state.epsilon.len() >= 2 {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG: state {} has {} epsilon transitions (alternation)", current, state.epsilon.len());
-
                 // Extract each alternative branch
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 for &target in state.epsilon.iter() {
@@ -277,8 +416,6 @@ impl<'a> StepExtractor<'a> {
                     branch_visited[current as usize] = true;
                     let branch_steps = self.extract_branch(target, &mut branch_visited);
                     if branch_steps.is_empty() {
-                        // #[cfg(debug_assertions)]
-                        // eprintln!("DEBUG: alternation branch {} (target state {}) returned empty", i, target);
                         // If any branch fails to extract, fall back
                         return Vec::new();
                     }
@@ -298,11 +435,9 @@ impl<'a> StepExtractor<'a> {
     fn extract_branch(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
         let mut steps = Vec::new();
         let mut current = start;
-        // #[cfg(debug_assertions)]
         let mut iteration = 0;
 
         loop {
-            // #[cfg(debug_assertions)]
             {
                 iteration += 1;
                 if iteration > 10000 {
@@ -311,14 +446,10 @@ impl<'a> StepExtractor<'a> {
             }
 
             if current as usize >= self.nfa.states.len() {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_branch: state {} out of bounds", current);
                 return Vec::new();
             }
 
             if visited[current as usize] {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_branch: state {} already visited (cycle detected)", current);
                 return Vec::new();
             }
 
@@ -350,8 +481,6 @@ impl<'a> StepExtractor<'a> {
                     NfaInstruction::PositiveLookahead(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
-                            // #[cfg(debug_assertions)]
-                            // eprintln!("DEBUG extract_branch: lookahead extraction failed at state {}", current);
                             return Vec::new();
                         }
                         steps.push(PatternStep::PositiveLookahead(inner_steps));
@@ -359,20 +488,13 @@ impl<'a> StepExtractor<'a> {
                     NfaInstruction::NegativeLookahead(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
-                            // #[cfg(debug_assertions)]
-                            // eprintln!("DEBUG extract_branch: neg lookahead extraction failed at state {}", current);
                             return Vec::new();
                         }
                         steps.push(PatternStep::NegativeLookahead(inner_steps));
                     }
                     NfaInstruction::CodepointClass(cpclass, target) => {
-                        // #[cfg(debug_assertions)]
-                        // eprintln!("DEBUG: CodepointClass at state {}, target={}", current, target);
-
                         // Check for greedy loop pattern: CodepointClass -> epsilon state -> back to current
                         if (*target as usize) >= self.nfa.states.len() {
-                            // #[cfg(debug_assertions)]
-                            // eprintln!("DEBUG: CodepointClass target {} out of bounds", target);
                             return Vec::new();
                         }
 
@@ -400,16 +522,12 @@ impl<'a> StepExtractor<'a> {
                         }
 
                         // Not a greedy loop - just emit and continue
-                        // #[cfg(debug_assertions)]
-                        // eprintln!("DEBUG: CodepointClass not a greedy loop, continuing to target {}", target);
                         steps.push(PatternStep::CodepointClass(cpclass.clone(), *target));
                         visited[current as usize] = true;
                         current = *target;
                         continue;
                     }
                     _ => {
-                        // #[cfg(debug_assertions)]
-                        // eprintln!("DEBUG extract_branch: unsupported instruction {:?} at state {}", instr, current);
                         return Vec::new();
                     }
                 }
@@ -464,29 +582,6 @@ impl<'a> StepExtractor<'a> {
                 let eps0 = state.epsilon[0];
                 let eps1 = state.epsilon[1];
 
-                // Check for greedy star pattern: one epsilon leads to loop body with transitions,
-                // other epsilon leads to exit (continuation)
-                if let Some((ranges, exit_state)) =
-                    self.detect_greedy_star(current, eps0, eps1, visited)
-                {
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: detected greedy star at state {}", current);
-                    steps.push(PatternStep::GreedyStar(ByteClass::new(ranges)));
-                    visited[current as usize] = true;
-                    current = exit_state;
-                    continue;
-                }
-                if let Some((ranges, exit_state)) =
-                    self.detect_greedy_star(current, eps1, eps0, visited)
-                {
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: detected greedy star at state {} (swapped)", current);
-                    steps.push(PatternStep::GreedyStar(ByteClass::new(ranges)));
-                    visited[current as usize] = true;
-                    current = exit_state;
-                    continue;
-                }
-
                 // Check for greedy loop: if one epsilon leads to an already-visited state,
                 // and we have a CodepointClass step, this is a greedy plus/star pattern
                 let eps0_visited = visited[eps0 as usize];
@@ -495,24 +590,18 @@ impl<'a> StepExtractor<'a> {
                 if eps0_visited && !eps1_visited {
                     // eps0 is the back-edge of a greedy loop, eps1 is the exit
                     // Continue with the exit branch
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: greedy loop detected at state {} (back to {}, exit to {})", current, eps0, eps1);
                     visited[current as usize] = true;
                     current = eps1;
                     continue;
                 }
                 if eps1_visited && !eps0_visited {
                     // eps1 is the back-edge of a greedy loop, eps0 is the exit
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: greedy loop detected at state {} (back to {}, exit to {})", current, eps1, eps0);
                     visited[current as usize] = true;
                     current = eps0;
                     continue;
                 }
 
                 // Not a greedy star, treat as alternation
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_branch: actual alternation at state {} with 2 epsilons", current);
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
                 for &target in state.epsilon.iter() {
@@ -533,8 +622,6 @@ impl<'a> StepExtractor<'a> {
                     any_valid = true;
                 }
                 if !any_valid {
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: no valid alternatives at state {}", current);
                     return Vec::new();
                 }
                 steps.push(PatternStep::Alt(alternatives));
@@ -543,8 +630,6 @@ impl<'a> StepExtractor<'a> {
 
             // More than 2 epsilons - must be alternation
             if state.epsilon.len() > 2 {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_branch: multi-alternation at state {} with {} epsilons", current, state.epsilon.len());
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
                 for &target in state.epsilon.iter() {
@@ -563,8 +648,6 @@ impl<'a> StepExtractor<'a> {
                     any_valid = true;
                 }
                 if !any_valid {
-                    // #[cfg(debug_assertions)]
-                    // eprintln!("DEBUG extract_branch: no valid alternatives in multi-alternation at state {}", current);
                     return Vec::new();
                 }
                 steps.push(PatternStep::Alt(alternatives));
@@ -582,22 +665,17 @@ impl<'a> StepExtractor<'a> {
         let mut visited = vec![false; inner_nfa.states.len()];
         let mut steps = Vec::new();
         let mut current = inner_nfa.start;
-        // #[cfg(debug_assertions)]
         let mut iteration = 0;
 
         loop {
-            // #[cfg(debug_assertions)]
             {
                 iteration += 1;
                 if iteration > 10000 {
-                    // eprintln!("DEBUG extract_lookaround: too many iterations (>10000) at state {}", current);
                     return Vec::new();
                 }
             }
 
             if current as usize >= inner_nfa.states.len() {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_lookaround: state {} out of bounds", current);
                 return Vec::new();
             }
 
@@ -633,8 +711,6 @@ impl<'a> StepExtractor<'a> {
                         continue;
                     }
                     _ => {
-                        // #[cfg(debug_assertions)]
-                        // eprintln!("DEBUG extract_lookaround: unsupported instruction {:?} at state {}", instr, current);
                         return Vec::new();
                     }
                 }
@@ -734,21 +810,13 @@ impl<'a> StepExtractor<'a> {
                 }
 
                 // Not a recognized greedy star pattern
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_lookaround: state {} has 2 epsilons but not a greedy star pattern", current);
                 return Vec::new();
             }
 
             if !state.epsilon.is_empty() {
-                // #[cfg(debug_assertions)]
-                // eprintln!("DEBUG extract_lookaround: state {} has {} epsilons (not handled)", current, state.epsilon.len());
                 return Vec::new();
             }
 
-            // #[cfg(debug_assertions)]
-            {
-                // eprintln!("DEBUG extract_lookaround: dead end at state {} (no transitions, no epsilon, not match)", current);
-            }
             break;
         }
 
@@ -842,86 +910,6 @@ impl<'a> StepExtractor<'a> {
         }
 
         steps
-    }
-
-    /// Detects a greedy star pattern (X*) in the main NFA.
-    ///
-    /// This handles complex structures where the loop body is a nested alternation
-    /// (common for Unicode character classes like \S which expand to UTF-8 byte sequences).
-    ///
-    /// Pattern structure:
-    ///   branch_state --eps--> loop_body_start --...-> eventually back to branch_state
-    ///                  --eps--> exit_state (skip)
-    fn detect_greedy_star(
-        &self,
-        branch_state: StateId,
-        loop_start: StateId,
-        exit_state: StateId,
-        _visited: &[bool],
-    ) -> Option<(Vec<ByteRange>, StateId)> {
-        if loop_start as usize >= self.nfa.states.len() {
-            return None;
-        }
-
-        // Check if exit_state eventually leads to match or continuation
-        // (not back to branch_state - that would be the loop path)
-        if self.state_eventually_reaches(exit_state, branch_state, 10) {
-            // exit_state loops back - this might be the wrong interpretation
-            return None;
-        }
-
-        // Check if loop_start eventually loops back to branch_state
-        if self.state_eventually_reaches(loop_start, branch_state, 50) {
-            // This is a greedy star/plus pattern!
-            // We can't easily extract the byte ranges without fully traversing the sub-NFA,
-            // so we'll use a placeholder approach for now
-            // #[cfg(debug_assertions)]
-            // eprintln!("DEBUG detect_greedy_star: FOUND loop {} -> {} -> back to {}", branch_state, loop_start, branch_state);
-
-            // For now, signal that we found a greedy pattern but can't extract ranges
-            // This will cause us to fall through to alternation handling
-            // TODO: Properly extract ranges from the loop body
-            return None;
-        }
-
-        None
-    }
-
-    /// Checks if following epsilon/byte transitions from `start` eventually reaches `target`.
-    /// Uses BFS with a depth limit to avoid infinite loops.
-    fn state_eventually_reaches(&self, start: StateId, target: StateId, max_depth: usize) -> bool {
-        use std::collections::VecDeque;
-
-        let mut queue = VecDeque::new();
-        let mut seen = vec![false; self.nfa.states.len()];
-        queue.push_back((start, 0));
-
-        while let Some((state_id, depth)) = queue.pop_front() {
-            if state_id == target {
-                return true;
-            }
-            if depth >= max_depth {
-                continue;
-            }
-            if state_id as usize >= self.nfa.states.len() || seen[state_id as usize] {
-                continue;
-            }
-            seen[state_id as usize] = true;
-
-            let state = &self.nfa.states[state_id as usize];
-
-            // Follow epsilon transitions
-            for &eps in &state.epsilon {
-                queue.push_back((eps, depth + 1));
-            }
-
-            // Follow byte transitions
-            for (_, next) in &state.transitions {
-                queue.push_back((*next, depth + 1));
-            }
-        }
-
-        false
     }
 
     /// Detects a greedy star pattern where `loop_start` has transitions that loop back

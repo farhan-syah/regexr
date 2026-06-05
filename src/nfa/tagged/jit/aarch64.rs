@@ -857,6 +857,22 @@ impl TaggedNfaJitCompiler {
         if steps.is_empty() {
             return self.compile_with_fallback(None);
         }
+        // Soundness guards (mirror x86_64 / `StepExtractor::extract`): bail to the
+        // PikeVm (`compile_with_fallback(None)`) when linear step extraction is
+        // unfaithful for the pattern — when it dropped or duplicated a zero-width
+        // assertion (per-kind tally ≠ NFA), when the JIT's backtracking is
+        // unreliable for the shape (greedy+lookaround / adjacent greedy), or when
+        // the interpreter's own extractor cannot represent the pattern. These
+        // shapes are off the tiktoken hot path; correctness takes priority.
+        if crate::nfa::tagged::count_assertions_in_steps(&steps)
+            != crate::nfa::tagged::count_assertions_in_nfa(&self.nfa)
+            || crate::nfa::tagged::jit_must_defer(&steps)
+            || crate::nfa::tagged::StepExtractor::new(&self.nfa)
+                .extract()
+                .is_none()
+        {
+            return self.compile_with_fallback(None);
+        }
         for step in &steps {
             if let PatternStep::Alt(alts) = step {
                 if Self::has_unsupported_in_alt(alts) {
