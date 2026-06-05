@@ -2164,6 +2164,19 @@ impl TaggedNfaJitCompiler {
         let state_count = self.nfa.states.len();
         let lookaround_count = self.liveness.lookaround_count;
         let stride = (capture_count as usize + 1) * 2;
+        let needs_left_context = self.nfa.states.iter().any(|s| {
+            matches!(
+                s.instruction,
+                Some(
+                    NfaInstruction::StartOfText
+                        | NfaInstruction::StartOfLine
+                        | NfaInstruction::WordBoundary
+                        | NfaInstruction::NotWordBoundary
+                        | NfaInstruction::PositiveLookbehind(_)
+                        | NfaInstruction::NegativeLookbehind(_)
+                )
+            )
+        });
         Ok(TaggedNfaJit::new(
             code,
             find_fn,
@@ -2178,6 +2191,7 @@ impl TaggedNfaJitCompiler {
             self.lookaround_nfas,
             find_needs_ctx,
             fallback_steps,
+            needs_left_context,
         ))
     }
 }

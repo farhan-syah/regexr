@@ -78,6 +78,13 @@ pub struct TaggedNfaJit {
     /// Whether find_fn needs context (false for simple patterns).
     /// When false, we skip the expensive context setup in find().
     find_needs_ctx: bool,
+    /// Whether the pattern depends on absolute position or characters to the
+    /// left of the match start: a start anchor (`^` / `\A`), `\b`/`\B`, or a
+    /// lookbehind. `find_at(start>0)` slices the input (the JIT has no start
+    /// offset), which would make the slice's first byte look like the start of
+    /// text and hide any preceding context — wrong for these. When set, such
+    /// calls go to the interpreter, which matches at an absolute position.
+    needs_left_context: bool,
     /// Pre-extracted pattern steps for fast fallback matching.
     /// Used when JIT returns JIT_USE_INTERPRETER to avoid creating
     /// a new interpreter on every call.
@@ -110,6 +117,7 @@ impl TaggedNfaJit {
         lookaround_nfas: Vec<Box<Nfa>>,
         find_needs_ctx: bool,
         fallback_steps: Option<Vec<PatternStep>>,
+        needs_left_context: bool,
     ) -> Self {
         // Create PikeVm for fallback
         let fallback_vm = PikeVm::new(nfa.clone());
@@ -129,6 +137,7 @@ impl TaggedNfaJit {
             lookaround_nfas,
             find_needs_ctx,
             fallback_steps,
+            needs_left_context,
             cached_ctx: std::sync::RwLock::new(None),
             cached_captures_buf: std::sync::RwLock::new(Vec::new()),
             fallback_vm,
@@ -345,6 +354,19 @@ impl TaggedNfaJit {
         }
         if start == 0 {
             return self.find(input);
+        }
+
+        // The JIT has no start-offset parameter, so `find_at(start>0)` slices the
+        // input and runs from the slice. That hides everything before `start`,
+        // which is wrong for patterns anchored at the text start or that read
+        // left context (`\b`, lookbehind): the slice's first byte would look like
+        // the start of text. Route those to the interpreter, which matches at an
+        // absolute position with the full input visible.
+        if self.needs_left_context {
+            if let Some(ref steps) = self.fallback_steps {
+                return TaggedNfa::find_at(steps, input, start);
+            }
+            return self.fallback_vm.find_at(input, start);
         }
 
         // JIT supports start offset by passing sliced input pointer
