@@ -6,6 +6,10 @@
 //! - Lazy DFA: On-demand determinization with caching
 //! - JIT: Native x86-64 code generation (optional, requires `jit` feature)
 //! - SIMD: AVX2-accelerated literal search (optional, requires `simd` feature)
+//!
+//! The [`reference`] module is an executable specification: a simple,
+//! obviously-correct backtracking matcher defining regexr's canonical match
+//! semantics, used as the ground-truth oracle in conformance/differential tests.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -17,6 +21,7 @@ pub mod hir;
 pub mod literal;
 pub mod nfa;
 pub mod parser;
+pub mod reference;
 pub mod vm;
 
 #[cfg(feature = "jit")]

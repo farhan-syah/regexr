@@ -530,3 +530,33 @@ fn test_unicode_dot_all() {
     let m = re.find(text).unwrap();
     assert_eq!(m.as_str(), text);
 }
+
+// =============================================================================
+// Nested character classes (set union) — Rust `regex`-crate / HF semantics
+// =============================================================================
+
+#[test]
+fn test_nested_class_union() {
+    // `[a[b-c]d]` is the union {a, b, c, d}.
+    let re = regex(r"[a[b-c]d]+");
+    let text = "abcd x";
+    assert_eq!(re.find(text).unwrap().as_str(), "abcd");
+}
+
+#[test]
+fn test_negated_class_with_nested() {
+    // BLOOM-style: `[^(\s|[.,!])]+` — negated union of (, \s, |, ., ,, !.
+    let re = regex(r"[^(\s|[.,!])]+");
+    let text = "ab.c (x)";
+    let m: Vec<&str> = re.find_iter(text).map(|m| m.as_str()).collect();
+    assert_eq!(m, vec!["ab", "c", "x"]);
+}
+
+#[test]
+fn test_negated_nested_class_complement() {
+    // A negated nested class contributes its complement to the union: `[a[^0-9]]`
+    // = {a} ∪ (everything except digits) = everything except digits.
+    let re = regex(r"[a[^0-9]]+");
+    let text = "abc123";
+    assert_eq!(re.find(text).unwrap().as_str(), "abc");
+}
