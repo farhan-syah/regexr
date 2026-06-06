@@ -123,7 +123,10 @@ impl CompiledRegex {
         }
 
         if self.has_anchors {
-            if self.match_needs_end_of_text && end_pos != input.len() {
+            // `$`/`\Z` (EndOfText): at end of input, or just before a final newline.
+            if self.match_needs_end_of_text
+                && !crate::nfa::at_end_or_before_final_newline(input, end_pos)
+            {
                 return false;
             }
             if self.match_needs_end_of_line {
@@ -173,8 +176,69 @@ impl CompiledRegex {
             } else {
                 self.find_at(input, 0)
             }
+        } else if self.has_post_validated_assertions() {
+            // Unanchored patterns whose match end can be rejected by a stripped
+            // assertion (`$`/`\Z`, end-of-line, word boundary): a single scan may
+            // return a leftmost candidate that fails the assertion while a later
+            // start succeeds. Scan start positions, validating each candidate.
+            self.execute_unanchored_validated(input)
         } else {
             self.execute(input)
+        }
+    }
+
+    /// Whether a matched candidate can be rejected by `validate_end_assertions`.
+    #[inline]
+    fn has_post_validated_assertions(&self) -> bool {
+        self.match_needs_end_of_text
+            || self.match_needs_end_of_line
+            || (self.has_word_boundary
+                && (self.match_needs_word_boundary || self.match_needs_not_word_boundary))
+    }
+
+    /// Unanchored search that correctly handles post-validated assertions
+    /// (`$`/`\Z`, end-of-line, word boundaries) by iterating start positions.
+    fn execute_unanchored_validated(&self, input: &[u8]) -> Option<(usize, usize)> {
+        let mut from = 0usize;
+        loop {
+            let prev_class = if self.has_word_boundary && from > 0 {
+                CharClass::from_byte(input[from - 1])
+            } else {
+                CharClass::NonWord
+            };
+            let (rel_start, rel_end) = self.raw_match(&input[from..], prev_class)?;
+            let start = from + rel_start;
+            let end = from + rel_end;
+            if self.validate_end_assertions(input, start, end, prev_class) {
+                return Some((start, end));
+            }
+            let next = start + 1;
+            if next > input.len() {
+                return None;
+            }
+            from = next;
+        }
+    }
+
+    /// Runs the JIT machine code on `input` and returns the raw (start, end)
+    /// match WITHOUT validating end assertions.
+    fn raw_match(&self, input: &[u8], prev_class: CharClass) -> Option<(usize, usize)> {
+        type MatchFn = unsafe extern "C" fn(*const u8, usize) -> i64;
+
+        let entry = if self.has_word_boundary && prev_class == CharClass::Word {
+            self.entry_point_word.unwrap_or(self.entry_point)
+        } else {
+            self.entry_point
+        };
+
+        let func: MatchFn = unsafe { std::mem::transmute(self.code.ptr(entry)) };
+        let result = unsafe { func(input.as_ptr(), input.len()) };
+
+        if result >= 0 {
+            let packed = result as u64;
+            Some(((packed >> 32) as usize, (packed & 0xFFFF_FFFF) as usize))
+        } else {
+            None
         }
     }
 
