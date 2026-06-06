@@ -159,6 +159,17 @@ impl TaggedNfaJitCompiler {
         }
     }
 
+    fn step_forces_backtrack(step: &PatternStep) -> bool {
+        Self::step_consumes_input(step)
+            || matches!(
+                step,
+                PatternStep::PositiveLookahead(_)
+                    | PatternStep::NegativeLookahead(_)
+                    | PatternStep::PositiveLookbehind(_, _)
+                    | PatternStep::NegativeLookbehind(_, _)
+            )
+    }
+
     fn calc_min_len(steps: &[PatternStep]) -> usize {
         steps
             .iter()
@@ -647,6 +658,25 @@ impl TaggedNfaJitCompiler {
         Ok(())
     }
 
+    /// Emits an end-of-text (`$`/`\Z`) assertion at the current position (x22).
+    ///
+    /// Matches at the true end of input, or one byte before a trailing `\n`
+    /// (mirrors the x86_64 backend and the reference semantics for `$`). A bare
+    /// `cmp x22, x20 ; b.ne` would reject a match positioned before a final
+    /// newline, which is wrong for patterns like `\p{N}+$` on "99\n".
+    fn emit_end_of_text(&mut self, fail_label: dynasmrt::DynamicLabel) -> Result<()> {
+        use dynasmrt::DynasmLabelApi;
+        let ok = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch aarch64
+            ; cmp x22, x20 ; b.eq =>ok                        // at end of input
+            ; add x1, x22, 1 ; cmp x1, x20 ; b.ne =>fail_label // not one byte from end
+            ; ldrb w0, [x19, x22] ; cmp w0, 0x0A ; b.ne =>fail_label // that byte must be '\n'
+            ; =>ok
+        );
+        Ok(())
+    }
+
     fn emit_step_inline(
         &mut self,
         step: &PatternStep,
@@ -700,7 +730,7 @@ impl TaggedNfaJitCompiler {
                 dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>fail_label);
             }
             PatternStep::EndOfText => {
-                dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.ne =>fail_label);
+                self.emit_end_of_text(fail_label)?;
             }
             PatternStep::StartOfLine => {
                 let at_start = self.asm.new_dynamic_label();
@@ -727,9 +757,7 @@ impl TaggedNfaJitCompiler {
                     let is_last = i == alts.len() - 1;
                     let try_next = self.asm.new_dynamic_label();
                     dynasm!(self.asm ; .arch aarch64 ; str x22, [sp, -16]!);
-                    for s in alt_steps {
-                        self.emit_step_inline(s, try_next)?;
-                    }
+                    self.emit_alt_branch_steps(alt_steps, try_next)?;
                     dynasm!(self.asm ; .arch aarch64 ; add sp, sp, 16 ; b =>success);
                     dynasm!(self.asm ; .arch aarch64 ; =>try_next ; ldr x22, [sp], 16);
                     if is_last {
@@ -779,11 +807,17 @@ impl TaggedNfaJitCompiler {
                     }
                 }
                 PatternStep::EndOfText => {
-                    if positive {
-                        dynasm!(self.asm ; .arch aarch64 ; cmp x9, x20 ; b.ne =>fail_label);
-                    } else {
-                        dynasm!(self.asm ; .arch aarch64 ; cmp x9, x20 ; b.ne =>inner_match);
-                    }
+                    // End of input, or one byte before a trailing '\n' (matches
+                    // `$`/`\Z` semantics). x9 is the lookahead scan position.
+                    let not_eot = if positive { fail_label } else { inner_match };
+                    let ok = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch aarch64
+                        ; cmp x9, x20 ; b.eq =>ok
+                        ; add x1, x9, 1 ; cmp x1, x20 ; b.ne =>not_eot
+                        ; ldrb w0, [x19, x9] ; cmp w0, 0x0A ; b.ne =>not_eot
+                        ; =>ok
+                    );
                 }
                 _ => {
                     return Err(Error::new(
@@ -997,7 +1031,7 @@ impl TaggedNfaJitCompiler {
                     dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>byte_mismatch);
                 }
                 PatternStep::EndOfText => {
-                    dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.ne =>byte_mismatch);
+                    self.emit_end_of_text(byte_mismatch)?;
                 }
                 PatternStep::StartOfLine => {
                     let at_start = self.asm.new_dynamic_label();
@@ -1032,9 +1066,7 @@ impl TaggedNfaJitCompiler {
                         } else {
                             self.asm.new_dynamic_label()
                         };
-                        for s in alt_steps {
-                            self.emit_alt_step(s, try_next)?;
-                        }
+                        self.emit_alt_branch_steps(alt_steps, try_next)?;
                         dynasm!(self.asm ; .arch aarch64 ; b =>alt_success);
                         if !is_last {
                             dynasm!(self.asm ; .arch aarch64 ; =>try_next ; mov x22, x23);
@@ -1128,6 +1160,55 @@ impl TaggedNfaJitCompiler {
         fail_label: dynasmrt::DynamicLabel,
     ) -> Result<()> {
         self.emit_step_inline(step, fail_label)
+    }
+
+    /// Emits the steps of one alternation branch, honouring backtracking.
+    ///
+    /// A greedy quantifier followed by input-consuming steps must be able to
+    /// give back characters so the trailing steps can match (e.g. the `\s+[\r\n]`
+    /// arm of `\s*[\r\n]` on " \n" must give back the `\n`). The plain
+    /// `emit_alt_step` loop emits a possessive greedy loop that overconsumes and
+    /// wrongly fails the branch, so detect this shape and use the backtracking
+    /// emitters instead (mirrors the x86_64 backend).
+    fn emit_alt_branch_steps(
+        &mut self,
+        alt_steps: &[PatternStep],
+        fail_label: dynasmrt::DynamicLabel,
+    ) -> Result<()> {
+        let mut si = 0;
+        while si < alt_steps.len() {
+            let step = &alt_steps[si];
+            match step {
+                PatternStep::GreedyStar(bc) | PatternStep::GreedyPlus(bc) => {
+                    let remaining = &alt_steps[si + 1..];
+                    if remaining.iter().any(Self::step_consumes_input) {
+                        if matches!(step, PatternStep::GreedyPlus(_)) {
+                            self.emit_greedy_plus_with_backtracking(
+                                &bc.ranges, remaining, fail_label,
+                            )?;
+                        } else {
+                            self.emit_greedy_star_with_backtracking(
+                                &bc.ranges, remaining, fail_label,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
+                PatternStep::GreedyCodepointPlus(cp) => {
+                    let remaining = &alt_steps[si + 1..];
+                    if remaining.iter().any(Self::step_forces_backtrack) {
+                        self.emit_greedy_codepoint_plus_with_backtracking(
+                            cp, remaining, fail_label,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            self.emit_alt_step(step, fail_label)?;
+            si += 1;
+        }
+        Ok(())
     }
 
     fn emit_greedy_plus_with_backtracking(
@@ -1336,7 +1417,7 @@ impl TaggedNfaJitCompiler {
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
                 }
                 PatternStep::EndOfText => {
-                    dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.ne =>la_mismatch);
+                    self.emit_end_of_text(la_mismatch)?;
                 }
                 _ => {}
             }
@@ -1383,7 +1464,7 @@ impl TaggedNfaJitCompiler {
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
                 }
                 PatternStep::EndOfText => {
-                    dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.ne =>la_mismatch);
+                    self.emit_end_of_text(la_mismatch)?;
                 }
                 _ => {}
             }
@@ -1570,7 +1651,7 @@ impl TaggedNfaJitCompiler {
                 dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>fail_label);
             }
             PatternStep::EndOfText => {
-                dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.ne =>fail_label);
+                self.emit_end_of_text(fail_label)?;
             }
             PatternStep::StartOfLine => {
                 let at_start = self.asm.new_dynamic_label();
