@@ -10,6 +10,7 @@
 
 # Project specific
 /research/
+/releases/
 /.claude/
 CLAUDE.md
 
