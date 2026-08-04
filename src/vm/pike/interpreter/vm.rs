@@ -55,16 +55,9 @@ impl PikeVm {
     /// lookbehind see the bytes before `from` — unlike searching a slice that
     /// begins there.
     pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
-        for start in from..=input.len() {
-            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
-            if !crate::nfa::is_utf8_boundary(input, start) {
-                continue;
-            }
-            if let Some(end) = self.match_at(input, start) {
-                return Some((start, end));
-            }
-        }
-        None
+        let mut ctx = self.create_context();
+        self.captures_unanchored_with_context(input, &mut ctx, from)
+            .and_then(|caps| caps.first().copied().flatten())
     }
 
     /// Returns capture groups for the first match.
@@ -76,15 +69,8 @@ impl PikeVm {
     ///
     /// Keeps the full left context visible, like [`PikeVm::find_from`].
     pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
-        for start in from..=input.len() {
-            if !crate::nfa::is_utf8_boundary(input, start) {
-                continue;
-            }
-            if let Some(captures) = self.captures_at(input, start) {
-                return Some(captures);
-            }
-        }
-        None
+        let mut ctx = self.create_context();
+        self.captures_unanchored_with_context(input, &mut ctx, from)
     }
 
     /// Finds a match starting at the given position.
@@ -127,106 +113,214 @@ impl PikeVm {
         self.captures_with_context(input, ctx, 0)
     }
 
-    /// Returns capture groups using a pre-allocated context, starting from a given position.
+    /// Returns capture groups using a pre-allocated context, for a match that
+    /// must begin exactly at `start_pos`.
+    ///
+    /// This is the *anchored* entry point: no other start position is tried, so
+    /// a pattern whose match begins later reports no match. Use
+    /// [`PikeVm::captures_unanchored_with_context`] to search.
     pub fn captures_with_context(
         &self,
         input: &[u8],
         ctx: &mut PikeVmContext,
         start_pos: usize,
     ) -> Option<Vec<Option<(usize, usize)>>> {
+        self.run(input, ctx, start_pos, false)
+    }
+
+    /// Returns capture groups for the leftmost match starting at or after `from`,
+    /// in a **single pass** over the input.
+    ///
+    /// Rather than restarting the whole simulation at every candidate position —
+    /// which costs O(n) passes over an n-byte input — this seeds one fresh start
+    /// thread per position into the same priority queue. Threads seeded earlier
+    /// carry a smaller `seq` and therefore outrank later ones, which is exactly
+    /// leftmost-first: a match from an earlier start always preempts a later one.
+    /// A backreference pattern is the one exception: see below.
+    pub fn captures_unanchored_with_context(
+        &self,
+        input: &[u8],
+        ctx: &mut PikeVmContext,
+        from: usize,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
+        if from > input.len() {
+            return None;
+        }
+
+        // The single pass relies on per-position deduplication by NFA state:
+        // when two threads reach the same state, the lower-priority one is
+        // dropped as redundant. A backreference breaks that premise — what a
+        // thread matches next depends on the text it captured, not just on its
+        // state — so two threads in the same state with different capture
+        // histories are *not* interchangeable. With one start position in flight
+        // that rarely bites, but seeding every position puts threads from many
+        // starts in the same generation and the wrong one wins. Restart per
+        // position for these. (Backreference patterns normally go to the
+        // backtracking engine; the PikeVM only sees them as a fallback.)
+        if self.nfa.has_backrefs {
+            for start in from..=input.len() {
+                if !crate::nfa::is_utf8_boundary(input, start) {
+                    continue;
+                }
+                if let Some(caps) = self.run(input, ctx, start, false) {
+                    return Some(caps);
+                }
+            }
+            return None;
+        }
+
+        self.run(input, ctx, from, true)
+    }
+
+    /// Schedules a fresh start thread at `pos`.
+    ///
+    /// Called when the main loop has reached `pos`, so every thread already
+    /// queued for `pos` was scheduled on an earlier iteration and holds a smaller
+    /// `seq`. The new thread is therefore the lowest-priority one at `pos`.
+    fn seed_start_thread(&self, ctx: &mut PikeVmContext, pos: usize, capture_count: usize) {
+        let seq = ctx.seq_counter;
+        ctx.seq_counter += 1;
+        ctx.future_threads.push(PendingThread {
+            pos,
+            seq,
+            thread: Thread::new(self.nfa.start, capture_count, pos),
+        });
+    }
+
+    /// The thread simulation shared by the anchored and unanchored entry points.
+    ///
+    /// All threads — whether they advance by a byte or by a multi-byte codepoint —
+    /// flow through a single priority-ordered queue keyed on (position, seq).
+    /// `seq` is assigned in priority order as threads are scheduled, so at any
+    /// position the highest-priority thread is processed first. Greedy vs
+    /// non-greedy is encoded entirely in the NFA's epsilon ordering (preserved by
+    /// the closure), so no special non-greedy bookkeeping is needed here.
+    ///
+    /// When `unanchored`, a start thread is seeded at every codepoint boundary
+    /// from `from` onwards until a match exists; after that no later start could
+    /// win, so seeding stops and the loop only visits positions that still hold
+    /// threads.
+    fn run(
+        &self,
+        input: &[u8],
+        ctx: &mut PikeVmContext,
+        from: usize,
+        unanchored: bool,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
         ctx.reset();
         ctx.ensure_state_capacity(self.nfa.states.len());
 
         let capture_count = self.nfa.capture_count as usize;
 
-        // Schedule the initial thread. All threads — whether they advance by a byte
-        // or by a multi-byte codepoint — flow through a single priority-ordered
-        // queue keyed on (position, seq). `seq` is assigned in priority order as
-        // threads are scheduled, so at any position the highest-priority thread is
-        // processed first. Greedy vs non-greedy is encoded entirely in the NFA's
-        // epsilon ordering (preserved by the closure), so no special non-greedy
-        // bookkeeping is needed here.
-        let seq = ctx.seq_counter;
-        ctx.seq_counter += 1;
-        ctx.future_threads.push(PendingThread {
-            pos: start_pos,
-            seq,
-            thread: Thread::new(self.nfa.start, capture_count),
-        });
+        if !unanchored {
+            self.seed_start_thread(ctx, from, capture_count);
+        }
 
         let mut matched: Option<Vec<Option<(usize, usize)>>> = None;
 
         // Buffer for the consuming successors scheduled at each position.
         let mut sched: Vec<(usize, Thread)> = Vec::new();
 
-        // Copy `pos` out of the peeked thread so the borrow ends before the body
-        // pops from / pushes to `future_threads` below.
-        while let Some(pos) = ctx.future_threads.peek().map(|pt| pt.pos) {
-            if pos > input.len() {
-                break;
+        let mut pos = from;
+        // Guards against re-seeding a position the loop revisits because threads
+        // were scheduled back onto it (a zero-width backreference jump).
+        let mut seeded_at: Option<usize> = None;
+
+        while pos <= input.len() {
+            if unanchored
+                && matched.is_none()
+                && seeded_at != Some(pos)
+                // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+                && crate::nfa::is_utf8_boundary(input, pos)
+            {
+                self.seed_start_thread(ctx, pos, capture_count);
+                seeded_at = Some(pos);
             }
 
-            // Fresh generation for per-position state deduplication.
-            ctx.generation = ctx.generation.wrapping_add(1);
-            ctx.current_threads.clear();
+            if matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                // Fresh generation for per-position state deduplication.
+                ctx.generation = ctx.generation.wrapping_add(1);
+                ctx.current_threads.clear();
 
-            // Drain every thread scheduled for this position. The heap yields them
-            // in (seq) priority order; the epsilon closure expands each into
-            // `current_threads`, preserving that order.
-            while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
-                let pt = ctx.future_threads.pop().unwrap();
-                self.add_thread(ctx, pt.thread, input, pos);
-            }
+                // Drain every thread scheduled for this position. The heap yields
+                // them in (seq) priority order; the epsilon closure expands each
+                // into `current_threads`, preserving that order.
+                while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                    let pt = ctx.future_threads.pop().unwrap();
+                    self.add_thread(ctx, pt.thread, input, pos);
+                }
 
-            // The first (highest-priority) thread to reach a match wins at this
-            // position and preempts every lower-priority thread. A higher-priority
-            // thread that is still consuming may overwrite this match at a later
-            // position (it comes from a more-preferred path).
-            let match_idx = ctx
-                .current_threads
-                .iter()
-                .position(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false));
-            if let Some(i) = match_idx {
-                let mut caps = ctx.current_threads[i].reconstruct_captures();
-                caps[0] = Some((start_pos, pos));
-                matched = Some(caps);
-            }
-            // Only threads strictly higher priority than the match advance.
-            let limit = match_idx.unwrap_or(ctx.current_threads.len());
+                // The first (highest-priority) thread to reach a match wins at
+                // this position and preempts every lower-priority thread. A
+                // higher-priority thread that is still consuming may overwrite
+                // this match at a later position (it comes from a more-preferred
+                // path — and, unanchored, from a start at or before this one).
+                let match_idx = ctx
+                    .current_threads
+                    .iter()
+                    .position(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false));
+                if let Some(i) = match_idx {
+                    let thread = &ctx.current_threads[i];
+                    let mut caps = thread.reconstruct_captures();
+                    caps[0] = Some((thread.start, pos));
+                    matched = Some(caps);
+                }
+                // Only threads strictly higher priority than the match advance.
+                let limit = match_idx.unwrap_or(ctx.current_threads.len());
 
-            // Schedule consuming successors in priority order so `seq` keeps
-            // reflecting pattern priority. A state may consume a byte (byte-range
-            // transitions) or a codepoint (`CodepointClass` instruction).
-            let byte = input.get(pos).copied();
-            sched.clear();
-            for thread in &ctx.current_threads[..limit] {
-                let state = match self.nfa.get(thread.state) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                if let Some(b) = byte {
-                    for (range, target) in &state.transitions {
-                        if range.contains(b) {
-                            sched.push((pos + 1, thread.clone_with_state(*target)));
+                // Schedule consuming successors in priority order so `seq` keeps
+                // reflecting pattern priority. A state may consume a byte
+                // (byte-range transitions) or a codepoint (`CodepointClass`).
+                let byte = input.get(pos).copied();
+                sched.clear();
+                for thread in &ctx.current_threads[..limit] {
+                    let state = match self.nfa.get(thread.state) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(b) = byte {
+                        for (range, target) in &state.transitions {
+                            if range.contains(b) {
+                                sched.push((pos + 1, thread.clone_with_state(*target)));
+                            }
+                        }
+                    }
+                    if let Some(NfaInstruction::CodepointClass(cpclass, target)) =
+                        &state.instruction
+                    {
+                        if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
+                            if cpclass.contains(cp) {
+                                sched.push((pos + len, thread.clone_with_state(*target)));
+                            }
                         }
                     }
                 }
-                if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
-                    if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
-                        if cpclass.contains(cp) {
-                            sched.push((pos + len, thread.clone_with_state(*target)));
-                        }
-                    }
+                for (npos, th) in sched.drain(..) {
+                    let seq = ctx.seq_counter;
+                    ctx.seq_counter += 1;
+                    ctx.future_threads.push(PendingThread {
+                        pos: npos,
+                        seq,
+                        thread: th,
+                    });
                 }
             }
-            for (npos, th) in sched.drain(..) {
-                let seq = ctx.seq_counter;
-                ctx.seq_counter += 1;
-                ctx.future_threads.push(PendingThread {
-                    pos: npos,
-                    seq,
-                    thread: th,
-                });
+
+            // Threads scheduled back onto `pos` (zero-width backref jump) get
+            // another round before the position advances.
+            if matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                continue;
+            }
+
+            // While still seeding, every position must be visited. Otherwise only
+            // positions that actually hold threads matter, so skip ahead.
+            if unanchored && matched.is_none() {
+                pos += 1;
+            } else {
+                match ctx.future_threads.peek().map(|pt| pt.pos) {
+                    Some(next) => pos = next,
+                    None => break,
+                }
             }
         }
 

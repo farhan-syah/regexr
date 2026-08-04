@@ -82,18 +82,11 @@ impl TaggedNfaEngine {
     /// slice beginning at `start`, so `^`, `\b` and lookbehind still see the
     /// preceding bytes.
     pub fn captures_from(&self, input: &[u8], start: usize) -> Option<Vec<Option<(usize, usize)>>> {
-        // Use PikeVm with cached context for capture extraction. Positions are
-        // tried in turn (like `find_at`); `captures_with_context` alone would
-        // only ever match at `start` itself.
+        // Searches for the match (like `find_at`) rather than requiring one at
+        // `start`; the unanchored entry point does that in a single pass, so the
+        // cost stays linear in the input rather than one full run per position.
         let mut ctx = self.pike_ctx.write().unwrap();
-        for pos in start..=input.len() {
-            if !crate::nfa::is_utf8_boundary(input, pos) {
-                continue;
-            }
-            if let Some(caps) = self.pike_vm.captures_with_context(input, &mut ctx, pos) {
-                return Some(caps);
-            }
-        }
-        None
+        self.pike_vm
+            .captures_unanchored_with_context(input, &mut ctx, start)
     }
 }

@@ -293,31 +293,22 @@ impl TaggedNfaJit {
         })
     }
 
-    /// Extracts captures with the fallback PikeVm, trying start positions from
-    /// `from` and reusing the cached context.
+    /// Extracts captures with the fallback PikeVm, searching from `from` and
+    /// reusing the cached context.
     ///
-    /// The scan is what makes this equivalent to `find`: `captures_with_context`
-    /// matches only at the position it is handed, so a single call at `from`
-    /// would answer "no match" for every pattern whose match starts later.
+    /// Searching is what makes this equivalent to `find`: the anchored
+    /// `captures_with_context` matches only at the position it is handed, so a
+    /// single call at `from` would answer "no match" for every pattern whose
+    /// match starts later. The unanchored entry point does the search in one
+    /// pass instead of one full VM run per candidate position.
     fn fallback_captures_from(
         &self,
         input: &[u8],
         from: usize,
     ) -> Option<Vec<Option<(usize, usize)>>> {
         let mut vm_ctx = self.fallback_vm_ctx.write().unwrap();
-        for pos in from..=input.len() {
-            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
-            if !crate::nfa::is_utf8_boundary(input, pos) {
-                continue;
-            }
-            if let Some(caps) = self
-                .fallback_vm
-                .captures_with_context(input, &mut vm_ctx, pos)
-            {
-                return Some(caps);
-            }
-        }
-        None
+        self.fallback_vm
+            .captures_unanchored_with_context(input, &mut vm_ctx, from)
     }
 
     /// Runs the capture-extracting JIT over `input`, which is either the whole

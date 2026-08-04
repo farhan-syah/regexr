@@ -169,16 +169,21 @@ pub struct Thread {
     pub capture_head: Option<Arc<CaptureNode>>,
     /// Number of capture groups (needed for reconstruction).
     pub capture_count: usize,
+    /// Input position where this thread's match attempt began — capture slot 0's
+    /// start. An unanchored pass keeps threads from many different start
+    /// positions in flight at once, so the start cannot be a property of the run.
+    pub start: usize,
 }
 
 impl Thread {
-    /// Create a new thread with no capture history.
+    /// Create a new thread with no capture history, beginning at `start`.
     #[inline]
-    pub fn new(state: StateId, capture_count: usize) -> Self {
+    pub fn new(state: StateId, capture_count: usize, start: usize) -> Self {
         Self {
             state,
             capture_head: None,
             capture_count,
+            start,
         }
     }
 
@@ -189,6 +194,7 @@ impl Thread {
             state,
             capture_head: self.capture_head.clone(), // Rc::clone is O(1)
             capture_count: self.capture_count,
+            start: self.start,
         }
     }
 
