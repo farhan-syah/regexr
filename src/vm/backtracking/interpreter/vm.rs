@@ -45,20 +45,7 @@ impl BacktrackingVm {
 
     /// Finds the first match in the input.
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
-        let num_slots = (self.capture_count as usize + 1) * 2;
-        let mut slots = vec![-1i32; num_slots];
-
-        for start in 0..=input.len() {
-            slots.fill(-1);
-            if self.exec(input, start, &mut slots) {
-                let s = slots[0];
-                let e = slots[1];
-                if s >= 0 && e >= 0 {
-                    return Some((s as usize, e as usize));
-                }
-            }
-        }
-        None
+        self.find_at(input, 0)
     }
 
     /// Finds a match starting at the given position.
@@ -81,10 +68,18 @@ impl BacktrackingVm {
 
     /// Returns captures for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
+        self.captures_from(input, 0)
+    }
+
+    /// Returns captures for the first match starting at or after `from`.
+    ///
+    /// The whole input is handed to every attempt, so `^`, `\b` and lookbehind
+    /// still see the bytes before `from`.
+    pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
 
-        for start in 0..=input.len() {
+        for start in from..=input.len() {
             slots.fill(-1);
             if self.exec(input, start, &mut slots) {
                 return Some(self.extract_captures(&slots));

@@ -259,10 +259,23 @@ impl Prefilter {
 
     /// Returns an iterator over all candidate positions.
     pub fn find_candidates<'a, 'h>(&'a self, haystack: &'h [u8]) -> CandidateIter<'a, 'h> {
+        self.find_candidates_from(haystack, 0)
+    }
+
+    /// Returns an iterator over the candidate positions at or after `start`.
+    ///
+    /// The full haystack is kept, so the engine verifying a candidate still sees
+    /// the bytes before `start` (needed by `^`, `\b` and lookbehind); only the
+    /// scan itself is resumed at `start`.
+    pub fn find_candidates_from<'a, 'h>(
+        &'a self,
+        haystack: &'h [u8],
+        start: usize,
+    ) -> CandidateIter<'a, 'h> {
         CandidateIter {
             prefilter: self,
             haystack,
-            pos: 0,
+            pos: start,
         }
     }
 
@@ -514,5 +527,23 @@ mod tests {
         let pf = Prefilter::SingleByte(b'o');
         let candidates: Vec<_> = pf.find_candidates(b"hello world").collect();
         assert_eq!(candidates, vec![4, 7]);
+    }
+
+    /// Resuming the scan drops the candidates before `start` but keeps the
+    /// haystack whole, so positions stay absolute.
+    #[test]
+    fn test_candidate_iter_from() {
+        let pf = Prefilter::SingleByte(b'o');
+        let candidates: Vec<_> = pf.find_candidates_from(b"hello world", 5).collect();
+        assert_eq!(candidates, vec![7]);
+
+        // A resume point past every candidate yields nothing, and one at the end
+        // of the haystack terminates rather than looping.
+        assert!(pf.find_candidates_from(b"hello world", 8).next().is_none());
+        assert!(pf.find_candidates_from(b"hello world", 11).next().is_none());
+
+        // Starting from 0 is exactly the unresumed scan.
+        let all: Vec<_> = pf.find_candidates_from(b"hello world", 0).collect();
+        assert_eq!(all, vec![4, 7]);
     }
 }

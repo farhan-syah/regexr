@@ -210,3 +210,99 @@ mod jit_word_boundary {
         assert_eq!(m.as_str(), "foo");
     }
 }
+
+// =============================================================================
+// Zero-width boundaries around an empty match
+// =============================================================================
+//
+// A boundary is a property of the *pair* of characters around a position, so an
+// empty match under `\b`/`\B` can only be decided once both neighbours are
+// known. Engines that resolve the assertion while building a start state — the
+// DFA family — cannot express these, so the selector routes such patterns to the
+// PikeVM. These cases lock that in.
+
+/// `\b` before a fully optional body: an empty match at every word boundary.
+#[test]
+fn test_word_boundary_with_optional_body() {
+    let re = regex(r"\bx?");
+    let spans: Vec<_> = re
+        .find_iter("ab ab")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(0, 0), (2, 2), (3, 3), (5, 5)]);
+}
+
+/// The `\B` mirror: an empty match at every position that is *not* a boundary.
+#[test]
+fn test_not_word_boundary_with_optional_body() {
+    let re = regex(r"\Bx?");
+    let spans: Vec<_> = re
+        .find_iter("ab ab")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(1, 1), (4, 4)]);
+}
+
+/// A star can match empty, so `\b\w*` yields the word plus the empty match at
+/// the boundary that closes it.
+#[test]
+fn test_word_boundary_with_star() {
+    let re = regex(r"\b\w*");
+    let spans: Vec<_> = re
+        .find_iter("ab cd")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(0, 2), (2, 2), (3, 5), (5, 5)]);
+}
+
+/// `\B` leading a nullable body, where the only matches are empty ones. The
+/// first is at position 0: no preceding character means no boundary there.
+#[test]
+fn test_not_word_boundary_leading_nullable() {
+    let re = regex(r"\Ba*");
+    let spans: Vec<_> = re.find_iter(" ab ").map(|m| (m.start(), m.end())).collect();
+    assert_eq!(spans, vec![(0, 0), (2, 2), (4, 4)]);
+}
+
+/// A trailing `\B` after a nullable prefix — the assertion sits at the match end
+/// but the match may still be empty.
+#[test]
+fn test_trailing_not_word_boundary_after_star() {
+    let re = regex(r"a*\B");
+    let spans: Vec<_> = re
+        .find_iter("aa bb")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(0, 1), (1, 1), (4, 4)]);
+}
+
+/// The empty match must not land inside a multi-byte codepoint: in "中a中" the
+/// only `\B` positions on codepoint boundaries are 0 and the end.
+#[test]
+fn test_boundary_empty_match_stays_on_codepoint_boundaries() {
+    let re = regex(r"a*\B");
+    let spans: Vec<_> = re
+        .find_iter("中a中")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(0, 0), (7, 7)]);
+}
+
+/// Non-empty matches under a boundary keep working — the routing must not
+/// change which text matches.
+#[test]
+fn test_boundary_non_empty_matches_unchanged() {
+    let re = regex(r"\bfoo");
+    let spans: Vec<_> = re
+        .find_iter("xfoo foo")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(5, 8)]);
+
+    let re = regex(r"\Bfoo");
+    let spans: Vec<_> = re
+        .find_iter("xfoo foo")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(1, 4)]);
+}

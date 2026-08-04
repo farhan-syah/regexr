@@ -197,10 +197,38 @@ impl JitShiftOr {
         func(input.as_ptr(), input.len(), self.accept, self.first)
     }
 
+    /// Finds the leftmost match starting at or after `from`.
+    ///
+    /// Left context is preserved without needing a start offset in the generated
+    /// code: a start anchor can only hold at 0, the word-boundary fallback reads
+    /// the preceding byte from the full input, and every other construct this
+    /// engine accepts is context-free (`is_shift_or_compatible` rejects
+    /// lookaround and multiline anchors). The end anchor is unaffected because a
+    /// suffix slice ends where the input does.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from > input.len() {
+            return None;
+        }
+        if self.has_leading_wb || self.has_trailing_wb {
+            return self.find_with_word_boundaries_from(input, from);
+        }
+        if self.has_start_anchor {
+            // `^` only holds at position 0, so a resumed search cannot match.
+            return if from == 0 { self.find(input) } else { None };
+        }
+        self.find(&input[from..]).map(|(s, e)| (from + s, from + e))
+    }
+
     /// Find with word boundary handling (fallback to Rust).
     fn find_with_word_boundaries(&self, input: &[u8]) -> Option<(usize, usize)> {
+        self.find_with_word_boundaries_from(input, 0)
+    }
+
+    /// Word-boundary fallback resumed at `from`, reading the byte before each
+    /// candidate start from the full input.
+    fn find_with_word_boundaries_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
         // Use similar logic to ShiftOr::find but with JIT for inner matching
-        for start in 0..input.len() {
+        for start in from..input.len() {
             let prev_is_word = if start > 0 {
                 is_word_byte(input[start - 1])
             } else {

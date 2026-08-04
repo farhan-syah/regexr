@@ -271,6 +271,58 @@ impl TaggedNfaJit {
 
     /// Returns capture groups for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
+        self.captures_from(input, 0)
+    }
+
+    /// Returns capture groups for the first match starting at or after `start`.
+    ///
+    /// Patterns that read left context (`^`, `\b`, lookbehind) are routed to the
+    /// interpreter, which matches at an absolute position with the full input
+    /// visible; the rest can run on the suffix slice (see [`TaggedNfaJit::find_at`]).
+    pub fn captures_from(&self, input: &[u8], start: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        if start > input.len() {
+            return None;
+        }
+        if start > 0 && self.needs_left_context {
+            return self.fallback_captures_from(input, start);
+        }
+        self.captures_in_suffix(&input[start..]).map(|caps| {
+            caps.into_iter()
+                .map(|slot| slot.map(|(s, e)| (start + s, start + e)))
+                .collect()
+        })
+    }
+
+    /// Extracts captures with the fallback PikeVm, trying start positions from
+    /// `from` and reusing the cached context.
+    ///
+    /// The scan is what makes this equivalent to `find`: `captures_with_context`
+    /// matches only at the position it is handed, so a single call at `from`
+    /// would answer "no match" for every pattern whose match starts later.
+    fn fallback_captures_from(
+        &self,
+        input: &[u8],
+        from: usize,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
+        let mut vm_ctx = self.fallback_vm_ctx.write().unwrap();
+        for pos in from..=input.len() {
+            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+            if !crate::nfa::is_utf8_boundary(input, pos) {
+                continue;
+            }
+            if let Some(caps) = self
+                .fallback_vm
+                .captures_with_context(input, &mut vm_ctx, pos)
+            {
+                return Some(caps);
+            }
+        }
+        None
+    }
+
+    /// Runs the capture-extracting JIT over `input`, which is either the whole
+    /// haystack or a suffix of it; positions are relative to `input`.
+    fn captures_in_suffix(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         // Get or create cached context
         let mut ctx_ref = self.cached_ctx.write().unwrap();
         let ctx = ctx_ref.get_or_insert_with(|| {
@@ -305,9 +357,10 @@ impl TaggedNfaJit {
         };
 
         if result == JIT_USE_INTERPRETER {
-            // Fall back to PikeVm
-            let mut ctx = self.fallback_vm_ctx.write().unwrap();
-            return self.fallback_vm.captures_with_context(input, &mut ctx, 0);
+            // This is the *normal* path for a pattern with no capture groups: the
+            // captures JIT is a stub for those (there is nothing to track), so it
+            // always requests the interpreter.
+            return self.fallback_captures_from(input, 0);
         }
 
         if result >= 0 {
@@ -366,7 +419,7 @@ impl TaggedNfaJit {
             if let Some(ref steps) = self.fallback_steps {
                 return TaggedNfa::find_at(steps, input, start);
             }
-            return self.fallback_vm.find_at(input, start);
+            return self.fallback_vm.find_from(input, start);
         }
 
         // JIT supports start offset by passing sliced input pointer
@@ -383,7 +436,7 @@ impl TaggedNfaJit {
                 if let Some(ref steps) = self.fallback_steps {
                     return TaggedNfa::find_at(steps, input, start);
                 }
-                return self.fallback_vm.find_at(input, start);
+                return self.fallback_vm.find_from(input, start);
             }
 
             return if result >= 0 {
@@ -418,7 +471,7 @@ impl TaggedNfaJit {
             if let Some(ref steps) = self.fallback_steps {
                 return TaggedNfa::find_at(steps, input, start);
             }
-            return self.fallback_vm.find_at(input, start);
+            return self.fallback_vm.find_from(input, start);
         }
 
         if result >= 0 {

@@ -46,7 +46,16 @@ impl PikeVm {
 
     /// Finds the first match, returning (start, end).
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
-        for start in 0..=input.len() {
+        self.find_from(input, 0)
+    }
+
+    /// Finds the leftmost match starting at or after `from`, returning (start, end).
+    ///
+    /// The whole input is passed to every attempt, so anchors, `\b`/`\B` and
+    /// lookbehind see the bytes before `from` — unlike searching a slice that
+    /// begins there.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        for start in from..=input.len() {
             // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
             if !crate::nfa::is_utf8_boundary(input, start) {
                 continue;
@@ -60,7 +69,14 @@ impl PikeVm {
 
     /// Returns capture groups for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
-        for start in 0..=input.len() {
+        self.captures_from(input, 0)
+    }
+
+    /// Returns capture groups for the leftmost match starting at or after `from`.
+    ///
+    /// Keeps the full left context visible, like [`PikeVm::find_from`].
+    pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        for start in from..=input.len() {
             if !crate::nfa::is_utf8_boundary(input, start) {
                 continue;
             }

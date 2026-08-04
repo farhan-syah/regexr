@@ -443,16 +443,15 @@ impl<'a> Iterator for Matches<'a> {
                     return None;
                 }
 
-                // Sliced as bytes, so the resume position never has to be a valid
-                // `&str` boundary: byte-level constructs (`.`, byte classes) match a
-                // single byte and can end inside a multi-byte codepoint.
-                let search_text = &self.text.as_bytes()[*last_end..];
-                match regex.inner.find(search_text) {
+                // The search is resumed at an offset into the *original* text
+                // rather than run on a slice starting there, so `^`, `\b`/`\B` and
+                // lookbehind still see the real text to the left of the resume
+                // point. The offset is a byte offset and need not be a valid
+                // `&str` boundary: byte-level constructs (`.`, byte classes)
+                // match a single byte and can end inside a multi-byte codepoint.
+                match regex.inner.find_from(self.text.as_bytes(), *last_end) {
                     None => None,
-                    Some((start, end)) => {
-                        let abs_start = *last_end + start;
-                        let abs_end = *last_end + end;
-
+                    Some((abs_start, abs_end)) => {
                         // Resume at the next UTF-8 character boundary, so no match ever
                         // starts inside a multi-byte codepoint (the engine-wide rule,
                         // see `nfa::is_utf8_boundary`). For empty matches, step one byte
@@ -491,33 +490,29 @@ impl<'r, 't> Iterator for CapturesIter<'r, 't> {
             return None;
         }
 
-        // Sliced as bytes for the same reason as `Matches::next`.
-        let search_text = &self.text.as_bytes()[self.last_end..];
-        match self.regex.inner.captures(search_text) {
+        // Resumed at an offset into the original text, for the same reason as
+        // `Matches::next`; the slots come back as absolute offsets.
+        match self
+            .regex
+            .inner
+            .captures_from(self.text.as_bytes(), self.last_end)
+        {
             None => None,
             Some(slots) => {
                 // Get the full match bounds (slot 0)
                 let (start, end) = slots.first().and_then(|s| *s)?;
-                let offset = self.last_end;
 
                 // Resume at the next UTF-8 character boundary, ensuring progress on
                 // empty matches by stepping one byte first (see `Matches::next`).
-                let abs_end = offset + end;
                 self.last_end = if start == end {
-                    ceil_char_boundary(self.text, abs_end + 1)
+                    ceil_char_boundary(self.text, end + 1)
                 } else {
-                    ceil_char_boundary(self.text, abs_end)
+                    ceil_char_boundary(self.text, end)
                 };
-
-                // Adjust all slot positions to absolute positions
-                let adjusted_slots: Vec<_> = slots
-                    .into_iter()
-                    .map(|slot| slot.map(|(s, e)| (offset + s, offset + e)))
-                    .collect();
 
                 Some(Captures {
                     text: self.text,
-                    slots: adjusted_slots,
+                    slots,
                     named_groups: Arc::clone(&self.regex.named_groups),
                 })
             }

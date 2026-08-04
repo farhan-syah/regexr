@@ -249,27 +249,46 @@ impl EagerDfa {
 
     /// Finds the first match in the input, returning (start, end).
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+        self.find_from(input, 0)
+    }
+
+    /// Finds the leftmost match starting at or after `from`.
+    ///
+    /// Attempts see the whole input (see [`EagerDfa::find_at`]), so the start
+    /// state is picked from the real preceding byte rather than from a slice
+    /// boundary.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from > input.len() {
+            return None;
+        }
+
         if self.has_start_anchor {
             if self.has_multiline_anchors {
                 // Multiline: try position 0 and after each newline
-                if let Some(end) = self.find_at(input, 0) {
-                    return Some((0, end));
+                if from == 0 {
+                    if let Some(end) = self.find_at(input, 0) {
+                        return Some((0, end));
+                    }
                 }
-                for (i, &byte) in input.iter().enumerate() {
-                    if byte == b'\n' && i < input.len() {
+                // Line starts at or after `from`: the newline itself may sit just
+                // before it, hence `from - 1`.
+                for (i, &byte) in input.iter().enumerate().skip(from.saturating_sub(1)) {
+                    if byte == b'\n' {
                         if let Some(end) = self.find_at(input, i + 1) {
                             return Some((i + 1, end));
                         }
                     }
                 }
                 None
-            } else {
+            } else if from == 0 {
                 // Non-multiline: only try position 0
                 self.find_at(input, 0).map(|end| (0, end))
+            } else {
+                None
             }
         } else {
             // No start anchor: try starting at each position
-            for start_pos in 0..=input.len() {
+            for start_pos in from..=input.len() {
                 if let Some(end) = self.find_at(input, start_pos) {
                     return Some((start_pos, end));
                 }

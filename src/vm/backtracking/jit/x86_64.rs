@@ -130,6 +130,8 @@ impl BacktrackingCompiler {
             code,
             match_fn,
             capture_count: self.capture_count,
+            // Attached by `compile_backtracking` when the pattern reads left context.
+            left_context_vm: None,
         })
     }
 

@@ -264,8 +264,27 @@ impl<'a> Matcher<'a> {
 /// Unicode semantics of Python `regex`/PCRE on valid UTF-8): a zero-width or
 /// optional construct must not match in the middle of a multi-byte codepoint.
 pub fn find(expr: &HirExpr, num_caps: usize, input: &[u8]) -> Option<(usize, usize)> {
+    find_from(expr, num_caps, input, 0)
+}
+
+/// Finds the leftmost-first match of `expr` starting at or after byte offset
+/// `from`, returning byte offsets into the whole `input`.
+///
+/// This is [`find`] resumed at an offset — the spec for how iteration continues.
+/// The whole input stays visible, so `^`, `\b`/`\B` and lookbehind are evaluated
+/// against the real surrounding text and not against a slice that begins at
+/// `from`.
+pub fn find_from(
+    expr: &HirExpr,
+    num_caps: usize,
+    input: &[u8],
+    from: usize,
+) -> Option<(usize, usize)> {
+    if from > input.len() {
+        return None;
+    }
     let matcher = Matcher { input };
-    for start in 0..=input.len() {
+    for start in from..=input.len() {
         // Skip continuation bytes (0b10xx_xxxx) — not codepoint starts.
         if start < input.len() && (input[start] & 0xC0) == 0x80 {
             continue;

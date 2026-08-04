@@ -58,19 +58,42 @@ impl TaggedNfaEngine {
     }
 
     /// Finds a match starting at or after the given position.
+    ///
+    /// The full input is passed with an explicit start position, so the search
+    /// keeps the left context of `start` (`^`, `\b`, lookbehind).
     pub fn find_at(&self, input: &[u8], start: usize) -> Option<(usize, usize)> {
         // Use fast step-based interpreter if pattern steps were extracted
         if let Some(ref steps) = self.steps {
             return TaggedNfa::find_at(steps, input, start);
         }
-        // Fall back to PikeVm
-        self.pike_vm.find_at(input, start)
+        // Fall back to PikeVm. `find_from`, not `find_at`: this method searches
+        // at or after `start`, while `PikeVm::find_at` tries only `start` itself.
+        self.pike_vm.find_from(input, start)
     }
 
     /// Returns capture groups for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
-        // Use PikeVm with cached context for capture extraction
+        self.captures_from(input, 0)
+    }
+
+    /// Returns capture groups for the first match starting at or after `start`.
+    ///
+    /// The full input is passed with an explicit start position rather than a
+    /// slice beginning at `start`, so `^`, `\b` and lookbehind still see the
+    /// preceding bytes.
+    pub fn captures_from(&self, input: &[u8], start: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        // Use PikeVm with cached context for capture extraction. Positions are
+        // tried in turn (like `find_at`); `captures_with_context` alone would
+        // only ever match at `start` itself.
         let mut ctx = self.pike_ctx.write().unwrap();
-        self.pike_vm.captures_with_context(input, &mut ctx, 0)
+        for pos in start..=input.len() {
+            if !crate::nfa::is_utf8_boundary(input, pos) {
+                continue;
+            }
+            if let Some(caps) = self.pike_vm.captures_with_context(input, &mut ctx, pos) {
+                return Some(caps);
+            }
+        }
+        None
     }
 }

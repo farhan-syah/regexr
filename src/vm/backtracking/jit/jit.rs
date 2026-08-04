@@ -5,6 +5,8 @@
 use crate::error::Result;
 use crate::hir::Hir;
 
+use super::super::interpreter::BacktrackingVm;
+
 use dynasmrt::ExecutableBuffer;
 
 #[cfg(target_arch = "x86_64")]
@@ -31,6 +33,17 @@ pub struct BacktrackingJit {
     pub(super) match_fn: MatchFn,
     /// Number of capture groups.
     pub(super) capture_count: u32,
+    /// Interpreter used for searches that start past position 0 when the pattern
+    /// depends on what precedes the match: a start anchor (`^` / `\A`) or
+    /// `\b`/`\B`. The generated code has no start-offset parameter, so such a
+    /// search would have to run on a slice — which makes the slice's first byte
+    /// look like the start of text and hides the preceding bytes. `None` when the
+    /// pattern reads no left context and slicing is therefore sound.
+    ///
+    /// Lookbehind is not in that list because it cannot reach this engine:
+    /// `compile_with_jit` only routes a pattern here when it has backreferences
+    /// and *no* lookaround.
+    pub(super) left_context_vm: Option<BacktrackingVm>,
 }
 
 impl BacktrackingJit {
@@ -87,12 +100,44 @@ impl BacktrackingJit {
 
     /// Finds a match starting at or after the given position.
     pub fn find_at(&self, input: &[u8], start: usize) -> Option<(usize, usize)> {
-        if start >= input.len() {
+        self.find_from(input, start)
+    }
+
+    /// Finds the leftmost match starting at or after `from`.
+    ///
+    /// Patterns that read left context go to the interpreter, which matches at an
+    /// absolute position with the full input visible (see `left_context_vm`);
+    /// everything else can safely run on the suffix slice, whose end — and so
+    /// `$`/`\Z` — is the end of the input.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from > input.len() {
             return None;
         }
-        // For now, search from start position
-        let slice = &input[start..];
-        self.find(slice).map(|(s, e)| (s + start, e + start))
+        if from == 0 {
+            return self.find(input);
+        }
+        if let Some(vm) = &self.left_context_vm {
+            return vm.find_at(input, from);
+        }
+        self.find(&input[from..]).map(|(s, e)| (s + from, e + from))
+    }
+
+    /// Returns capture groups for the leftmost match starting at or after `from`.
+    pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        if from > input.len() {
+            return None;
+        }
+        if from == 0 {
+            return self.captures(input);
+        }
+        if let Some(vm) = &self.left_context_vm {
+            return vm.captures_from(input, from);
+        }
+        self.captures(&input[from..]).map(|caps| {
+            caps.into_iter()
+                .map(|slot| slot.map(|(s, e)| (s + from, e + from)))
+                .collect()
+        })
     }
 
     /// Debug method to see raw results
@@ -118,7 +163,16 @@ pub fn compile_backtracking(hir: &Hir) -> Result<BacktrackingJit> {
     // during backtracking.
 
     let compiler = BacktrackingCompiler::new(hir)?;
-    compiler.compile()
+    let mut jit = compiler.compile()?;
+
+    // A resumed search can only slice the input when nothing in the pattern
+    // depends on what precedes the match start.
+    let props = &hir.props;
+    if props.has_start_anchor || props.has_multiline_anchors || props.has_word_boundary {
+        jit.left_context_vm = Some(BacktrackingVm::new(hir));
+    }
+
+    Ok(jit)
 }
 
 #[cfg(test)]

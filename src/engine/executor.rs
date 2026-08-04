@@ -18,7 +18,7 @@ use crate::vm::{
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::jit;
 
-use super::{select_engine, select_engine_from_hir, EngineType};
+use super::{needs_boundary_aware_empty_match, select_engine, select_engine_from_hir, EngineType};
 
 /// Returns true if the byte is a word character (alphanumeric or underscore).
 #[inline]
@@ -192,10 +192,25 @@ impl CompiledRegex {
 
     /// Finds the first match, returning (start, end).
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+        self.find_from(input, 0)
+    }
+
+    /// Finds the leftmost match starting at or after `from`, returning (start, end).
+    ///
+    /// This is the resume point used by iteration. The engines always get the
+    /// *whole* input plus a start offset — never a slice beginning at `from` — so
+    /// `^`, `\b`/`\B` and lookbehind see the real text to the left of the resume
+    /// position. The prefilter stays on the hot path: it is simply scanned from
+    /// `from` instead of from 0.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from > input.len() {
+            return None;
+        }
+
         // Fast path: if prefilter can provide full match bounds (TeddyFull),
         // return directly without running the NFA
         if self.prefilter.is_full_match() {
-            return self.prefilter.find_full_match(input, 0);
+            return self.prefilter.find_full_match(input, from);
         }
 
         // Special handling for InnerByte prefilter
@@ -203,12 +218,13 @@ impl CompiledRegex {
         // so we need to look back from the found position to find the actual start.
         if self.prefilter.is_inner_byte() {
             let lookback = self.prefilter.inner_byte_lookback();
-            let mut search_pos = 0;
+            let mut search_pos = from;
 
             while let Some(inner_pos) = self.prefilter.find_candidate(input, search_pos) {
                 // Find the likely start position by looking back for a word boundary
-                // (non-word char followed by word char, or start of input)
-                let start_pos = inner_pos.saturating_sub(lookback);
+                // (non-word char followed by word char, or start of input).
+                // The lookback never reaches behind the resume position.
+                let start_pos = inner_pos.saturating_sub(lookback).max(from);
                 let mut candidate = start_pos;
 
                 // Find the first word boundary in the lookback window
@@ -237,7 +253,7 @@ impl CompiledRegex {
         // IMPORTANT: Use find_at_pos (exact position) not find_at (linear search from pos)
         // The prefilter already tells us where candidates are - we only need to verify each one.
         if !self.prefilter.is_none() {
-            for candidate in self.prefilter.find_candidates(input) {
+            for candidate in self.prefilter.find_candidates_from(input, from) {
                 if let Some(result) = self.find_at_pos(input, candidate) {
                     return Some(result);
                 }
@@ -245,24 +261,34 @@ impl CompiledRegex {
             return None;
         }
 
-        // No prefilter - search from start
+        // No prefilter - let the engine scan from the resume position
+        self.find_engine_from(input, from)
+    }
+
+    /// Runs the engine's own unanchored search from `from`, with no prefilter.
+    ///
+    /// Every engine takes the full input plus a start offset. The two engines
+    /// whose generated code has no start-offset parameter (the backtracking and
+    /// tagged-NFA JITs) fall back internally to their interpreters for patterns
+    /// that read left context, so slicing never hides preceding bytes.
+    fn find_engine_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
         match &self.inner {
-            CompiledInner::PikeVm(vm) => vm.find(input),
-            CompiledInner::ShiftOr(so) => so.find(input),
-            CompiledInner::ShiftOrWide(so) => so.find(input),
-            CompiledInner::LazyDfa(dfa) => dfa.write().unwrap().find(input),
-            CompiledInner::EagerDfa(dfa) => dfa.find(input),
-            CompiledInner::CodepointClass(matcher) => matcher.find(input),
-            CompiledInner::BacktrackingVm(vm) => vm.find(input),
-            CompiledInner::TaggedNfaInterp(engine) => engine.find(input),
+            CompiledInner::PikeVm(vm) => vm.find_from(input, from),
+            CompiledInner::ShiftOr(so) => so.find_at(input, from),
+            CompiledInner::ShiftOrWide(so) => so.find_at(input, from),
+            CompiledInner::LazyDfa(dfa) => dfa.write().unwrap().find_from(input, from),
+            CompiledInner::EagerDfa(dfa) => dfa.find_from(input, from),
+            CompiledInner::CodepointClass(matcher) => matcher.find_from(input, from),
+            CompiledInner::BacktrackingVm(vm) => vm.find_at(input, from),
+            CompiledInner::TaggedNfaInterp(engine) => engine.find_at(input, from),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            CompiledInner::Jit(jit) => jit.find(input),
+            CompiledInner::Jit(jit) => jit.find_from(input, from),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            CompiledInner::TaggedNfaJit(engine) => engine.find(input),
+            CompiledInner::TaggedNfaJit(engine) => engine.find_at(input, from),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            CompiledInner::Backtracking(jit) => jit.find(input),
+            CompiledInner::Backtracking(jit) => jit.find_from(input, from),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            CompiledInner::JitShiftOr(jit) => jit.find(input),
+            CompiledInner::JitShiftOr(jit) => jit.find_from(input, from),
         }
     }
 
@@ -270,57 +296,52 @@ impl CompiledRegex {
     ///
     /// For Shift-Or, LazyDfa, and JIT engines, this uses a two-pass strategy:
     /// 1. Use the fast engine to find match bounds
-    /// 2. Use PikeVm on the matched substring to extract captures
+    /// 2. Re-run PikeVm at that match start to extract captures
     ///
     /// TaggedNfa performs single-pass capture extraction natively.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
+        self.captures_from(input, 0)
+    }
+
+    /// Returns capture groups for the first match starting at or after `from`.
+    ///
+    /// Like [`CompiledRegex::find_from`], the engines receive the whole input and
+    /// an explicit start offset, so a resumed search still sees the text to the
+    /// left of `from`. All reported slots are absolute input offsets.
+    pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        if from > input.len() {
+            return None;
+        }
         match &self.inner {
-            CompiledInner::PikeVm(vm) => vm.captures(input),
-            CompiledInner::CodepointClass(matcher) => matcher.captures(input),
+            CompiledInner::PikeVm(vm) => vm.captures_from(input, from),
+            CompiledInner::CodepointClass(matcher) => matcher.captures_from(input, from),
             CompiledInner::BacktrackingVm(vm) => {
                 // BacktrackingVm does single-pass capture extraction
-                vm.captures(input)
+                vm.captures_from(input, from)
             }
             CompiledInner::TaggedNfaInterp(engine) => {
                 // TaggedNfa interpreter does single-pass capture extraction
-                engine.captures(input)
+                engine.captures_from(input, from)
             }
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::TaggedNfaJit(engine) => {
                 // TaggedNfa JIT does single-pass capture extraction
-                engine.captures(input)
+                engine.captures_from(input, from)
             }
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::Backtracking(jit) => {
                 // Backtracking JIT does single-pass capture extraction
-                jit.captures(input)
+                jit.captures_from(input, from)
             }
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::Jit(_) => {
                 // Fast path: if we have BacktrackingVm, use it for single-pass capture extraction
                 if let Some(ref backtracking_vm) = self.backtracking_vm {
-                    return backtracking_vm.captures(input);
+                    return backtracking_vm.captures_from(input, from);
                 }
 
                 // Two-pass capture strategy for DFA JIT (fallback)
-                let (start, _end) = self.find(input)?;
-
-                // Use cached PikeVM and context to avoid allocations
-                self.get_or_init_capture_vm();
-                let vm_ref = self.capture_vm.read().unwrap();
-                let vm = vm_ref.as_ref()?;
-                let mut ctx_ref = self.capture_ctx.write().unwrap();
-                let ctx = ctx_ref.as_mut()?;
-
-                // Use the optimized context-based method
-                vm.captures_from_start_with_context(&input[start..], ctx)
-                    .map(|mut caps| {
-                        for (s, e) in caps.iter_mut().flatten() {
-                            *s += start;
-                            *e += start;
-                        }
-                        caps
-                    })
+                self.captures_two_pass(input, from)
             }
             CompiledInner::ShiftOr(_)
             | CompiledInner::ShiftOrWide(_)
@@ -328,56 +349,53 @@ impl CompiledRegex {
             | CompiledInner::EagerDfa(_) => {
                 // Fast path: if we have BacktrackingVm, use it for single-pass capture extraction
                 if let Some(ref backtracking_vm) = self.backtracking_vm {
-                    return backtracking_vm.captures(input);
+                    return backtracking_vm.captures_from(input, from);
                 }
 
-                // Two-pass capture strategy:
-                // 1. Find match bounds using fast engine
-                let (start, _end) = self.find(input)?;
-
-                // 2. Use cached PikeVM and context for fast capture extraction
-                self.get_or_init_capture_vm();
-                let vm_ref = self.capture_vm.read().unwrap();
-                let vm = vm_ref.as_ref()?;
-                let mut ctx_ref = self.capture_ctx.write().unwrap();
-                let ctx = ctx_ref.as_mut()?;
-
-                // Use the optimized context-based method
-                vm.captures_from_start_with_context(&input[start..], ctx)
-                    .map(|mut caps| {
-                        // Adjust capture positions to absolute offsets
-                        for (s, e) in caps.iter_mut().flatten() {
-                            *s += start;
-                            *e += start;
-                        }
-                        caps
-                    })
+                self.captures_two_pass(input, from)
             }
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::JitShiftOr(_) => {
                 // Use BacktrackingJit for capture extraction if available
                 // This is the JIT equivalent of BacktrackingVm used by non-JIT ShiftOr
                 if let Some(ref backtracking_jit) = self.backtracking_jit {
-                    return backtracking_jit.captures(input);
+                    return backtracking_jit.captures_from(input, from);
                 }
 
                 // Fall back to two-pass strategy if no BacktrackingJit
-                let (start, _end) = self.find(input)?;
-                self.get_or_init_capture_vm();
-                let vm_ref = self.capture_vm.read().unwrap();
-                let vm = vm_ref.as_ref()?;
-                let mut ctx_ref = self.capture_ctx.write().unwrap();
-                let ctx = ctx_ref.as_mut()?;
-                vm.captures_from_start_with_context(&input[start..], ctx)
-                    .map(|mut caps| {
-                        for (s, e) in caps.iter_mut().flatten() {
-                            *s += start;
-                            *e += start;
-                        }
-                        caps
-                    })
+                self.captures_two_pass(input, from)
             }
         }
+    }
+
+    /// Two-pass capture extraction for engines that only report match bounds:
+    /// 1. Find the match bounds with the fast engine (from `from`).
+    /// 2. Re-run the cached PikeVM at that exact start position.
+    ///
+    /// The second pass is given the full input and a start position rather than
+    /// a slice starting at the match, so the capture pass evaluates `^`, `\b` and
+    /// lookbehind against the same context the first pass used. Slots come back
+    /// as absolute offsets.
+    ///
+    /// A capture NFA is only built when the pattern actually has groups to
+    /// extract (see the `capture_nfa` fields set during compilation). With no
+    /// groups there is nothing for a second pass to do: the match bounds found in
+    /// step 1 *are* the whole capture set, and slot 0 is returned directly.
+    fn captures_two_pass(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        let (match_start, match_end) = self.find_from(input, from)?;
+
+        // Use cached PikeVM and context to avoid allocations
+        self.get_or_init_capture_vm();
+        let vm_ref = self.capture_vm.read().unwrap();
+        let vm = match vm_ref.as_ref() {
+            Some(vm) => vm,
+            // Group-less pattern: the full match is the only slot.
+            None => return Some(vec![Some((match_start, match_end))]),
+        };
+        let mut ctx_ref = self.capture_ctx.write().unwrap();
+        let ctx = ctx_ref.as_mut()?;
+
+        vm.captures_with_context(input, ctx, match_start)
     }
 
     /// Check if there's a match starting at `pos`.
@@ -737,6 +755,14 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         // `compile_with_pikevm` demotes any full-match literal prefilter to
         // candidate-only so it cannot short-circuit the leftmost-first match
         // (e.g. `a+?| $`, a non-greedy branch in an alternation).
+        return compile_with_pikevm(hir);
+    }
+
+    // A word boundary guarding an empty match (`\Ba*`, `\b(?:xy)?`) is not
+    // representable in the DFA JIT — see `needs_boundary_aware_empty_match`.
+    // Backreference patterns are left for the backtracking engine below, which
+    // evaluates assertions positionally and so is unaffected.
+    if needs_boundary_aware_empty_match(hir) && !hir.props.has_backrefs {
         return compile_with_pikevm(hir);
     }
 

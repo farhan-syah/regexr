@@ -29,12 +29,23 @@ impl CodepointClassMatcher {
 
     /// Finds the first character matching the class, returning (start, end) byte positions.
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
-        let s = std::str::from_utf8(input).ok()?;
+        self.find_from(input, 0)
+    }
 
-        for (byte_idx, ch) in s.char_indices() {
+    /// Finds the first matching character at or after byte offset `from`.
+    ///
+    /// A lone character class has no left context to lose (no anchors, no `\b`,
+    /// no lookbehind can reach this matcher), so resuming is just a matter of
+    /// starting the codepoint walk later. `from` must be a codepoint boundary;
+    /// otherwise there is no match to report.
+    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        let s = std::str::from_utf8(input).ok()?;
+        let rest = s.get(from..)?;
+
+        for (byte_idx, ch) in rest.char_indices() {
             let cp = ch as u32;
             if self.class.contains(cp) {
-                return Some((byte_idx, byte_idx + ch.len_utf8()));
+                return Some((from + byte_idx, from + byte_idx + ch.len_utf8()));
             }
         }
         None
@@ -42,7 +53,12 @@ impl CodepointClassMatcher {
 
     /// Returns captures for the first match (just the full match for a char class).
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
-        self.find(input).map(|m| vec![Some(m)])
+        self.captures_from(input, 0)
+    }
+
+    /// Returns captures for the first match at or after byte offset `from`.
+    pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        self.find_from(input, from).map(|m| vec![Some(m)])
     }
 }
 

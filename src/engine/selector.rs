@@ -22,6 +22,40 @@ fn hir_uses_codepoint_class(expr: &HirExpr) -> bool {
     }
 }
 
+/// Whether an HIR expression can match the empty string.
+///
+/// Zero-width constructs (anchors, lookaround, and a backreference to a group
+/// that captured nothing) consume no input and therefore match empty; a class or
+/// a non-empty literal never does. Repetition matches empty when it may run zero
+/// times or when its body can.
+pub fn hir_matches_empty(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Empty | HirExpr::Anchor(_) | HirExpr::Lookaround(_) | HirExpr::Backref(_) => true,
+        HirExpr::Literal(bytes) => bytes.is_empty(),
+        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => false,
+        HirExpr::Concat(exprs) => exprs.iter().all(hir_matches_empty),
+        HirExpr::Alt(branches) => branches.iter().any(hir_matches_empty),
+        HirExpr::Repeat(r) => r.min == 0 || hir_matches_empty(&r.expr),
+        HirExpr::Capture(c) => hir_matches_empty(&c.expr),
+    }
+}
+
+/// Whether a pattern combines a word boundary with the ability to match empty
+/// (`\b`, `\Ba*`, `\b(?:xy)?`, `a*\B`, …).
+///
+/// The DFA family resolves `\b`/`\B` while *building* a state's epsilon closure,
+/// but the truth of a boundary depends on the byte on **each** side of the
+/// position. For a non-empty match that is fine: the assertion is re-resolved
+/// when the next byte is consumed, so both sides are known. An empty match
+/// consumes nothing, so the DFA would have to decide the assertion at a point
+/// where the following byte has not been read — and the start state is built
+/// from a guess. That makes empty matches under a boundary unrepresentable in
+/// the DFA (and in the DFA JIT), so such patterns are routed to the PikeVM,
+/// which evaluates every assertion against the real position.
+pub fn needs_boundary_aware_empty_match(hir: &Hir) -> bool {
+    hir.props.has_word_boundary && hir_matches_empty(&hir.expr)
+}
+
 /// Recursively checks whether an HIR expression contains a user alternation
 /// (`a|b`). A DFA/Shift-Or matcher returns at its first/longest accepting state
 /// and therefore cannot honour ALTERNATION BRANCH PRIORITY: `ab|a` on "ab" must
@@ -104,6 +138,13 @@ pub fn select_engine_from_hir(hir: &Hir) -> EngineType {
     // instead of byte-level DFA transitions. LazyDFA cannot handle these -
     // only PikeVM and TaggedNFA support CodepointClass instructions.
     if hir_uses_codepoint_class(&hir.expr) {
+        return EngineType::PikeVm;
+    }
+
+    // A word boundary guarding an empty match cannot be expressed by the DFA
+    // family (see `needs_boundary_aware_empty_match`). Checked before Shift-Or,
+    // which has its own partial word-boundary handling.
+    if needs_boundary_aware_empty_match(hir) {
         return EngineType::PikeVm;
     }
 

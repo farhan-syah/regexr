@@ -160,30 +160,52 @@ impl CompiledRegex {
 
     /// Finds the first match in the input.
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+        self.find_from(input, 0)
+    }
+
+    /// Finds the leftmost match starting at or after `start_from`.
+    ///
+    /// This is `find` resumed at an offset. The bytes before `start_from` stay
+    /// visible: anchors are validated against the absolute position and the
+    /// preceding character class is handed to the JIT entry point, so `^` and
+    /// `\b` behave as they do in a search from 0. (Lookbehind cannot reach this
+    /// engine — lookaround patterns are routed to the tagged NFA.)
+    pub fn find_from(&self, input: &[u8], start_from: usize) -> Option<(usize, usize)> {
+        if start_from > input.len() {
+            return None;
+        }
+
         if self.has_start_anchor {
             if self.has_multiline_anchors {
-                if let Some((start, end)) = self.find_at(input, 0) {
-                    return Some((start, end));
+                if start_from == 0 {
+                    if let Some((start, end)) = self.find_at(input, 0) {
+                        return Some((start, end));
+                    }
                 }
-                for (i, &byte) in input.iter().enumerate() {
-                    if byte == b'\n' && i < input.len() {
+                // Line starts at or after `start_from`: the newline itself may
+                // sit just before it, hence `start_from - 1`.
+                let skip = start_from.saturating_sub(1);
+                for (i, &byte) in input.iter().enumerate().skip(skip) {
+                    if byte == b'\n' {
                         if let Some((start, end)) = self.find_at(input, i + 1) {
                             return Some((start, end));
                         }
                     }
                 }
                 None
-            } else {
+            } else if start_from == 0 {
                 self.find_at(input, 0)
+            } else {
+                None
             }
         } else if self.has_post_validated_assertions() {
             // Unanchored patterns whose match end can be rejected by a stripped
             // assertion (`$`/`\Z`, end-of-line, word boundary): a single scan may
             // return a leftmost candidate that fails the assertion while a later
             // start succeeds. Scan start positions, validating each candidate.
-            self.execute_unanchored_validated(input)
+            self.execute_unanchored_validated(input, start_from)
         } else {
-            self.execute(input)
+            self.find_at(input, start_from)
         }
     }
 
@@ -197,9 +219,14 @@ impl CompiledRegex {
     }
 
     /// Unanchored search that correctly handles post-validated assertions
-    /// (`$`/`\Z`, end-of-line, word boundaries) by iterating start positions.
-    fn execute_unanchored_validated(&self, input: &[u8]) -> Option<(usize, usize)> {
-        let mut from = 0usize;
+    /// (`$`/`\Z`, end-of-line, word boundaries) by iterating start positions
+    /// from `start_from`.
+    fn execute_unanchored_validated(
+        &self,
+        input: &[u8],
+        start_from: usize,
+    ) -> Option<(usize, usize)> {
+        let mut from = start_from;
         loop {
             let prev_class = if self.has_word_boundary && from > 0 {
                 CharClass::from_byte(input[from - 1])

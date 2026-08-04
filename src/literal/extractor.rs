@@ -52,13 +52,21 @@ pub fn extract_literals(hir: &Hir) -> Literals {
     let mut extractor = LiteralExtractor::new();
     let result = extractor.extract(&hir.expr);
 
-    // Patterns with backreferences, lookarounds, or word boundaries cannot be
-    // fully matched by literals alone - they require NFA verification.
+    // Patterns with backreferences, lookarounds, word boundaries or anchors
+    // cannot be fully matched by literals alone - they require NFA verification.
     // Set prefix_complete = false to prevent TeddyFull from bypassing NFA.
+    //
+    // Anchors count here because the extractor skips them while collecting
+    // prefixes: `^[ab]` yields the complete literals "a"/"b", and a full-match
+    // prefilter would then report every "a"/"b" in the haystack as a match,
+    // ignoring the `^` — including at every resume position of an iteration.
+    // Demoting to a candidate-only prefilter keeps the literal scan (and its
+    // SIMD skipping) while letting the engine enforce the anchor.
     let prefix_complete = result.complete
         && !hir.props.has_backrefs
         && !hir.props.has_lookaround
-        && !hir.props.has_word_boundary;
+        && !hir.props.has_word_boundary
+        && !hir.props.has_anchors;
 
     // If no prefix literals found, check if pattern starts with digit class
     let starts_with_digit = result.prefixes.is_empty() && starts_with_digit_class(&hir.expr);

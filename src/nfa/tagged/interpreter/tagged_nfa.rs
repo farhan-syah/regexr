@@ -15,25 +15,23 @@ pub struct TaggedNfa;
 impl TaggedNfa {
     /// Finds the first match in the input.
     pub fn find(steps: &[PatternStep], input: &[u8]) -> Option<(usize, usize)> {
-        for start in 0..=input.len() {
-            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
-            if !crate::nfa::is_utf8_boundary(input, start) {
-                continue;
-            }
-            if let Some(end) = Self::match_at(steps, input, start) {
-                return Some((start, end));
-            }
-        }
-        None
+        Self::find_at(steps, input, 0)
     }
 
     /// Finds a match starting at or after the given position.
+    ///
+    /// The full input is passed to every attempt, so steps that read left
+    /// context (`^`, `\b`, lookbehind) see the real preceding bytes.
     pub fn find_at(
         steps: &[PatternStep],
         input: &[u8],
         start_from: usize,
     ) -> Option<(usize, usize)> {
         for start in start_from..=input.len() {
+            // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+            if !crate::nfa::is_utf8_boundary(input, start) {
+                continue;
+            }
             if let Some(end) = Self::match_at(steps, input, start) {
                 return Some((start, end));
             }

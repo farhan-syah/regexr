@@ -127,12 +127,16 @@ impl CompiledRegex {
     /// if that candidate fails its end assertion (e.g. `x?$` matches empty at the
     /// leftmost position, but `$` does not hold there), we must continue scanning
     /// from the next start position rather than giving up. This iterates start
-    /// positions, taking the JIT's match at each, until one satisfies the
-    /// assertion. For end anchors this is complete: `$` only holds at end-of-text
-    /// or before a final `\n`, so the greedy end is the sole `$`-satisfying
-    /// candidate at any start (no shorter end can satisfy it).
-    fn execute_unanchored_validated(&self, input: &[u8]) -> Option<(usize, usize)> {
-        let mut from = 0usize;
+    /// positions from `from`, taking the JIT's match at each, until one satisfies
+    /// the assertion. For end anchors this is complete: `$` only holds at
+    /// end-of-text or before a final `\n`, so the greedy end is the sole
+    /// `$`-satisfying candidate at any start (no shorter end can satisfy it).
+    fn execute_unanchored_validated(
+        &self,
+        input: &[u8],
+        start_from: usize,
+    ) -> Option<(usize, usize)> {
+        let mut from = start_from;
         loop {
             let prev_class = if self.has_word_boundary && from > 0 {
                 CharClass::from_byte(input[from - 1])
@@ -250,24 +254,46 @@ impl CompiledRegex {
     /// that searches the entire input. The JIT internally handles word boundary context tracking.
     /// For anchored patterns (^), we iterate over valid start positions.
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+        self.find_from(input, 0)
+    }
+
+    /// Finds the leftmost match starting at or after `start_from`.
+    ///
+    /// This is `find` resumed at an offset. The bytes before `start_from` are
+    /// never hidden: anchors are validated against the absolute position and the
+    /// character class preceding the scan is handed to the JIT entry point, so
+    /// `^` and `\b` behave as they do in a search from 0. (Lookbehind cannot
+    /// reach this engine — lookaround patterns are routed to the tagged NFA.)
+    pub fn find_from(&self, input: &[u8], start_from: usize) -> Option<(usize, usize)> {
+        if start_from > input.len() {
+            return None;
+        }
+
         // For patterns with start anchors, we need to try specific positions
         if self.has_start_anchor {
             if self.has_multiline_anchors {
                 // Multiline mode: try position 0 and after each newline
-                if let Some((start, end)) = self.find_at(input, 0) {
-                    return Some((start, end));
+                if start_from == 0 {
+                    if let Some((start, end)) = self.find_at(input, 0) {
+                        return Some((start, end));
+                    }
                 }
-                for (i, &byte) in input.iter().enumerate() {
-                    if byte == b'\n' && i < input.len() {
+                // Line starts at or after `start_from`: the newline itself may
+                // sit just before it, hence `start_from - 1`.
+                let skip = start_from.saturating_sub(1);
+                for (i, &byte) in input.iter().enumerate().skip(skip) {
+                    if byte == b'\n' {
                         if let Some((start, end)) = self.find_at(input, i + 1) {
                             return Some((start, end));
                         }
                     }
                 }
                 None
-            } else {
+            } else if start_from == 0 {
                 // Non-multiline: only try position 0
                 self.find_at(input, 0)
+            } else {
+                None
             }
         } else if self.has_post_validated_assertions() {
             // Unanchored patterns whose match end can be rejected by a stripped
@@ -275,11 +301,13 @@ impl CompiledRegex {
             // return a leftmost candidate that fails the assertion while a later
             // start succeeds (e.g. `x?$` on "abc" → empty match at the end). Scan
             // start positions, validating each candidate.
-            self.execute_unanchored_validated(input)
+            self.execute_unanchored_validated(input, start_from)
         } else {
             // Unanchored patterns with no post-validated assertion: the JIT's
             // single internal scan returns the correct leftmost match directly.
-            self.execute(input)
+            // `find_at` is that same single scan, entered at `start_from` with the
+            // preceding character class supplied.
+            self.find_at(input, start_from)
         }
     }
 
