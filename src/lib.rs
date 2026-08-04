@@ -236,6 +236,11 @@ impl Regex {
     }
 
     /// Returns an iterator over all non-overlapping matches.
+    ///
+    /// Match spans are exactly what the engine reports, which for byte-level
+    /// constructs (`.`, byte classes) can be a single byte inside a multi-byte
+    /// codepoint. The search always resumes at the next codepoint boundary, so
+    /// no match starts inside a codepoint (see `nfa::is_utf8_boundary`).
     pub fn find_iter<'a>(&'a self, text: &'a str) -> Matches<'a> {
         Matches::new(self, text)
     }
@@ -263,11 +268,14 @@ impl Regex {
         match self.find(text) {
             None => std::borrow::Cow::Borrowed(text),
             Some(m) => {
-                let mut result = String::with_capacity(text.len() + rep.len());
-                result.push_str(&text[..m.start()]);
-                result.push_str(rep);
-                result.push_str(&text[m.end()..]);
-                std::borrow::Cow::Owned(result)
+                // Assembled as bytes: a byte-level match can split a codepoint, so
+                // the surrounding pieces are not always valid `&str` slices.
+                let bytes = text.as_bytes();
+                let mut result = Vec::with_capacity(text.len() + rep.len());
+                result.extend_from_slice(&bytes[..m.start()]);
+                result.extend_from_slice(rep.as_bytes());
+                result.extend_from_slice(&bytes[m.end()..]);
+                std::borrow::Cow::Owned(into_string_lossy(result))
             }
         }
     }
@@ -279,22 +287,24 @@ impl Regex {
 
     /// Replaces all matches with the replacement string.
     pub fn replace_all<'t>(&self, text: &'t str, rep: &str) -> std::borrow::Cow<'t, str> {
+        let bytes = text.as_bytes();
         let mut last_end = 0;
-        let mut result = String::new();
+        // Assembled as bytes: see `replace`.
+        let mut result = Vec::new();
         let mut had_match = false;
 
         for m in self.find_iter(text) {
             had_match = true;
-            result.push_str(&text[last_end..m.start()]);
-            result.push_str(rep);
+            result.extend_from_slice(&bytes[last_end..m.start()]);
+            result.extend_from_slice(rep.as_bytes());
             last_end = m.end();
         }
 
         if !had_match {
             std::borrow::Cow::Borrowed(text)
         } else {
-            result.push_str(&text[last_end..]);
-            std::borrow::Cow::Owned(result)
+            result.extend_from_slice(&bytes[last_end..]);
+            std::borrow::Cow::Owned(into_string_lossy(result))
         }
     }
 }
@@ -319,8 +329,24 @@ impl<'t> Match<'t> {
     }
 
     /// Returns the matched text.
+    ///
+    /// Byte-level constructs (`.` and byte classes generally, see
+    /// [`hir::HirClass`]) match a single byte, so a match span is not always a
+    /// valid `&str` slice — it can split a multi-byte codepoint. In that case
+    /// this returns `""`; [`Match::as_bytes`] always returns the exact span.
     pub fn as_str(&self) -> &'t str {
-        &self.text[self.start..self.end]
+        self.text.get(self.start..self.end).unwrap_or("")
+    }
+
+    /// Returns the matched bytes.
+    ///
+    /// Unlike [`Match::as_str`] this is always the exact span the engine
+    /// matched, even when that span splits a multi-byte codepoint.
+    pub fn as_bytes(&self) -> &'t [u8] {
+        self.text
+            .as_bytes()
+            .get(self.start..self.end)
+            .unwrap_or(&[])
     }
 
     /// Returns the byte range of the match.
@@ -336,6 +362,30 @@ impl<'t> Match<'t> {
     /// Returns true if the match is empty.
     pub fn is_empty(&self) -> bool {
         self.start == self.end
+    }
+}
+
+/// Returns the smallest index `>= i` that is a UTF-8 codepoint boundary of
+/// `text`. Indices at or past the end of `text` are returned unchanged, so
+/// callers can use `i + 1` to force forward progress past the last byte.
+///
+/// `std`'s `is_char_boundary` is the sole authority on what a boundary is.
+fn ceil_char_boundary(text: &str, i: usize) -> usize {
+    let mut j = i;
+    while j < text.len() && !text.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
+/// Converts assembled replacement output into a `String`, substituting U+FFFD
+/// for any invalid UTF-8. The output is only ever invalid when a byte-level
+/// match split a multi-byte codepoint, leaving orphaned continuation bytes that
+/// have no `str` representation.
+fn into_string_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     }
 }
 
@@ -393,23 +443,24 @@ impl<'a> Iterator for Matches<'a> {
                     return None;
                 }
 
-                let search_text = &self.text[*last_end..];
-                match regex.inner.find(search_text.as_bytes()) {
+                // Sliced as bytes, so the resume position never has to be a valid
+                // `&str` boundary: byte-level constructs (`.`, byte classes) match a
+                // single byte and can end inside a multi-byte codepoint.
+                let search_text = &self.text.as_bytes()[*last_end..];
+                match regex.inner.find(search_text) {
                     None => None,
                     Some((start, end)) => {
                         let abs_start = *last_end + start;
                         let abs_end = *last_end + end;
 
-                        // Advance past the match, but ensure progress on empty matches
-                        // For empty matches, advance to the next UTF-8 character boundary
+                        // Resume at the next UTF-8 character boundary, so no match ever
+                        // starts inside a multi-byte codepoint (the engine-wide rule,
+                        // see `nfa::is_utf8_boundary`). For empty matches, step one byte
+                        // first so the iterator always makes forward progress.
                         *last_end = if abs_start == abs_end {
-                            // Find the next char boundary after abs_end
-                            let remaining = &self.text[abs_end..];
-                            let next_char_len =
-                                remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                            abs_end + next_char_len
+                            ceil_char_boundary(self.text, abs_end + 1)
                         } else {
-                            abs_end
+                            ceil_char_boundary(self.text, abs_end)
                         };
 
                         Some(Match {
@@ -440,23 +491,22 @@ impl<'r, 't> Iterator for CapturesIter<'r, 't> {
             return None;
         }
 
-        let search_text = &self.text[self.last_end..];
-        match self.regex.inner.captures(search_text.as_bytes()) {
+        // Sliced as bytes for the same reason as `Matches::next`.
+        let search_text = &self.text.as_bytes()[self.last_end..];
+        match self.regex.inner.captures(search_text) {
             None => None,
             Some(slots) => {
                 // Get the full match bounds (slot 0)
                 let (start, end) = slots.first().and_then(|s| *s)?;
                 let offset = self.last_end;
 
-                // Advance past the match, but ensure progress on empty matches
-                // For empty matches, advance to the next UTF-8 character boundary
+                // Resume at the next UTF-8 character boundary, ensuring progress on
+                // empty matches by stepping one byte first (see `Matches::next`).
                 let abs_end = offset + end;
                 self.last_end = if start == end {
-                    let remaining = &self.text[abs_end..];
-                    let next_char_len = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                    abs_end + next_char_len
+                    ceil_char_boundary(self.text, abs_end + 1)
                 } else {
-                    abs_end
+                    ceil_char_boundary(self.text, abs_end)
                 };
 
                 // Adjust all slot positions to absolute positions
@@ -546,5 +596,51 @@ mod tests {
         assert_eq!(escape(r"\.*+?|^$(){}[]"), r"\\\.\*\+\?\|\^\$\(\)\{\}\[\]");
         assert_eq!(escape("plain text"), "plain text");
         assert_eq!(escape(""), "");
+    }
+
+    /// `ceil_char_boundary` is the resume-position rule for `Matches` /
+    /// `CapturesIter`: it must never move backwards, must land on a boundary
+    /// inside the text, and must pass indices at/after the end through so an
+    /// empty match at the end terminates the iterators.
+    #[test]
+    fn test_ceil_char_boundary() {
+        let text = "aé世🎉";
+        // Boundaries: 0 (a), 1 (é), 3 (世), 6 (🎉), 10 (end).
+        assert_eq!(ceil_char_boundary(text, 0), 0);
+        assert_eq!(ceil_char_boundary(text, 1), 1);
+        assert_eq!(ceil_char_boundary(text, 2), 3);
+        assert_eq!(ceil_char_boundary(text, 3), 3);
+        assert_eq!(ceil_char_boundary(text, 4), 6);
+        assert_eq!(ceil_char_boundary(text, 5), 6);
+        assert_eq!(ceil_char_boundary(text, 7), 10);
+        assert_eq!(ceil_char_boundary(text, 10), 10);
+        // Past the end: passed through, which is what stops the iterators.
+        assert_eq!(ceil_char_boundary(text, 11), 11);
+
+        // Every ASCII index is already a boundary, so nothing moves.
+        let ascii = "abc";
+        for i in 0..=ascii.len() {
+            assert_eq!(ceil_char_boundary(ascii, i), i);
+        }
+
+        // Result is always a boundary (or past the end) and never regresses.
+        for i in 0..=text.len() {
+            let j = ceil_char_boundary(text, i);
+            assert!(j >= i);
+            assert!(text.is_char_boundary(j));
+        }
+    }
+
+    /// `into_string_lossy` must be an exact round-trip for valid UTF-8 (the
+    /// only case existing replacements produce) and lossy otherwise.
+    #[test]
+    fn test_into_string_lossy() {
+        assert_eq!(into_string_lossy("héllo".as_bytes().to_vec()), "héllo");
+        assert_eq!(into_string_lossy(Vec::new()), "");
+        // Orphaned continuation bytes from a split codepoint.
+        assert_eq!(
+            into_string_lossy(vec![b'-', 0xB8, 0x96]),
+            "-\u{FFFD}\u{FFFD}"
+        );
     }
 }

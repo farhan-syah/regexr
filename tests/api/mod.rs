@@ -107,6 +107,138 @@ fn test_find_iter_empty() {
 }
 
 // =============================================================================
+// find_iter over multi-byte UTF-8
+// =============================================================================
+//
+// `.` and byte classes match a single byte (this is the engine's canonical
+// semantics, see `regexr::reference`), so a match can end inside a multi-byte
+// codepoint. The iterator reports that span as-is but always resumes at the
+// next codepoint boundary, so no match ever starts inside a codepoint and no
+// `&str` is ever sliced at a non-boundary.
+
+/// Collects `(start, end)` for every match, driving the iterator to completion.
+fn ranges(re: &Regex, text: &str) -> Vec<(usize, usize)> {
+    re.find_iter(text).map(|m| (m.start(), m.end())).collect()
+}
+
+#[test]
+fn test_find_iter_dot_over_multibyte_text() {
+    // The reported panic: `.` over text containing a 3-byte codepoint.
+    // "Hello " is bytes 0..6, '世' is 6..9, '界' is 9..12, '!' is 12..13.
+    let re = regex(".");
+    let text = "Hello 世界!";
+
+    assert_eq!(
+        ranges(&re, text),
+        vec![
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (9, 10),
+            (12, 13),
+        ]
+    );
+
+    // The two spans that split a codepoint have no `&str` representation.
+    let strs: Vec<_> = re.find_iter(text).map(|m| m.as_str()).collect();
+    assert_eq!(strs, vec!["H", "e", "l", "l", "o", " ", "", "", "!"]);
+
+    // ...but the bytes are always available and exact.
+    let bytes: Vec<_> = re.find_iter(text).map(|m| m.as_bytes().to_vec()).collect();
+    assert_eq!(bytes[6], vec![0xE4]); // lead byte of '世'
+    assert_eq!(bytes[7], vec![0xE7]); // lead byte of '界'
+}
+
+#[test]
+fn test_find_iter_dot_over_two_byte_codepoint() {
+    // 'a' is 0..1, 'é' is 1..3, 'b' is 3..4.
+    let re = regex(".");
+    assert_eq!(ranges(&re, "aéb"), vec![(0, 1), (1, 2), (3, 4)]);
+}
+
+#[test]
+fn test_find_iter_dot_over_three_byte_codepoint() {
+    // '世' is 0..3, '界' is 3..6.
+    let re = regex(".");
+    assert_eq!(ranges(&re, "世界"), vec![(0, 1), (3, 4)]);
+}
+
+#[test]
+fn test_find_iter_dot_over_four_byte_codepoint() {
+    // 'x' is 0..1, '🎉' is 1..5, 'y' is 5..6.
+    let re = regex(".");
+    assert_eq!(ranges(&re, "x🎉y"), vec![(0, 1), (1, 2), (5, 6)]);
+}
+
+#[test]
+fn test_find_iter_never_starts_inside_a_codepoint() {
+    // The invariant the resume rule maintains, over mixed 1/2/3/4-byte text.
+    let re = regex(".");
+    let text = "a é 世 🎉 z";
+    for m in re.find_iter(text) {
+        assert!(
+            text.is_char_boundary(m.start()),
+            "match at {} starts inside a codepoint",
+            m.start()
+        );
+    }
+}
+
+#[test]
+fn test_find_iter_empty_matches_over_multibyte_text() {
+    // The pre-existing empty-match guard: one empty match per codepoint plus
+    // one at the end, and the iterator terminates.
+    // 'é' is 0..2, '世' is 2..5.
+    let re = regex("x*");
+    assert_eq!(ranges(&re, "é世"), vec![(0, 0), (2, 2), (5, 5)]);
+}
+
+#[test]
+fn test_find_iter_ascii_behaviour_unchanged() {
+    // Every ASCII index is a codepoint boundary, so the resume rule is a no-op.
+    let re = regex(".");
+    assert_eq!(ranges(&re, "abc"), vec![(0, 1), (1, 2), (2, 3)]);
+    let strs: Vec<_> = re.find_iter("abc").map(|m| m.as_str()).collect();
+    assert_eq!(strs, vec!["a", "b", "c"]);
+
+    let re = regex("x*");
+    assert_eq!(ranges(&re, "abc"), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+}
+
+#[test]
+fn test_captures_iter_over_multibyte_text() {
+    // `CapturesIter` resumes the same way as `find_iter`.
+    let re = regex("(.)");
+    let spans: Vec<_> = re
+        .captures_iter("世界")
+        .map(|c| {
+            let m = c.get(0).unwrap();
+            (m.start(), m.end())
+        })
+        .collect();
+    assert_eq!(spans, vec![(0, 1), (3, 4)]);
+}
+
+#[test]
+fn test_replace_over_multibyte_text() {
+    // A byte-level match removes part of a codepoint; the orphaned bytes have
+    // no `str` form and become U+FFFD rather than panicking.
+    let re = regex(".");
+    let replaced = re.replace_all("世", "-");
+    assert!(replaced.starts_with('-'));
+    assert!(replaced.contains('\u{FFFD}'));
+
+    // Codepoint-aligned matches are unaffected.
+    let re = regex("世");
+    assert_eq!(re.replace_all("a世b", "-"), "a-b");
+    assert_eq!(re.replace("a世b世", "-"), "a-b世");
+}
+
+// =============================================================================
 // captures
 // =============================================================================
 
