@@ -64,8 +64,21 @@ impl<'a> ShiftOrInterpreter<'a> {
             return None;
         }
 
-        // No anchors: try matching at each position, preferring longest match (greedy)
-        for start in 0..=input.len() {
+        // No anchors: try matching at each position, preferring longest match
+        // (greedy). `scan_limit` first rules out "no match anywhere" in a single
+        // bit-parallel pass and otherwise caps how far this scan has to walk.
+        let scan_end = match self.shift_or.scan_limit(input, 0) {
+            Some(end) => end,
+            None => {
+                // Nothing to find. `scan_limit` never reports `None` for a
+                // nullable pattern, so the empty-match tail below still applies.
+                if self.shift_or.nullable {
+                    return Some((0, 0));
+                }
+                return None;
+            }
+        };
+        for start in 0..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));
             }
@@ -103,9 +116,15 @@ impl<'a> ShiftOrInterpreter<'a> {
             return None;
         }
 
+        // `scan_limit` rules out "no match anywhere" in a single bit-parallel
+        // pass, and for an unanchored pattern also caps the scan (an end-anchored
+        // one may reject a match and keep looking, so it only gets the existence
+        // check — see `ShiftOr::earliest_match_end`).
+        let scan_end = self.shift_or.scan_limit(input, pos)?;
+
         // If end anchor, only accept matches that end at input.len()
         if self.shift_or.has_end_anchor {
-            for start in pos..=input.len() {
+            for start in pos..=scan_end {
                 if let Some(end) = self.match_at(input, start) {
                     if crate::nfa::at_end_or_before_final_newline(input, end) {
                         return Some((start, end));
@@ -116,7 +135,7 @@ impl<'a> ShiftOrInterpreter<'a> {
         }
 
         // No anchors: try matching at each position from pos
-        for start in pos..=input.len() {
+        for start in pos..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));
             }

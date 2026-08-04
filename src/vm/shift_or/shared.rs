@@ -229,8 +229,11 @@ impl ShiftOr {
             return None;
         }
 
-        // Try matching at each position, preferring longest match (greedy)
-        for start in 0..=input.len() {
+        // Try matching at each position, preferring longest match (greedy).
+        // `scan_limit` first rules out "no match anywhere" in a single pass and
+        // otherwise caps how far this scan has to walk.
+        let scan_end = self.scan_limit(input, 0)?;
+        for start in 0..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 // For end anchor: only accept if match ends at input end
                 if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
@@ -262,8 +265,11 @@ impl ShiftOr {
 
         let search_start = if self.has_start_anchor { 0 } else { pos };
 
-        // Try matching at each position from pos
-        for start in search_start..=input.len() {
+        // Try matching at each position from pos. `scan_limit` first rules out
+        // "no match anywhere" in a single pass and otherwise caps how far this
+        // scan has to walk.
+        let scan_end = self.scan_limit(input, search_start)?;
+        for start in search_start..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 // For end anchor: only accept if match ends at input end
                 if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
@@ -281,6 +287,72 @@ impl ShiftOr {
             }
         }
         None
+    }
+
+    /// One bit-parallel pass over `input[from..]` keeping a fresh start live at
+    /// every position; returns the earliest position at which *some* non-empty
+    /// match ends, or `None` if no match begins at or after `from`.
+    ///
+    /// This is the classic unanchored Shift-Or scan. Because every start is live
+    /// at once it answers "is there a match at all?" in a single pass, where the
+    /// anchored `match_at` needs one pass per start position.
+    ///
+    /// It deliberately reports only the earliest **end**. The state is a bitmask
+    /// of reachable positions and records nothing about *which* start reached
+    /// them, so it cannot express the leftmost-first preference between two
+    /// starts — `abc|b` on "abc" ends a match at 2 via the `b` branch, while the
+    /// leftmost match is `abc` spanning 0..3. What it does give is a bound: the
+    /// match ending at `e` starts at or before `e`, and the leftmost start is no
+    /// later than that start, so `s* <= e`. A caller can therefore stop its
+    /// anchored scan at `e` instead of walking to the end of the input.
+    pub(crate) fn earliest_match_end(&self, input: &[u8], from: usize) -> Option<usize> {
+        // Inverted logic throughout, as in `match_at`: bit i == 0 means position
+        // i is active. All 1s = nothing reached yet.
+        let mut state = !0u64;
+
+        for (i, &byte) in input[from..].iter().enumerate() {
+            // Positions reachable from the active set, unioned with First — that
+            // unconditional injection is what keeps a match starting *here* live
+            // alongside every earlier one, and is the whole difference from the
+            // anchored scan.
+            let mut reachable = self.first;
+            let mut active = !state;
+            while active != 0 {
+                let pos = active.trailing_zeros() as usize;
+                reachable |= self.follow[pos];
+                active &= active - 1;
+            }
+
+            state = (!reachable) | self.masks[byte as usize];
+
+            if (state | self.accept) != !0u64 {
+                return Some(from + i + 1);
+            }
+        }
+
+        None
+    }
+
+    /// How far an anchored scan starting at `search_start` has to walk.
+    ///
+    /// Returns `None` when a single unanchored pass proves there is no match to
+    /// find, letting the caller skip the scan entirely — that is what turns the
+    /// no-match case from one pass per position into one pass overall.
+    ///
+    /// The pass is skipped where it cannot pay off: a start anchor means the scan
+    /// tries a single position anyway, and a nullable pattern matches empty at
+    /// the first position tried.
+    pub(crate) fn scan_limit(&self, input: &[u8], search_start: usize) -> Option<usize> {
+        if self.has_start_anchor || self.nullable {
+            return Some(input.len());
+        }
+        match self.earliest_match_end(input, search_start) {
+            None => None,
+            // An end-anchored pattern may reject this match and keep looking, so
+            // only the existence check carries over — the bound does not.
+            Some(_) if self.has_end_anchor => Some(input.len()),
+            Some(end) => Some(end),
+        }
     }
 
     /// Tries to match at exactly the given position.
@@ -503,8 +575,16 @@ impl ShiftOrWide {
 
     /// Finds the first match, returning (start, end).
     pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
-        // Try matching at each position, preferring longest match (greedy)
-        for start in 0..=input.len() {
+        // Try matching at each position, preferring longest match (greedy).
+        // `scan_limit` first rules out "no match anywhere" in a single pass and
+        // otherwise caps how far this scan has to walk.
+        let scan_end = match self.scan_limit(input, 0) {
+            Some(end) => end,
+            // No match to find. A nullable pattern still matches empty, and
+            // `scan_limit` never reports `None` for one.
+            None => return None,
+        };
+        for start in 0..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));
             }
@@ -524,12 +604,60 @@ impl ShiftOrWide {
             return None;
         }
 
-        for start in pos..=input.len() {
+        let scan_end = self.scan_limit(input, pos)?;
+        for start in pos..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));
             }
         }
         None
+    }
+
+    /// One bit-parallel pass over `input[from..]` keeping a fresh start live at
+    /// every position; returns the earliest position at which *some* non-empty
+    /// match ends, or `None` if no match begins at or after `from`.
+    ///
+    /// The 256-bit counterpart of `ShiftOr::earliest_match_end` — see there for
+    /// why this reports the earliest *end* and how that bounds the anchored scan
+    /// (`s* <= e`).
+    fn earliest_match_end(&self, input: &[u8], from: usize) -> Option<usize> {
+        let mut state = BitSet256::all_ones();
+
+        for (i, &byte) in input[from..].iter().enumerate() {
+            // Reachable from the active set, unioned with First — the
+            // unconditional injection keeps a match starting *here* live
+            // alongside every earlier one.
+            let mut reachable = self.first;
+            let active = state.complement();
+            for word_idx in 0..4 {
+                let mut word = active.parts[word_idx];
+                while word != 0 {
+                    let pos = word_idx * 64 + word.trailing_zeros() as usize;
+                    if pos < self.follow.len() {
+                        reachable.union_assign(self.follow[pos]);
+                    }
+                    word &= word - 1;
+                }
+            }
+
+            state = reachable.complement().union(self.masks[byte as usize]);
+
+            if !state.union(self.accept).is_all_ones() {
+                return Some(from + i + 1);
+            }
+        }
+
+        None
+    }
+
+    /// How far an anchored scan starting at `search_start` has to walk, or `None`
+    /// when a single unanchored pass proves there is nothing to find. Skipped for
+    /// a nullable pattern, which matches empty at the first position tried.
+    fn scan_limit(&self, input: &[u8], search_start: usize) -> Option<usize> {
+        if self.nullable {
+            return Some(input.len());
+        }
+        self.earliest_match_end(input, search_start)
     }
 
     /// Tries to match at exactly the given position.
@@ -625,4 +753,144 @@ pub fn is_shift_or_wide_compatible(hir: &Hir) -> bool {
                 && nfa.position_count > 0
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod scan_bound_tests {
+    use super::*;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn compile(pattern: &str) -> Option<ShiftOr> {
+        let hir = parse(pattern).and_then(|ast| translate(&ast)).ok()?;
+        if hir.props.has_anchors {
+            ShiftOr::from_hir_with_anchors(&hir)
+        } else {
+            ShiftOr::from_hir(&hir)
+        }
+    }
+
+    /// The unbounded scan the `scan_limit` bound replaced: try every start.
+    ///
+    /// `match_at` knows nothing about anchors — they are stripped during Glushkov
+    /// construction and enforced by the callers — so this oracle applies them the
+    /// same way, otherwise it would happily accept `^a` at position 1.
+    fn brute_force(so: &ShiftOr, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        if so.has_start_anchor && from > 0 {
+            return None;
+        }
+        let last = if so.has_start_anchor { 0 } else { input.len() };
+        for start in from..=last {
+            if let Some(end) = so.match_at(input, start) {
+                if so.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
+                    continue;
+                }
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
+    const PATTERNS: &[&str] = &[
+        "a", "ab", "abc", "[ab]", "a+", "a*", "a?", "a{2}", "a{1,3}", "\\w", "\\w+", "\\w*", "\\d",
+        "\\w*\\d", "[a-z]*9", "a*b", "a.*b", "a.c", "(?:ab)+", "[^a]", "[^a]+", ".", ".*", ".+",
+        "\\s*", "\\s+", "ab*c", "a[bc]d", "^a", "a$", "^ab$", "^a*", "a*$",
+    ];
+
+    const TEXTS: &[&str] = &[
+        "",
+        "a",
+        "aa",
+        "ab",
+        "ba",
+        "abc",
+        "abab",
+        "aaab",
+        "aaa9",
+        "9aaa",
+        "aaa",
+        "a b c",
+        "  ",
+        "xyz",
+        "aaaaaaaaab",
+        "baaaaaaaaa",
+        "abcabcabc",
+        "a\nb",
+        "aaa\n",
+        "9",
+        "z",
+    ];
+
+    /// Bounding the anchored scan by the earliest match end must never change an
+    /// answer: the leftmost start `s*` always satisfies `s* <= e`, because the
+    /// match ending at `e` itself starts at or before `e`.
+    #[test]
+    fn bounded_scan_matches_brute_force() {
+        let mut failures = Vec::new();
+        for pattern in PATTERNS {
+            let Some(so) = compile(pattern) else {
+                continue;
+            };
+            for text in TEXTS {
+                let bytes = text.as_bytes();
+                for from in 0..=bytes.len() {
+                    let expected = brute_force(&so, bytes, from);
+                    let got = so.find_at(bytes, from);
+                    if got != expected {
+                        failures.push(format!(
+                            "{pattern:?} on {text:?} from {from}: brute={expected:?} got={got:?}"
+                        ));
+                    }
+                }
+                // `find` is the same search anchored at zero.
+                let got = so.find(bytes);
+                let expected = brute_force(&so, bytes, 0);
+                if got != expected && !(so.nullable && expected.is_none()) {
+                    failures.push(format!(
+                        "find {pattern:?} on {text:?}: brute={expected:?} got={got:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} divergences:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The one-pass rejector must agree with the scan about whether anything
+    /// matches at all — that equivalence is what makes the early return sound.
+    #[test]
+    fn earliest_match_end_agrees_with_scan() {
+        for pattern in PATTERNS {
+            let Some(so) = compile(pattern) else {
+                continue;
+            };
+            if so.nullable || so.has_start_anchor {
+                continue;
+            }
+            for text in TEXTS {
+                let bytes = text.as_bytes();
+                for from in 0..=bytes.len() {
+                    let any_match = (from..=bytes.len())
+                        .filter_map(|s| so.match_at(bytes, s).map(|e| (s, e)))
+                        .find(|(s, e)| e > s);
+                    let end = so.earliest_match_end(bytes, from);
+                    assert_eq!(
+                        end.is_some(),
+                        any_match.is_some(),
+                        "{pattern:?} on {text:?} from {from}: pass={end:?} scan={any_match:?}"
+                    );
+                    if let (Some(e), Some((s, _))) = (end, any_match) {
+                        assert!(
+                            s <= e,
+                            "{pattern:?} on {text:?} from {from}: leftmost start {s} > bound {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
