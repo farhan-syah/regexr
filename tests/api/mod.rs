@@ -436,3 +436,128 @@ mod jit_alternation {
         assert_eq!(&caps[2][2], "3");
     }
 }
+
+// =============================================================================
+// escape()
+// =============================================================================
+
+mod escape_fn {
+    use regexr::{escape, Regex};
+
+    /// Builds a real `Regex` from `escape(s)` and asserts it matches `s`
+    /// literally at that position: the escaped pattern must match the whole
+    /// string, and anchoring it with `^...$` must match nothing else.
+    fn assert_round_trips(s: &str) {
+        let pattern = escape(s);
+        let re = Regex::new(&pattern)
+            .unwrap_or_else(|e| panic!("escape({s:?}) = {pattern:?} failed to compile: {e}"));
+        let m = re
+            .find(s)
+            .unwrap_or_else(|| panic!("escape({s:?}) = {pattern:?} did not match {s:?} literally"));
+        assert_eq!(m.as_str(), s, "escape({s:?}) matched the wrong substring");
+
+        // Anchored, it must match `s` exactly and nothing longer or shorter.
+        let anchored = format!("^(?:{pattern})$");
+        let anchored_re = Regex::new(&anchored)
+            .unwrap_or_else(|e| panic!("anchored pattern {anchored:?} failed to compile: {e}"));
+        assert!(
+            anchored_re.is_match(s),
+            "anchored escape({s:?}) = {anchored:?} did not fully match {s:?}"
+        );
+    }
+
+    #[test]
+    fn test_round_trip_empty_string() {
+        assert_round_trips("");
+    }
+
+    #[test]
+    fn test_round_trip_all_metacharacters() {
+        // Every character regexr's parser treats specially at the top level.
+        assert_round_trips(r"\.*+?|^$(){}[]");
+    }
+
+    #[test]
+    fn test_round_trip_no_metacharacters() {
+        assert_round_trips("hello world 123");
+    }
+
+    #[test]
+    fn test_round_trip_mixed_literal_and_meta() {
+        assert_round_trips("a.b*c(d)[e]{f}g|h^i$j\\k");
+    }
+
+    #[test]
+    fn test_round_trip_embedded_whitespace_and_newlines() {
+        assert_round_trips("line one\nline two\ttabbed  double-spaced\r\n");
+    }
+
+    #[test]
+    fn test_round_trip_non_ascii() {
+        // Multi-byte UTF-8: accented Latin, CJK, and a 4-byte emoji. None of
+        // these should be split or corrupted by byte-wise escaping.
+        assert_round_trips("héllo wörld");
+        assert_round_trips("こんにちは世界");
+        assert_round_trips("emoji: 😀🎉👍");
+    }
+
+    #[test]
+    fn test_round_trip_context_dependent_characters() {
+        // These are only special *inside* other constructs in regexr's own
+        // parser (`-` inside `[...]`, `:` `<` `>` `=` `!` `,` inside `(?...)`
+        // and `{n,m}`, digits inside backreferences) but parse as plain
+        // literals at the top level, which is the only context `escape`'s
+        // output is used in. They must still round-trip correctly.
+        assert_round_trips("a-b:c<d>e=f!g,h123");
+        assert_round_trips("range: 1-100, ratio: 3:2");
+    }
+
+    #[test]
+    fn test_round_trip_unmatched_brackets_and_parens() {
+        // Individually these would be parse errors (or change meaning) if
+        // left unescaped: unmatched `)`, `]`, `}`, or an unescaped `(`.
+        assert_round_trips(")");
+        assert_round_trips("]");
+        assert_round_trips("}");
+        assert_round_trips("(");
+        assert_round_trips("[");
+        assert_round_trips("{");
+    }
+
+    #[test]
+    fn test_round_trip_backslash_sequences() {
+        // Text that looks like escape sequences (\d, \n, \\) must be matched
+        // as those literal characters, not interpreted as regexr escapes.
+        assert_round_trips(r"\d\w\s\n\t\\");
+    }
+
+    #[test]
+    fn test_round_trip_repetition_like_text() {
+        // Looks like a quantified atom (`a{2,4}`) but must match only the
+        // literal text `a{2,4}`, not "a repeated 2-4 times".
+        assert_round_trips("a{2,4}");
+        assert!(!Regex::new(&escape("a{2,4}")).unwrap().is_match("aa"));
+    }
+
+    #[test]
+    fn test_escape_used_as_literal_delimiter() {
+        // The motivating use case: splitting/matching on a literal delimiter
+        // that happens to be a regex metacharacter.
+        let re = Regex::new(&escape(".")).unwrap();
+        assert!(re.is_match("a.b"));
+        assert!(!re.is_match("axb"));
+
+        let re = Regex::new(&escape("|")).unwrap();
+        assert!(re.is_match("a|b"));
+        assert!(!re.is_match("ab"));
+    }
+
+    #[test]
+    fn test_escape_does_not_over_escape_safe_characters() {
+        // Characters that are already safe unescaped should pass through
+        // byte-for-byte, so escape() output stays minimal and readable.
+        for s in ["-", ":", "<", ">", "=", "!", ",", "#", "&", "~", "/", "0"] {
+            assert_eq!(escape(s), s);
+        }
+    }
+}

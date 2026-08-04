@@ -134,6 +134,57 @@ impl RegexBuilder {
     }
 }
 
+/// Escapes all regex metacharacters in `text` so that the returned pattern
+/// matches `text` literally.
+///
+/// This is regexr's counterpart to `regex::escape` from the `regex` crate:
+/// pass the result to [`Regex::new`] or [`RegexBuilder::new`] when you have a
+/// plain string (e.g. a user-supplied delimiter) that must be matched
+/// character-for-character rather than interpreted as a pattern.
+///
+/// # Which characters are escaped
+///
+/// Escaping covers exactly the characters regexr's parser treats specially
+/// at the top level (outside a character class): `\ . * + ? | ^ $ ( ) [ ] { }`.
+/// Every other character - including `-`, `:`, `<`, `>`, `=`, `!`, `,`, `#`,
+/// `&`, `~`, digits, whitespace, and non-ASCII text - already parses as a
+/// literal on its own and is passed through unchanged.
+///
+/// Note this differs from `regex::escape`, which also escapes `#`, `&`, `~`,
+/// and `-` defensively (they can matter inside a character class, or under
+/// verbose/extended mode in other engines). regexr does not treat `#`/`&`/`~`
+/// specially anywhere, and the `-` is only special inside `[...]`; since the
+/// output of this function is never itself an unescaped `[...]`, none of
+/// those characters need escaping here. The result of `escape` is therefore
+/// only guaranteed to be safe when used as a standalone pattern (or
+/// concatenated with other *escaped* text) - not when spliced directly
+/// inside a hand-written character class.
+///
+/// # Example
+///
+/// ```
+/// use regexr::{escape, Regex};
+///
+/// let delimiter = "a.b|c";
+/// let pattern = escape(delimiter);
+/// let re = Regex::new(&pattern).unwrap();
+/// assert!(re.is_match(delimiter));
+/// assert!(!re.is_match("axb c"));
+/// ```
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '*' | '+' | '?' | '|' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A compiled regular expression.
 #[derive(Debug)]
 pub struct Regex {
@@ -479,5 +530,21 @@ impl<'t> std::ops::Index<&str> for Captures<'t> {
         self.name(name)
             .map(|m| m.as_str())
             .unwrap_or_else(|| panic!("no capture group named '{}'", name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sanity check on the escaped output shape: every metacharacter this
+    /// function targets gets a leading backslash, and nothing else does.
+    /// Behavioral round-trip coverage (building a real `Regex` from the
+    /// escaped output and matching against it) lives in `tests/api/`.
+    #[test]
+    fn test_escape_shape() {
+        assert_eq!(escape(r"\.*+?|^$(){}[]"), r"\\\.\*\+\?\|\^\$\(\)\{\}\[\]");
+        assert_eq!(escape("plain text"), "plain text");
+        assert_eq!(escape(""), "");
     }
 }
