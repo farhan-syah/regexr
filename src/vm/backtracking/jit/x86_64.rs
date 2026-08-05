@@ -33,7 +33,7 @@ use crate::hir::{Hir, HirAnchor, HirClass, HirExpr};
 
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
 
-use super::jit::BacktrackingJit;
+use super::jit::{BacktrackingJit, BUDGET_EXHAUSTED, STACK_EXHAUSTED};
 
 /// The backtracking JIT compiler.
 pub(super) struct BacktrackingCompiler {
@@ -49,6 +49,20 @@ pub(super) struct BacktrackingCompiler {
     no_match_label: dynasmrt::DynamicLabel,
     /// Label for trying next start position.
     next_start_label: dynasmrt::DynamicLabel,
+    /// Label for "the choice-point stack is full".
+    ///
+    /// The stack is a fixed frame, so a search that needs more choice points
+    /// than it holds has to stop rather than write past the end of it. Jumping
+    /// here returns [`STACK_EXHAUSTED`], and the caller re-runs the search on
+    /// the interpreter, whose stack grows.
+    stack_exhausted_label: dynasmrt::DynamicLabel,
+    /// Label for "the step budget is spent".
+    ///
+    /// Every choice point costs a step, so a search that explores exponentially
+    /// many of them runs the budget down and stops here, returning
+    /// [`BUDGET_EXHAUSTED`]. Unlike a full stack this is not worth retrying on
+    /// the interpreter — it is the caller's limit, and the caller is told.
+    budget_exhausted_label: dynasmrt::DynamicLabel,
     /// Number of capture groups.
     capture_count: u32,
     /// Current capture index being filled (used to update capture end on backtrack).
@@ -69,6 +83,8 @@ impl BacktrackingCompiler {
         let match_success_label = asm.new_dynamic_label();
         let no_match_label = asm.new_dynamic_label();
         let next_start_label = asm.new_dynamic_label();
+        let stack_exhausted_label = asm.new_dynamic_label();
+        let budget_exhausted_label = asm.new_dynamic_label();
 
         Ok(Self {
             asm,
@@ -77,6 +93,8 @@ impl BacktrackingCompiler {
             match_success_label,
             no_match_label,
             next_start_label,
+            stack_exhausted_label,
+            budget_exhausted_label,
             capture_count: hir.props.capture_count,
             current_capture: None,
         })
@@ -119,19 +137,20 @@ impl BacktrackingCompiler {
             .map_err(|e| Error::new(ErrorKind::Jit(format!("Failed to finalize: {:?}", e)), ""))?;
 
         #[cfg(target_os = "windows")]
-        let match_fn: unsafe extern "win64" fn(*const u8, usize, *mut i64) -> i64 =
+        let match_fn: unsafe extern "win64" fn(*const u8, usize, *mut i64, u64) -> i64 =
             unsafe { std::mem::transmute(code.ptr(entry_offset)) };
 
         #[cfg(not(target_os = "windows"))]
-        let match_fn: unsafe extern "sysv64" fn(*const u8, usize, *mut i64) -> i64 =
+        let match_fn: unsafe extern "sysv64" fn(*const u8, usize, *mut i64, u64) -> i64 =
             unsafe { std::mem::transmute(code.ptr(entry_offset)) };
 
         Ok(BacktrackingJit {
             code,
             match_fn,
             capture_count: self.capture_count,
-            // Attached by `compile_backtracking` when the pattern reads left context.
-            left_context_vm: None,
+            vm: crate::vm::backtracking::BacktrackingVm::new(&self.hir),
+            // Set by `compile_backtracking` when the pattern reads left context.
+            needs_left_context: false,
         })
     }
 
@@ -161,6 +180,7 @@ impl BacktrackingCompiler {
             ; mov rdi, rcx           // rdi = input_ptr
             ; mov rsi, rdx           // rsi = input_len
             ; mov r12, r8            // r12 = captures_ptr
+            ; mov QWORD [rbp - 8], r9 // Step budget, kept just under rbp
             ; xor r13d, r13d         // r13 = start_pos = 0
             ; mov rbx, rsp           // rbx = backtrack stack pointer
 
@@ -188,6 +208,7 @@ impl BacktrackingCompiler {
             // rdi = input_ptr (keep as-is, it's our input base)
             // rsi = input_len (keep as length for offset comparisons)
             ; mov r12, rdx           // r12 = captures_ptr
+            ; mov QWORD [rbp - 8], rcx // Step budget, kept just under rbp
             ; xor r13d, r13d         // r13 = start_pos = 0
             ; mov rbx, rsp           // rbx = backtrack stack pointer (grows UP from here)
 
@@ -408,6 +429,14 @@ impl BacktrackingCompiler {
                 // Save state for backtracking (32-byte entry, stack grows UP)
                 dynasm!(self.asm
                     ; .arch x64
+                    // Refuse to push past the top of the frame (see
+                    // `stack_exhausted_label`). The frame is [rbp-0x1008, rbp),
+                    // so this entry fits only while rbx + 32 <= rbp.
+                    ; sub QWORD [rbp - 8], 1
+                    ; jbe =>self.budget_exhausted_label
+                    ; lea rax, [rbx + 40]
+                    ; cmp rax, rbp
+                    ; ja =>self.stack_exhausted_label
                     // Push backtrack point (add to grow up)
                     ; mov QWORD [rbx], rcx           // Save position
                     ; lea rax, [=>try_next]
@@ -624,6 +653,13 @@ impl BacktrackingCompiler {
             // Choice point format: [position, return_label, r13, r15] (32 bytes, stack grows UP)
             dynasm!(self.asm
                 ; .arch x64
+                // Refuse to push past the top of the frame; see
+                // `stack_exhausted_label`.
+                ; sub QWORD [rbp - 8], 1
+                ; jbe =>self.budget_exhausted_label
+                ; lea rax, [rbx + 40]
+                ; cmp rax, rbp
+                ; ja =>self.stack_exhausted_label
                 ; mov QWORD [rbx], rcx              // Save position
                 ; lea rax, [=>try_backtrack]
                 ; mov QWORD [rbx + 8], rax          // Return address for backtrack
@@ -756,6 +792,13 @@ impl BacktrackingCompiler {
                 // Push choice point to try matching more later (stack grows UP)
                 dynasm!(self.asm
                     ; .arch x64
+                    // Refuse to push past the top of the frame; see
+                    // `stack_exhausted_label`.
+                    ; sub QWORD [rbp - 8], 1
+                    ; jbe =>self.budget_exhausted_label
+                    ; lea rax, [rbx + 40]
+                    ; cmp rax, rbp
+                    ; ja =>self.stack_exhausted_label
                     ; mov QWORD [rbx], rcx
                     ; lea rax, [=>try_more]
                     ; mov QWORD [rbx + 8], rax
@@ -998,6 +1041,16 @@ impl BacktrackingCompiler {
             // No-match handler
             ; =>self.no_match_label
             ; mov rax, -1i32
+            ; jmp =>epilogue
+
+            // Choice-point stack full: the answer is unknown, not "no match".
+            ; =>self.stack_exhausted_label
+            ; mov rax, STACK_EXHAUSTED as i32
+            ; jmp =>epilogue
+
+            // Step budget spent: the caller's limit, reported as such.
+            ; =>self.budget_exhausted_label
+            ; mov rax, BUDGET_EXHAUSTED as i32
 
             // Shared epilogue
             ; =>epilogue

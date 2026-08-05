@@ -7,7 +7,9 @@
 use crate::hir::{CodepointClass, Hir, HirAnchor, HirExpr};
 use crate::nfa::{ByteClass, ByteRange};
 
-use super::super::shared::{decode_utf8, is_word_byte, Op};
+use super::super::shared::{
+    decode_utf8, is_word_byte, BudgetExhausted, Op, DEFAULT_BACKTRACK_LIMIT,
+};
 
 /// A compiled backtracking regex.
 pub struct BacktrackingVm {
@@ -21,6 +23,8 @@ pub struct BacktrackingVm {
     /// Large codepoint classes (for Unicode classes with multiple ranges).
     /// Uses CodepointClass for fast ASCII bitmap lookup.
     cp_classes: Vec<CodepointClass>,
+    /// How many progress registers [`Op::MarkPos`] can address.
+    progress_regs: usize,
 }
 
 impl BacktrackingVm {
@@ -35,6 +39,7 @@ impl BacktrackingVm {
             capture_count: hir.props.capture_count,
             byte_classes: compiler.byte_classes,
             cp_classes: compiler.cp_classes,
+            progress_regs: compiler.progress_regs as usize,
         }
     }
 
@@ -50,20 +55,35 @@ impl BacktrackingVm {
 
     /// Finds a match starting at the given position.
     pub fn find_at(&self, input: &[u8], start: usize) -> Option<(usize, usize)> {
+        self.try_find_at(input, start, DEFAULT_BACKTRACK_LIMIT)
+            .unwrap_or(None)
+    }
+
+    /// [`Self::find_at`] under an explicit step budget.
+    ///
+    /// [`BudgetExhausted`] means the budget ran out before the search
+    /// finished; the caller decides what that means.
+    pub fn try_find_at(
+        &self,
+        input: &[u8],
+        start: usize,
+        limit: u64,
+    ) -> Result<Option<(usize, usize)>, BudgetExhausted> {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
+        let mut budget = limit;
 
         for pos in start..=input.len() {
             slots.fill(-1);
-            if self.exec(input, pos, &mut slots) {
+            if self.exec(input, pos, &mut slots, &mut budget)? {
                 let s = slots[0];
                 let e = slots[1];
                 if s >= 0 && e >= 0 {
-                    return Some((s as usize, e as usize));
+                    return Ok(Some((s as usize, e as usize)));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Returns captures for the first match.
@@ -76,16 +96,28 @@ impl BacktrackingVm {
     /// The whole input is handed to every attempt, so `^`, `\b` and lookbehind
     /// still see the bytes before `from`.
     pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        self.try_captures_from(input, from, DEFAULT_BACKTRACK_LIMIT)
+            .unwrap_or(None)
+    }
+
+    /// [`Self::captures_from`] under an explicit step budget.
+    pub fn try_captures_from(
+        &self,
+        input: &[u8],
+        from: usize,
+        limit: u64,
+    ) -> Result<Option<Vec<Option<(usize, usize)>>>, BudgetExhausted> {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
+        let mut budget = limit;
 
         for start in from..=input.len() {
             slots.fill(-1);
-            if self.exec(input, start, &mut slots) {
-                return Some(self.extract_captures(&slots));
+            if self.exec(input, start, &mut slots, &mut budget)? {
+                return Ok(Some(self.extract_captures(&slots)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Extract captures from slots.
@@ -103,14 +135,21 @@ impl BacktrackingVm {
         result
     }
 
-    /// Execute the bytecode.
+    /// Executes the bytecode from `start`, reporting whether it matched.
+    ///
+    /// Returns [`BudgetExhausted`] when the search exceeds `budget` steps. Only patterns
+    /// with backreferences reach this engine, and backreference matching has no
+    /// polynomial bound, so the budget is the guarantee that a search ends.
     #[inline(never)]
-    fn exec(&self, input: &[u8], start: usize, slots: &mut [i32]) -> bool {
-        // Backtrack stack: (pc, pos, saved_slots)
-        // We use a more efficient representation: save only the slots that change
-        let mut stack: Vec<(u32, usize)> = Vec::with_capacity(32);
-        let mut slot_stack: Vec<(u16, i32)> = Vec::with_capacity(64);
-        let mut slot_stack_frames: Vec<usize> = Vec::with_capacity(32);
+    fn exec(
+        &self,
+        input: &[u8],
+        start: usize,
+        slots: &mut [i32],
+        budget: &mut u64,
+    ) -> Result<bool, BudgetExhausted> {
+        let mut trail = Trail::new();
+        let mut progress = vec![usize::MAX; self.progress_regs];
 
         let mut pc = 0u32;
         let mut pos = start;
@@ -120,26 +159,20 @@ impl BacktrackingVm {
 
         loop {
             if pc as usize >= self.code.len() {
-                return false;
+                return Ok(false);
             }
+            if *budget == 0 {
+                return Err(BudgetExhausted);
+            }
+            *budget -= 1;
 
             match self.code[pc as usize] {
                 Op::Byte(b) => {
                     if pos < input.len() && input[pos] == b {
                         pos += 1;
                         pc += 1;
-                    } else {
-                        // Backtrack
-                        if !self.backtrack(
-                            &mut pc,
-                            &mut pos,
-                            &mut stack,
-                            slots,
-                            &mut slot_stack,
-                            &mut slot_stack_frames,
-                        ) {
-                            return false;
-                        }
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -147,15 +180,8 @@ impl BacktrackingVm {
                     if pos < input.len() && input[pos] >= lo && input[pos] <= hi {
                         pos += 1;
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -175,15 +201,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -203,15 +222,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -223,15 +235,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -243,15 +248,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -268,15 +266,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -292,15 +283,8 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -308,22 +292,13 @@ impl BacktrackingVm {
                     if pos < input.len() {
                         pos += 1;
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
                 Op::Split(target) => {
-                    // Save backtrack point for target
-                    slot_stack_frames.push(slot_stack.len());
-                    stack.push((target, pos));
+                    trail.push(target, pos);
                     pc += 1;
                 }
 
@@ -334,54 +309,51 @@ impl BacktrackingVm {
                 Op::Save(slot) => {
                     let slot = slot as usize;
                     if slot < slots.len() {
-                        // Save old value for potential restore
-                        if let Some(&frame_start) = slot_stack_frames.last() {
-                            // Check if we already saved this slot in current frame
-                            let already_saved = slot_stack
-                                .iter()
-                                .skip(frame_start)
-                                .any(|&(s, _)| s == slot as u16);
-                            if !already_saved {
-                                slot_stack.push((slot as u16, slots[slot]));
-                            }
-                        }
+                        trail.record_slot(slot as u16, slots[slot]);
                         slots[slot] = pos as i32;
                     }
                     pc += 1;
                 }
 
+                Op::MarkPos(reg) => {
+                    let reg = reg as usize;
+                    trail.record_reg(reg as u16, progress[reg]);
+                    progress[reg] = pos;
+                    pc += 1;
+                }
+
+                Op::AssertProgress(reg) => {
+                    // The body consumed nothing this turn, so this iteration is
+                    // rejected and the loop falls back to its exit branch —
+                    // which is where the choice point pushed at the loop head
+                    // resumes, with the slots this iteration wrote put back.
+                    if pos == progress[reg as usize] {
+                        if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                            return Ok(false);
+                        }
+                    } else {
+                        pc += 1;
+                    }
+                }
+
                 Op::Match => {
                     slots[1] = pos as i32;
-                    return true;
+                    return Ok(true);
                 }
 
                 Op::StartAnchor => {
                     if pos == 0 {
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
                 Op::EndAnchor => {
                     if pos == input.len() {
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -390,15 +362,8 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before != after {
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -407,15 +372,8 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before == after {
                         pc += 1;
-                    } else if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
 
@@ -432,46 +390,102 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !self.backtrack(
-                        &mut pc,
-                        &mut pos,
-                        &mut stack,
-                        slots,
-                        &mut slot_stack,
-                        &mut slot_stack_frames,
-                    ) {
-                        return false;
+                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
                     }
                 }
             }
         }
     }
+}
 
-    /// Backtrack to the previous choice point.
+/// Choice points, and the values that have to be put back when one is resumed.
+///
+/// Everything a choice point has to undo is recorded against it: the capture
+/// slots and the progress registers overwritten since it was pushed. Each is a
+/// flat stack plus a frame index per choice point, so resuming is a pop and a
+/// short unwind rather than a copy of the whole slot array.
+struct Trail {
+    /// `(pc, pos)` to resume from, innermost last.
+    stack: Vec<(u32, usize)>,
+    /// Capture slots overwritten since a choice point, with their old values.
+    slots: Vec<(u16, i32)>,
+    /// Where each choice point's run of `slots` begins.
+    slot_frames: Vec<usize>,
+    /// Progress registers overwritten since a choice point, with old values.
+    regs: Vec<(u16, usize)>,
+    /// Where each choice point's run of `regs` begins.
+    reg_frames: Vec<usize>,
+}
+
+impl Trail {
+    fn new() -> Self {
+        Self {
+            stack: Vec::with_capacity(32),
+            slots: Vec::with_capacity(64),
+            slot_frames: Vec::with_capacity(32),
+            regs: Vec::with_capacity(16),
+            reg_frames: Vec::with_capacity(32),
+        }
+    }
+
+    /// Records a choice point resuming at `pc` with the input at `pos`.
     #[inline]
-    fn backtrack(
-        &self,
+    fn push(&mut self, pc: u32, pos: usize) {
+        self.slot_frames.push(self.slots.len());
+        self.reg_frames.push(self.regs.len());
+        self.stack.push((pc, pos));
+    }
+
+    /// Notes that `slot` is about to be overwritten, so the innermost choice
+    /// point can put `old` back.
+    #[inline]
+    fn record_slot(&mut self, slot: u16, old: i32) {
+        if let Some(&frame) = self.slot_frames.last() {
+            // One entry per slot per frame: the first is the value to restore,
+            // later writes in the same frame are undone by that same entry.
+            if !self.slots[frame..].iter().any(|&(s, _)| s == slot) {
+                self.slots.push((slot, old));
+            }
+        }
+    }
+
+    /// Notes that progress register `reg` is about to be overwritten.
+    #[inline]
+    fn record_reg(&mut self, reg: u16, old: usize) {
+        if let Some(&frame) = self.reg_frames.last() {
+            if !self.regs[frame..].iter().any(|&(r, _)| r == reg) {
+                self.regs.push((reg, old));
+            }
+        }
+    }
+
+    /// Resumes the innermost choice point, restoring everything it recorded.
+    /// Returns false when there is none left and the search has failed.
+    #[inline]
+    fn pop(
+        &mut self,
         pc: &mut u32,
         pos: &mut usize,
-        stack: &mut Vec<(u32, usize)>,
         slots: &mut [i32],
-        slot_stack: &mut Vec<(u16, i32)>,
-        slot_stack_frames: &mut Vec<usize>,
+        progress: &mut [usize],
     ) -> bool {
-        if let Some((saved_pc, saved_pos)) = stack.pop() {
-            // Restore slots
-            if let Some(frame_start) = slot_stack_frames.pop() {
-                while slot_stack.len() > frame_start {
-                    let (slot, val) = slot_stack.pop().unwrap();
-                    slots[slot as usize] = val;
-                }
+        let Some((saved_pc, saved_pos)) = self.stack.pop() else {
+            return false;
+        };
+        if let Some(frame) = self.slot_frames.pop() {
+            for (slot, val) in self.slots.drain(frame..).rev() {
+                slots[slot as usize] = val;
             }
-            *pc = saved_pc;
-            *pos = saved_pos;
-            true
-        } else {
-            false
         }
+        if let Some(frame) = self.reg_frames.pop() {
+            for (reg, val) in self.regs.drain(frame..).rev() {
+                progress[reg as usize] = val;
+            }
+        }
+        *pc = saved_pc;
+        *pos = saved_pos;
+        true
     }
 }
 
@@ -480,6 +494,8 @@ struct Compiler {
     code: Vec<Op>,
     byte_classes: Vec<ByteClass>,
     cp_classes: Vec<CodepointClass>,
+    /// Progress registers handed out to nullable-body loops so far.
+    progress_regs: u16,
 }
 
 impl Compiler {
@@ -488,6 +504,7 @@ impl Compiler {
             code: Vec::with_capacity(64),
             byte_classes: Vec::new(),
             cp_classes: Vec::new(),
+            progress_regs: 0,
         }
     }
 
@@ -497,6 +514,16 @@ impl Compiler {
 
     fn pc(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    /// Reserves a progress register for one repetition.
+    ///
+    /// Registers are per loop *node*, never shared, so a loop only ever reads
+    /// back a position its own [`Op::MarkPos`] wrote.
+    fn progress_reg(&mut self) -> u16 {
+        let reg = self.progress_regs;
+        self.progress_regs += 1;
+        reg
     }
 
     fn compile(&mut self, expr: &HirExpr) {
@@ -646,11 +673,25 @@ impl Compiler {
                     }
                     None => {
                         // Unbounded: *
+                        //
+                        // A body that can match the empty string would otherwise
+                        // re-enter the loop at a position it can never advance
+                        // past, so such a loop carries a progress register: the
+                        // body's entry position goes in on the way in, and the
+                        // back edge is only taken if the position moved.
+                        let guard =
+                            crate::hir::matches_empty(&rep.expr).then(|| self.progress_reg());
                         let loop_start = self.pc();
                         if greedy {
                             let split_pc = self.pc();
                             self.emit(Op::Split(0)); // Try match, on fail exit
+                            if let Some(reg) = guard {
+                                self.emit(Op::MarkPos(reg));
+                            }
                             self.compile(&rep.expr);
+                            if let Some(reg) = guard {
+                                self.emit(Op::AssertProgress(reg));
+                            }
                             self.emit(Op::Jump(loop_start));
                             let exit = self.pc();
                             self.code[split_pc as usize] = Op::Split(exit);
@@ -662,7 +703,13 @@ impl Compiler {
                             self.emit(Op::Jump(0));
                             let loop_body = self.pc();
                             self.code[split_pc as usize] = Op::Split(loop_body);
+                            if let Some(reg) = guard {
+                                self.emit(Op::MarkPos(reg));
+                            }
                             self.compile(&rep.expr);
+                            if let Some(reg) = guard {
+                                self.emit(Op::AssertProgress(reg));
+                            }
                             self.emit(Op::Jump(loop_start));
                             let exit = self.pc();
                             self.code[jump_pc as usize] = Op::Jump(exit);

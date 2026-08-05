@@ -31,8 +31,8 @@ The Rust ecosystem already has the excellent, battle-tested [**`regex`**](https:
     - _Why not `regex`/`fancy-regex`?_ Neither offers JIT compilation.
     - _Why not `pcre2`?_ Requires installing a system C library (libpcre2).
 3.  **No System Dependencies:** Just `cargo add regexr` — no C toolchain or system libraries required. All code (including JIT) compiles with `cargo build`.
-4.  **WASM Support:** Compiles to `wasm32-unknown-unknown` with `--no-default-features`. Same API and features across native and WASM targets — JIT/SIMD are disabled automatically, but lookarounds, backreferences, and ReDoS protection all work. No need to swap crates per platform.
-5.  **Bounded Execution:** ReDoS protection that **memoizes** states (guaranteeing completion) rather than just **aborting** after a timeout (like `pcre2`).
+4.  **WASM Support:** Compiles to `wasm32-unknown-unknown` with `--no-default-features`. Same API and features across native and WASM targets — JIT/SIMD are disabled automatically, but lookarounds, backreferences, and bounded execution all work. No need to swap crates per platform.
+5.  **Bounded Execution:** Matching runs on automaton engines that track all alternatives at once, so time is linear in the input and no pattern backtracks catastrophically — including capture extraction, which is the operation most engines quietly hand to a backtracker. Backreferences are the one exception, because matching them is NP-hard: those patterns run on a backtracking engine under a step budget you can set with `RegexBuilder::backtrack_limit`, and `try_find` / `try_captures` / `try_is_match` report an exhausted budget rather than reporting "no match".
 
 ## The Problem Solved
 

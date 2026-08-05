@@ -3,6 +3,29 @@
 //! Contains the bytecode instructions and helper functions used by both
 //! interpreter and JIT backends.
 
+/// Steps a backtracking search may take before it gives up.
+///
+/// Only patterns with backreferences reach a backtracking engine, and matching
+/// a backreference is NP-hard in general: there is no polynomial bound to fall
+/// back on, so a budget is what makes the search terminate. It is set high
+/// enough that ordinary patterns never approach it — a linear scan of a 1 MiB
+/// input costs a few million steps — and a pattern that does exhaust it is
+/// reported through [`crate::error::ErrorKind::MatchLimitExceeded`] rather than
+/// being quietly answered "no match".
+///
+/// The value bounds the worst case at a few hundred milliseconds. The
+/// interpreter spends one unit per bytecode instruction; the generated code
+/// spends one per choice point, which is the quantity that actually explodes.
+pub const DEFAULT_BACKTRACK_LIMIT: u64 = 100_000_000;
+
+/// A backtracking search stopped because it ran out of steps.
+///
+/// Distinct from "no match": the search never finished, so the answer is
+/// unknown. Callers turn this into
+/// [`crate::error::ErrorKind::MatchLimitExceeded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExhausted;
+
 /// Bytecode instructions for the backtracking VM.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
@@ -43,6 +66,20 @@ pub enum Op {
     NotWordBoundary,
     /// Backreference to group N.
     Backref(u16),
+    /// Record the current position in progress register N, on entry to a
+    /// repetition body.
+    MarkPos(u16),
+    /// Reject a repetition iteration that consumed nothing.
+    ///
+    /// Backtracks if the position still equals the one [`Op::MarkPos`] wrote to
+    /// register `reg`, so the loop falls back to its exit branch. Without it a
+    /// body that can match empty re-enters at a position it can never advance
+    /// past and the search never terminates.
+    ///
+    /// Rejecting the iteration — rather than keeping it and then leaving the
+    /// loop — is what makes the empty-body case agree with the executable spec
+    /// in `crate::reference` and with the PikeVM.
+    AssertProgress(u16),
 }
 
 /// Decode UTF-8 codepoint from bytes.

@@ -22,24 +22,6 @@ fn hir_uses_codepoint_class(expr: &HirExpr) -> bool {
     }
 }
 
-/// Whether an HIR expression can match the empty string.
-///
-/// Zero-width constructs (anchors, lookaround, and a backreference to a group
-/// that captured nothing) consume no input and therefore match empty; a class or
-/// a non-empty literal never does. Repetition matches empty when it may run zero
-/// times or when its body can.
-pub fn hir_matches_empty(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Empty | HirExpr::Anchor(_) | HirExpr::Lookaround(_) | HirExpr::Backref(_) => true,
-        HirExpr::Literal(bytes) => bytes.is_empty(),
-        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => false,
-        HirExpr::Concat(exprs) => exprs.iter().all(hir_matches_empty),
-        HirExpr::Alt(branches) => branches.iter().any(hir_matches_empty),
-        HirExpr::Repeat(r) => r.min == 0 || hir_matches_empty(&r.expr),
-        HirExpr::Capture(c) => hir_matches_empty(&c.expr),
-    }
-}
-
 /// Whether a pattern combines a word boundary with the ability to match empty
 /// (`\b`, `\Ba*`, `\b(?:xy)?`, `a*\B`, …).
 ///
@@ -53,7 +35,7 @@ pub fn hir_matches_empty(expr: &HirExpr) -> bool {
 /// the DFA (and in the DFA JIT), so such patterns are routed to the PikeVM,
 /// which evaluates every assertion against the real position.
 pub fn needs_boundary_aware_empty_match(hir: &Hir) -> bool {
-    hir.props.has_word_boundary && hir_matches_empty(&hir.expr)
+    hir.props.has_word_boundary && crate::hir::matches_empty(&hir.expr)
 }
 
 /// Recursively checks whether an HIR expression contains a user alternation

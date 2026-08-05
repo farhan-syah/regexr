@@ -19,7 +19,9 @@
 
 use crate::hir::{HirAnchor, HirExpr, HirLookaroundKind};
 
-type Caps = Vec<Option<(usize, usize)>>;
+/// Spans of every capture group of a match, indexed by group number; index 0 is
+/// the overall match. `None` means the group did not participate.
+pub type Caps = Vec<Option<(usize, usize)>>;
 
 /// A continuation: "match the rest of the pattern starting at `pos`", returning
 /// the final end position of the overall match (leftmost-first: first success).
@@ -199,9 +201,18 @@ impl<'a> Matcher<'a> {
             if can_more {
                 let saved = caps.clone();
                 if let Some(r) = self.m(e, pos, caps, &mut |p, caps| {
-                    // zero-width progress once min satisfied: stop to avoid looping
-                    if p == pos && count >= min {
-                        return None;
+                    // The body consumed nothing, so going round again could only
+                    // produce the same iteration forever.
+                    //
+                    // The loop still takes this one while it owes iterations —
+                    // the first one always, plus any `min` demands — and then
+                    // stops, without leaving the body open to retry: `(|a)*` on
+                    // "a" matches empty at 0, it does not go back for the `a`.
+                    // Once the loop owes nothing, a zero-width iteration is
+                    // refused outright, so `(a*)*` on "a" reports group 1 as
+                    // 0..1 and not the empty span that would follow it.
+                    if p == pos {
+                        return if count < min.max(1) { k(p, caps) } else { None };
                     }
                     self.repeat(e, min, max, greedy, count + 1, p, caps, k)
                 }) {
@@ -283,6 +294,25 @@ pub fn find_from(
     if from > input.len() {
         return None;
     }
+    captures_from(expr, num_caps, input, from).and_then(|caps| caps[0])
+}
+
+/// Spans of every capture group of the leftmost-first match, group 0 first.
+///
+/// This is [`find`] carrying its group spans out with it — the spec for what
+/// `Regex::captures` must report, not just where the overall match lands.
+pub fn captures(expr: &HirExpr, num_caps: usize, input: &[u8]) -> Option<Caps> {
+    captures_from(expr, num_caps, input, 0)
+}
+
+/// [`captures`] resumed at byte offset `from`, the spec for `captures_iter`.
+///
+/// Like [`find_from`], the whole input stays visible so `^`, `\b`/`\B` and
+/// lookbehind are evaluated against the real surrounding text.
+pub fn captures_from(expr: &HirExpr, num_caps: usize, input: &[u8], from: usize) -> Option<Caps> {
+    if from > input.len() {
+        return None;
+    }
     let matcher = Matcher { input };
     for start in from..=input.len() {
         // Skip continuation bytes (0b10xx_xxxx) — not codepoint starts.
@@ -291,7 +321,8 @@ pub fn find_from(
         }
         let mut caps: Caps = vec![None; num_caps + 1];
         if let Some(end) = matcher.m(expr, start, &mut caps, &mut |p, _| Some(p)) {
-            return Some((start, end));
+            caps[0] = Some((start, end));
+            return Some(caps);
         }
     }
     None

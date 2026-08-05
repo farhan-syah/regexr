@@ -11,6 +11,7 @@ use crate::hir::Hir;
 use crate::literal::{extract_literals, Prefilter};
 use crate::nfa::tagged::TaggedNfaEngine;
 use crate::nfa::{self, Nfa};
+use crate::vm::backtracking::BudgetExhausted;
 use crate::vm::{
     BacktrackingVm, CodepointClassMatcher, PikeVm, PikeVmContext, ShiftOr, ShiftOrWide,
 };
@@ -368,6 +369,57 @@ impl CompiledRegex {
         }
     }
 
+    /// [`Self::captures_from`] under an explicit step budget.
+    ///
+    /// [`BudgetExhausted`] means the budget ran out before the search finished. Only the
+    /// backtracking engines can report that, and only backreference patterns
+    /// reach them: every other engine here is linear in the input and always
+    /// returns `Ok`.
+    pub fn try_captures_from(
+        &self,
+        input: &[u8],
+        from: usize,
+        limit: u64,
+    ) -> std::result::Result<Option<Vec<Option<(usize, usize)>>>, BudgetExhausted> {
+        if from > input.len() {
+            return Ok(None);
+        }
+        if let Some(ref vm) = self.backtracking_vm {
+            return vm.try_captures_from(input, from, limit);
+        }
+        match &self.inner {
+            CompiledInner::BacktrackingVm(vm) => vm.try_captures_from(input, from, limit),
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            CompiledInner::Backtracking(jit) => jit.try_captures_from(input, from, limit),
+            _ => Ok(self.captures_from(input, from)),
+        }
+    }
+
+    /// [`Self::find_from`] under an explicit step budget.
+    ///
+    /// For a backreference pattern this asks the backtracking engine directly
+    /// rather than going through the prefilter. A prefilter only skips start
+    /// positions that cannot match, so this finds the same match; it just does
+    /// not get the prefilter's head start.
+    pub fn try_find_from(
+        &self,
+        input: &[u8],
+        from: usize,
+        limit: u64,
+    ) -> std::result::Result<Option<(usize, usize)>, BudgetExhausted> {
+        if from > input.len() {
+            return Ok(None);
+        }
+        match &self.inner {
+            CompiledInner::BacktrackingVm(vm) => vm.try_find_at(input, from, limit),
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            CompiledInner::Backtracking(jit) => Ok(jit
+                .try_captures_from(input, from, limit)?
+                .and_then(|c| c[0])),
+            _ => Ok(self.find_from(input, from)),
+        }
+    }
+
     /// Two-pass capture extraction for engines that only report match bounds:
     /// 1. Find the match bounds with the fast engine (from `from`).
     /// 2. Re-run the cached PikeVM at that exact start position.
@@ -558,11 +610,18 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
     let literals = extract_literals(hir);
     let mut prefilter = Prefilter::from_literals(&literals);
 
-    // For patterns with captures (but no lookaround), we use a hybrid approach:
-    // - find() uses LazyDfa (fast)
-    // - captures() uses BacktrackingVm (fast single-pass)
-    // The BacktrackingVm is stored in capture_vm for use by captures().
-    let has_simple_captures = hir.props.capture_count > 0 && !hir.props.has_lookaround;
+    // Capture extraction is a hybrid: `find` uses the fast automaton engine, and
+    // the slots come from a second pass (see `captures_two_pass`).
+    //
+    // That second pass is the PikeVM unless the pattern has backreferences. A
+    // backreference makes the match depend on what earlier groups captured,
+    // which only a backtracking engine represents, and it is the one construct
+    // worth paying for: backtracking explores an unbounded search tree, so it
+    // answers under a step budget rather than the linear bound every other
+    // engine here meets. Routing capture-only patterns through it — which is
+    // what this used to do for *any* pattern with a group — silently gave every
+    // `captures()` call that same unbounded cost.
+    let needs_backtracking = hir.props.has_backrefs;
 
     let engine = select_engine_from_hir(hir);
 
@@ -671,8 +730,9 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         }
     };
 
-    // Create BacktrackingVm for fast single-pass capture extraction (if applicable)
-    let backtracking_vm = if has_simple_captures {
+    // Backreference patterns need single-pass backtracking capture extraction;
+    // everything else goes through the PikeVM second pass.
+    let backtracking_vm = if needs_backtracking {
         Some(BacktrackingVm::new(hir))
     } else {
         None
@@ -970,19 +1030,20 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                         None
                     };
 
-                    let backtracking_vm =
-                        if hir.props.capture_count > 0 && !hir.props.has_lookaround {
-                            Some(BacktrackingVm::new(hir))
-                        } else {
-                            None
-                        };
-
-                    let backtracking_jit =
-                        if hir.props.capture_count > 0 && !hir.props.has_lookaround {
-                            jit::compile_backtracking(hir).ok()
-                        } else {
-                            None
-                        };
+                    // Only backreferences justify backtracking for captures; see
+                    // `compile_from_hir`. Everything else takes the PikeVM
+                    // second pass, which is linear in the input.
+                    let needs_backtracking = hir.props.has_backrefs;
+                    let backtracking_vm = if needs_backtracking {
+                        Some(BacktrackingVm::new(hir))
+                    } else {
+                        None
+                    };
+                    let backtracking_jit = if needs_backtracking {
+                        jit::compile_backtracking(hir).ok()
+                    } else {
+                        None
+                    };
 
                     return Ok(CompiledRegex {
                         inner: CompiledInner::JitShiftOr(jit_shift_or),
@@ -1008,8 +1069,9 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         let capture_nfa = Some(nfa.clone());
         let mut dfa = LazyDfa::new(nfa);
 
-        // Create BacktrackingVm for fast capture extraction if pattern has captures
-        let backtracking_vm = if hir.props.capture_count > 0 && !hir.props.has_lookaround {
+        // Only backreferences justify backtracking for captures; see
+        // `compile_from_hir`.
+        let backtracking_vm = if hir.props.has_backrefs {
             Some(BacktrackingVm::new(hir))
         } else {
             None

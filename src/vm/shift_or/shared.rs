@@ -439,20 +439,7 @@ impl ShiftOr {
 /// Checks if an HIR is suitable for Shift-Or.
 /// Whether `expr` can match the empty string. Such patterns have a leftmost
 /// zero-width match that bit-parallel Shift-Or can't represent.
-fn hir_is_nullable(expr: &crate::hir::HirExpr) -> bool {
-    use crate::hir::HirExpr;
-    match expr {
-        HirExpr::Empty => true,
-        HirExpr::Literal(b) => b.is_empty(),
-        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) | HirExpr::Backref(_) => false,
-        HirExpr::Concat(es) => es.iter().all(hir_is_nullable),
-        HirExpr::Alt(es) => es.iter().any(hir_is_nullable),
-        HirExpr::Repeat(r) => r.min == 0 || hir_is_nullable(&r.expr),
-        HirExpr::Capture(c) => hir_is_nullable(&c.expr),
-        // Anchors and lookarounds are zero-width assertions.
-        HirExpr::Anchor(_) | HirExpr::Lookaround(_) => true,
-    }
-}
+use crate::hir::matches_empty as hir_is_nullable;
 
 /// Whether `hir` can be matched by the (narrow) Shift-Or engine.
 pub fn is_shift_or_compatible(hir: &Hir) -> bool {
