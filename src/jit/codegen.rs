@@ -13,7 +13,7 @@
 //!   before the start position
 
 use crate::dfa::{CharClass, DfaStateId, LazyDfa};
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use dynasmrt::{AssemblyOffset, ExecutableBuffer};
 
 /// A JIT-compiled regex matcher.
@@ -45,6 +45,9 @@ pub struct CompiledRegex {
     pub(crate) has_end_anchor: bool,
     /// Whether this regex uses multiline mode for anchors.
     pub(crate) has_multiline_anchors: bool,
+    /// Whether the *start* anchor specifically is line-mode. `^a(?m)$` has a
+    /// line-mode `$` but a plain `^`, so only position 0 is a valid start.
+    pub(crate) has_multiline_start_anchor: bool,
     /// Whether any match state requires EndOfText assertion.
     pub(crate) match_needs_end_of_text: bool,
     /// Whether any match state requires EndOfLine assertion.
@@ -271,7 +274,7 @@ impl CompiledRegex {
 
         // For patterns with start anchors, we need to try specific positions
         if self.has_start_anchor {
-            if self.has_multiline_anchors {
+            if self.has_multiline_start_anchor {
                 // Multiline mode: try position 0 and after each newline
                 if start_from == 0 {
                     if let Some((start, end)) = self.find_at(input, 0) {
@@ -323,7 +326,7 @@ impl CompiledRegex {
 
         // For anchored patterns, verify the start position is valid
         if self.has_start_anchor {
-            let valid_start = if self.has_multiline_anchors {
+            let valid_start = if self.has_multiline_start_anchor {
                 // Multiline: valid at position 0 or after newline
                 start_pos == 0 || (start_pos > 0 && input[start_pos - 1] == b'\n')
             } else {
@@ -377,6 +380,26 @@ impl JitCompiler {
         // Step 1: Materialize all reachable DFA states
         let materialized = self.materialize_dfa(dfa)?;
 
+        // A match state gated on `\b`/`\B` is only safe here when it is the
+        // end of the road. The generated code reports one end per start — the
+        // greedy one — and the caller checks the assertion there. If the
+        // automaton can carry on past that match state, a *shorter* end may be
+        // the one that satisfies the boundary: `a+\B` on "aa" has to reject the
+        // greedy end at 2 and report the one at 1, which this design cannot
+        // reach. A terminal match state has no shorter alternative, so `\bfoo\b`
+        // stays on the JIT. Refusing sends the rest to the DFA interpreter,
+        // which carries the assertion inside the automaton.
+        if materialized.states.iter().any(|s| {
+            s.is_match
+                && (s.needs_word_boundary || s.needs_not_word_boundary)
+                && s.transitions.iter().any(|t| t.is_some())
+        }) {
+            return Err(Error::new(
+                ErrorKind::Jit("word-boundary match state with a continuation".to_string()),
+                "",
+            ));
+        }
+
         // Step 2: Compile to machine code
         let (code, entry_point, entry_point_word) =
             crate::jit::x86_64::compile_states(&materialized)?;
@@ -406,6 +429,7 @@ impl JitCompiler {
             has_start_anchor: materialized.has_start_anchor,
             has_end_anchor: materialized.has_end_anchor,
             has_multiline_anchors: materialized.has_multiline_anchors,
+            has_multiline_start_anchor: materialized.has_multiline_start_anchor,
             match_needs_end_of_text,
             match_needs_end_of_line,
         })
@@ -424,6 +448,7 @@ impl JitCompiler {
         let has_start_anchor = dfa.has_start_anchor();
         let has_end_anchor = dfa.has_end_anchor();
         let has_multiline_anchors = dfa.has_multiline_anchors();
+        let has_multiline_start_anchor = dfa.has_multiline_start_anchor();
 
         // Get both start states if pattern has word boundaries
         let start_nonword = dfa.get_start_state_for_class(CharClass::NonWord);
@@ -442,6 +467,7 @@ impl JitCompiler {
             has_start_anchor,
             has_end_anchor,
             has_multiline_anchors,
+            has_multiline_start_anchor,
         };
 
         let mut queue = vec![start_nonword];
@@ -518,6 +544,8 @@ pub struct MaterializedDfa {
     pub has_end_anchor: bool,
     /// Whether this DFA uses multiline mode for anchors.
     pub has_multiline_anchors: bool,
+    /// Whether the *start* anchor specifically is line-mode.
+    pub has_multiline_start_anchor: bool,
 }
 
 /// A materialized DFA state with all transitions computed.

@@ -86,6 +86,11 @@ impl LazyDfa {
         self.ctx.has_multiline_anchors()
     }
 
+    /// Returns true if the start anchor specifically is line-mode.
+    pub fn has_multiline_start_anchor(&self) -> bool {
+        self.ctx.has_multiline_start_anchor()
+    }
+
     /// Gets the transition for a state and byte, computing it if needed.
     #[inline]
     pub fn transition(&mut self, state: DfaStateId, byte: u8) -> Option<DfaStateId> {
@@ -735,8 +740,17 @@ impl LazyDfa {
                 matches!(instr, NfaInstruction::EndOfText)
             });
 
-            if needs_end_of_text && pos != input.len() {
-                return false;
+            if needs_end_of_text {
+                // End of text, or immediately before a trailing newline — the
+                // same rule `crate::reference` and the other engines follow, so
+                // `a$` matches "a" in "a\n". Patterns without a word boundary
+                // take the clean-match-path shortcut above and never get here,
+                // which is why this only ever showed up alongside `\b`/`\B`.
+                let at_end = pos == input.len()
+                    || (pos + 1 == input.len() && input.get(pos) == Some(&b'\n'));
+                if !at_end {
+                    return false;
+                }
             }
 
             let needs_end_of_line = self.state_needs_assertion(&dfa_state.nfa_states, |instr| {
