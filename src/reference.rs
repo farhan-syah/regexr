@@ -45,13 +45,34 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            HirExpr::Class(class) => {
+            // A positive byte class consumes exactly one byte: `.` and friends
+            // are byte-level in this engine, and a match may legitimately end
+            // inside a codepoint.
+            //
+            // A negated one consumes a whole codepoint. Its complement is taken
+            // over Unicode scalar values, not over bytes — `[^a]` means "some
+            // character other than a", so on "中" it matches all three bytes and
+            // not just the first (`nfa::utf8_automata` is what builds that).
+            HirExpr::Class(class) if !class.negated => {
                 let b = *self.input.get(pos)?;
-                let in_ranges = class.ranges.iter().any(|&(lo, hi)| lo <= b && b <= hi);
-                if in_ranges != class.negated {
+                if class.ranges.iter().any(|&(lo, hi)| lo <= b && b <= hi) {
                     k(pos + 1, caps)
                 } else {
                     None
+                }
+            }
+
+            HirExpr::Class(class) => {
+                let (codepoint, len) = decode_utf8(&self.input[pos..])?;
+                let excluded = codepoint < 0x80
+                    && class
+                        .ranges
+                        .iter()
+                        .any(|&(lo, hi)| lo as u32 <= codepoint && codepoint <= hi as u32);
+                if excluded {
+                    None
+                } else {
+                    k(pos + len, caps)
                 }
             }
 
