@@ -349,8 +349,25 @@ impl BacktrackingVm {
                     }
                 }
 
+                Op::StartLineAnchor => {
+                    if pos == 0 || input[pos - 1] == b'\n' {
+                        pc += 1;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
+                    }
+                }
+
                 Op::EndAnchor => {
-                    if pos == input.len() {
+                    // End of text, or just before a trailing newline.
+                    if pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n') {
+                        pc += 1;
+                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        return Ok(false);
+                    }
+                }
+
+                Op::EndLineAnchor => {
+                    if pos == input.len() || input[pos] == b'\n' {
                         pc += 1;
                     } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
                         return Ok(false);
@@ -732,11 +749,17 @@ impl Compiler {
             }
 
             HirExpr::Anchor(anchor) => match anchor {
-                HirAnchor::Start | HirAnchor::StartLine => {
+                HirAnchor::Start => {
                     self.emit(Op::StartAnchor);
                 }
-                HirAnchor::End | HirAnchor::EndLine => {
+                HirAnchor::StartLine => {
+                    self.emit(Op::StartLineAnchor);
+                }
+                HirAnchor::End => {
                     self.emit(Op::EndAnchor);
+                }
+                HirAnchor::EndLine => {
+                    self.emit(Op::EndLineAnchor);
                 }
                 HirAnchor::WordBoundary => {
                     self.emit(Op::WordBoundary);

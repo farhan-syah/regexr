@@ -941,11 +941,20 @@ impl BacktrackingCompiler {
                 );
             }
             HirAnchor::End => {
-                // End of text: position must equal length
+                // End of text, or immediately before a trailing newline — the
+                // PCRE/Python rule, so `a$` matches "a" in "a\n".
+                let ok = self.asm.new_dynamic_label();
                 dynasm!(self.asm
                     ; .arch x64
                     ; cmp rcx, rsi
+                    ; je =>ok
+                    ; lea rax, [rcx + 1]
+                    ; cmp rax, rsi
                     ; jne =>self.backtrack_label
+                    ; mov al, BYTE [rdi + rcx]
+                    ; cmp al, 0x0a  // newline
+                    ; jne =>self.backtrack_label
+                    ; =>ok
                 );
             }
             HirAnchor::StartLine => {
