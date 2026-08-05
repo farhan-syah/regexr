@@ -2,12 +2,31 @@
 name = "regexr"
 version = "0.1.5"
 edition = "2021"
+# The MSRV is a published contract, not a CI-only constant: cargo refuses the
+# build on an older toolchain instead of failing somewhere inside the compile,
+# and the `msrv` CI job reads this value rather than hardcoding its own.
+rust-version = "1.83"
 authors = ["Farhan Syah"]
 description = "A high-performance regex engine built from scratch with JIT compilation and SIMD acceleration"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ml-rust/regexr"
 keywords = ["regex", "jit", "simd", "pattern-matching"]
 categories = ["text-processing", "parsing"]
+
+# Repository scaffolding that no consumer builds against. The Unicode tables
+# under `data/` are the generator's *input*; its committed output is
+# `src/hir/unicode_data.rs`, which is what the crate actually compiles. Without
+# this, roughly 1.4 MiB of README screenshots, raw UCD files, and CI config
+# ships to everyone who depends on regexr.
+exclude = [
+    "/.config/",
+    "/.github/",
+    "/data/",
+    "/docs/",
+    "/images/",
+    "/scripts/",
+    "/deny.toml",
+]
 
 [features]
 default = ["simd"]
@@ -16,17 +35,17 @@ simd = []
 full = ["jit", "simd"]
 
 [dependencies]
-dynasm = { version = "5.0", optional = true }
-dynasmrt = { version = "5.0", optional = true }
-memchr = "2"
-aho-corasick = "1"
+dynasm = { version = "5.1", optional = true }
+dynasmrt = { version = "5.1", optional = true }
+memchr = "2.8"
+aho-corasick = "1.1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-regex = "1"
-fancy-regex = "0.18"
+regex = "1.13"
+fancy-regex = "0.19"
 pcre2 = "0.2"
-aho-corasick = "1"
+aho-corasick = "1.1"
 
 [[bench]]
 name = "competitors"

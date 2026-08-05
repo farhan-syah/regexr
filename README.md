@@ -1,4 +1,4 @@
-![regexr](images/regexr.png)
+![regexr](https://raw.githubusercontent.com/ml-rust/regexr/main/images/regexr.png)
 
 # regexr
 
@@ -203,13 +203,13 @@ The library automatically selects the best execution engine based on pattern cha
 - **JitShiftOr**: Small patterns with alternations
 - **DFA JIT**: General patterns, benefits from SIMD prefiltering
 
-See [docs/architecture.md](docs/architecture.md) for details on the engine selection logic.
+See [docs/architecture.md](https://github.com/ml-rust/regexr/blob/main/docs/architecture.md) for details on the engine selection logic.
 
 ## Performance
 
 Speedup relative to `regex` crate (higher is better):
 
-![Performance Heatmap](images/speedup_heatmap.png)
+![Performance Heatmap](https://raw.githubusercontent.com/ml-rust/regexr/main/images/speedup_heatmap.png)
 
 **Highlights** (speedup vs `regex` crate):
 
@@ -229,8 +229,8 @@ Speedup relative to `regex` crate (higher is better):
 
 ## Documentation
 
-- [Architecture Overview](docs/architecture.md) - Engine architecture and selection logic
-- [Features](docs/features.md) - Detailed feature documentation
+- [Architecture Overview](https://github.com/ml-rust/regexr/blob/main/docs/architecture.md) - Engine architecture and selection logic
+- [Features](https://github.com/ml-rust/regexr/blob/main/docs/features.md) - Detailed feature documentation
 
 ## Citation
 

@@ -1,0 +1,88 @@
+# cargo-deny configuration.
+#
+# Run locally: `cargo deny --exclude-dev check`
+# CI gate:     .github/workflows/test.yml :: audit job
+#
+# Dev-dependencies are excluded in CI. regexr's benchmark suite links the
+# competing engines it measures against — including `pcre2`, which is C — and a
+# licence or advisory finding in a crate that never ships to a consumer of the
+# library is not a release gate.
+
+[graph]
+# Every target regexr is checked against in CI. `dynasmrt` pulls a different
+# mmap backend per platform, so a Windows-only advisory is invisible from a
+# Linux-only graph.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "wasm32-unknown-unknown" },
+]
+# JIT is not a default feature, but it is the feature that adds a runtime
+# codegen dependency — the part of the graph most worth auditing.
+all-features = true
+
+# ────────────────────────────────────────────────────────────────────────
+# Security advisories. Any RustSec advisory against a dep, direct or
+# transitive, fails CI. Yanked crates fail too: a yank is the registry
+# telling us not to depend on that version.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Add advisory IDs here with a comment explaining the exception, e.g.
+    # "RUSTSEC-YYYY-NNNN", # only reachable from a code path we don't use
+]
+
+# ────────────────────────────────────────────────────────────────────────
+# Licences — allow-list. regexr ships as MIT OR Apache-2.0, so anything that
+# would impose a stronger obligation on a consumer has to be a deliberate,
+# reviewed addition rather than something a transitive bump can introduce.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    # dynasm / dynasmrt, reached only through the `jit` feature. MPL-2.0 is
+    # file-level copyleft: it binds modifications to those crates' own files
+    # and imposes nothing on a crate that merely links them.
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+# The allow-list is a policy, not an inventory. Flagging entries no current
+# dependency happens to use turns every routine dep change into an edit here.
+unused-allowed-license = "allow"
+
+# ────────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"   # warn, not deny — common and usually harmless in transitive trees
+wildcards = "deny"           # no `foo = "*"` requirements in our Cargo.toml
+highlight = "all"
+deny = [
+    # A pure-Rust engine with no C dependencies is a headline property of this
+    # crate, not an accident. These are the C-linking regex engines the bench
+    # suite compares against; if one ever reaches the library graph, the claim
+    # is false and the build must say so.
+    { name = "pcre2-sys" },
+    { name = "onig_sys" },
+]
+skip-tree = []
+
+# ────────────────────────────────────────────────────────────────────────
+# Where deps may come from. crates.io only — a git-pinned dependency is a
+# dependency no `cargo audit` or yank ever reaches.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

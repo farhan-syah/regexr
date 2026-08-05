@@ -1,10 +1,30 @@
-# Reusable test workflow: lint, format, docs, cross-platform tests, feature checks.
+# Reusable test workflow.
 #
 # Called by:
-#   - ci.yml      (PR checks)
-#   - release.yml (pre-publish validation)
+#   - ci.yml              (PR checks + manual dispatch)
+#   - release-prepare.yml (tag gate, before anything is published)
 #
-# Not triggered directly — use workflow_call only.
+# Not triggered directly — `workflow_call` only.
+#
+# Every third-party action is pinned to a commit SHA with the release it
+# corresponds to in a trailing comment. A tag is a movable pointer; a SHA is
+# not, so a compromised or retagged action cannot silently enter a run that
+# holds a crates.io token. Dependabot owns keeping the pins current — see
+# .github/dependabot.yml.
+#
+# Jobs:
+#   lint           — rustfmt, clippy, docs, doctests, shellcheck
+#   test           — `cargo nextest run` on Linux / macOS / Windows, default and
+#                    full features
+#   feature-matrix — every feature combination that ships, plus wasm32
+#   jit-platforms  — the JIT actually executed on ARM64 Linux and both macOS
+#                    architectures; codegen bugs there are invisible to a
+#                    compile-only check
+#   cross-check    — bidirectional x86_64 ↔ aarch64 cross-compilation, which is
+#                    where the dynasm `.arch` directives regress
+#   msrv           — the MSRV declared in Cargo.toml, read from the manifest so
+#                    the job and the published contract cannot drift apart
+#   audit          — cargo-deny: advisories, licences, sources, banned crates
 
 name: Test
 
@@ -19,35 +39,47 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint, Format & Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           prefix-key: lint
 
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run clippy (all features)
+      # `--all-targets` also type-checks the benches and examples, so a bench
+      # that stops compiling fails here rather than the next time someone runs
+      # `cargo bench` by hand.
+      - name: Clippy (all features, all targets)
         run: cargo clippy --features full --all-targets -- -D warnings
 
+      # Warnings are denied because the failure that matters here is silent: a
+      # link to a private item renders as plain text rather than erroring, so
+      # the published docs lose it and nothing reports why.
       - name: Build docs
         run: cargo doc --features full --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # nextest does not run doctests; this is the only place they execute.
       - name: Run doctests
         run: cargo test --doc --features full
 
+      - name: Shellcheck release scripts
+        run: shellcheck scripts/ci/*.sh
+
+  # ─────────────────────────────────────────────────────────────────────────
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -56,57 +88,83 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          prefix-key: test
+          prefix-key: test-${{ matrix.os }}
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: nextest
+
+      # Both configurations run: engine selection differs between them, so a
+      # bug in an interpreted engine can be masked once the JIT takes over.
       - name: Run tests (default features)
-        run: cargo test
+        run: cargo nextest run --no-fail-fast
 
-      - name: Run tests (all features)
-        run: cargo test --features full
+      - name: Run tests (full features)
+        run: cargo nextest run --features full --no-fail-fast
 
+      - name: Upload nextest report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-${{ matrix.os }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
   feature-matrix:
     name: Feature Compile & WASM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           prefix-key: feature-matrix
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: nextest
+
       - name: "Compile: no default features (minimal)"
-        run: cargo check --no-default-features
+        run: cargo check --no-default-features --all-targets
 
       - name: "Compile: simd only (default)"
-        run: cargo check
+        run: cargo check --all-targets
 
       - name: "Compile: jit only"
-        run: cargo check --no-default-features --features jit
+        run: cargo check --no-default-features --features jit --all-targets
 
       - name: "Compile: full"
-        run: cargo check --features full
+        run: cargo check --features full --all-targets
 
+      # The JIT has no wasm32 backend, so this is the configuration a wasm
+      # consumer actually gets. Compile-only: there is no wasm runtime here.
       - name: "Compile: WASM (no default features)"
         run: cargo check --no-default-features --target wasm32-unknown-unknown
 
       - name: "Test: no default features"
-        run: cargo test --no-default-features
+        run: cargo nextest run --no-default-features --no-fail-fast
 
       - name: "Test: jit only"
-        run: cargo test --no-default-features --features jit
+        run: cargo nextest run --no-default-features --features jit --no-fail-fast
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # The JIT emits architecture-specific machine code. A cross-compile proves it
+  # assembles; only these runners prove it runs.
   jit-platforms:
     name: JIT (${{ matrix.name }})
     strategy:
@@ -124,21 +182,31 @@ jobs:
             features: jit
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          prefix-key: jit
+          prefix-key: jit-${{ matrix.os }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: nextest
 
       - name: Check
         run: cargo check --no-default-features --features ${{ matrix.features }}
 
       - name: Test
-        run: cargo test --no-default-features --features ${{ matrix.features }}
+        run: cargo nextest run --no-default-features --features ${{ matrix.features }} --no-fail-fast
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # dynasm blocks carry explicit `.arch` directives; without them the assembler
+  # falls back to the host architecture and the code is silently wrong for the
+  # target. That shipped twice (0.1.1, 0.1.2), which is why both directions are
+  # checked rather than just the common one.
   cross-check:
     name: Cross-check (${{ matrix.name }})
     runs-on: ${{ matrix.runs-on }}
@@ -159,14 +227,14 @@ jobs:
             linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
             linker: x86_64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           prefix-key: cross-${{ matrix.target }}
 
@@ -183,18 +251,67 @@ jobs:
         env:
           ${{ matrix.linker_env }}: ${{ matrix.linker }}
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # The MSRV comes from `package.rust-version`, so raising it is one edit in
+  # the manifest — the published contract and the job enforcing it cannot
+  # disagree. Read with grep rather than `cargo metadata`: the toolchain that
+  # would run it is the one this job is still deciding.
   msrv:
-    name: MSRV (1.83)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust 1.83
-        uses: dtolnay/rust-toolchain@1.83
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^rust-version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "Declared MSRV: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          prefix-key: msrv
+          toolchain: ${{ steps.msrv.outputs.version }}
 
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: msrv-${{ steps.msrv.outputs.version }}
+
+      # Library target only. Dev-dependencies are benchmark harnesses and the
+      # competing engines they measure; their MSRVs are not regexr's contract.
+      #
+      # `--locked` is what makes this job mean anything. An older cargo happily
+      # re-resolves Cargo.lock down to whatever it can build and then reports
+      # success, so without it the job proves some dependency set works on the
+      # MSRV — not the one that ships.
       - name: Check MSRV (all features)
-        run: cargo check --features full
+        run: cargo check --features full --lib --locked
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # `--exclude-dev`: the bench suite links the engines it measures against,
+  # including C-backed pcre2. An advisory or licence finding there is not
+  # something a consumer of the library ever links.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-deny
+
+      # `--locked`: audit the dependency versions that are committed, not
+      # whatever a fresh resolve happens to pick up on the day CI runs.
+      - name: Run cargo-deny
+        run: cargo deny --exclude-dev --locked check
