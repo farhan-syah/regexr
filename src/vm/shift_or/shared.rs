@@ -578,12 +578,9 @@ impl ShiftOrWide {
         // Try matching at each position, preferring longest match (greedy).
         // `scan_limit` first rules out "no match anywhere" in a single pass and
         // otherwise caps how far this scan has to walk.
-        let scan_end = match self.scan_limit(input, 0) {
-            Some(end) => end,
-            // No match to find. A nullable pattern still matches empty, and
-            // `scan_limit` never reports `None` for one.
-            None => return None,
-        };
+        // No match to find when this is `None`. A nullable pattern still
+        // matches empty, and `scan_limit` never reports `None` for one.
+        let scan_end = self.scan_limit(input, 0)?;
         for start in 0..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 return Some((start, end));

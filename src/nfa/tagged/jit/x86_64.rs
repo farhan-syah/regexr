@@ -5828,11 +5828,9 @@ impl TaggedNfaJitCompiler {
         let mut end_states: Vec<StateId> = Vec::new();
 
         for &alt_start in &state.epsilon {
-            if let Some(end) = self.trace_to_merge_point_with_depth(alt_start, start, depth) {
-                end_states.push(end);
-            } else {
-                return None;
-            }
+            // An alternative that does not reach a merge point means there is
+            // no single convergence state to report.
+            end_states.push(self.trace_to_merge_point_with_depth(alt_start, start, depth)?);
         }
 
         // All end states should be the same
