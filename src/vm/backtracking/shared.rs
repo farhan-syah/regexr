@@ -56,10 +56,18 @@ pub enum Op {
     Save(u16),
     /// Match (success).
     Match,
-    /// Start anchor (^).
+    /// Start of text (`^` without `(?m)`, `\A`).
     StartAnchor,
-    /// End anchor ($).
+    /// Start of a line (`^` under `(?m)`): the start of the text, or just after
+    /// a newline.
+    StartLineAnchor,
+    /// End of text (`$` without `(?m)`): the end of the text, or immediately
+    /// before a trailing newline — the PCRE/Python rule the rest of the crate
+    /// follows, so `a$` matches "a" in "a\n".
     EndAnchor,
+    /// End of a line (`$` under `(?m)`): the end of the text, or just before any
+    /// newline.
+    EndLineAnchor,
     /// Word boundary.
     WordBoundary,
     /// Not word boundary.
