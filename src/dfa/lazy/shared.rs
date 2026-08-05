@@ -178,6 +178,9 @@ pub struct LazyDfaContext {
     pub(crate) has_end_anchor: bool,
     /// Whether pattern uses multiline mode (^ matches after \n, $ matches before \n).
     pub(crate) has_multiline_anchors: bool,
+    /// Whether the *start* anchor specifically is line-mode — see
+    /// [`nfa_anchor_info`].
+    pub(crate) has_multiline_start_anchor: bool,
 }
 
 impl LazyDfaContext {
@@ -190,8 +193,13 @@ impl LazyDfaContext {
         let has_word_boundary = nfa_has_word_boundary(&nfa);
 
         // Check for anchor instructions
-        let (has_anchors, has_start_anchor, has_end_anchor, has_multiline_anchors) =
-            nfa_anchor_info(&nfa);
+        let (
+            has_anchors,
+            has_start_anchor,
+            has_end_anchor,
+            has_multiline_anchors,
+            has_multiline_start_anchor,
+        ) = nfa_anchor_info(&nfa);
 
         let mut ctx = Self {
             nfa,
@@ -206,16 +214,21 @@ impl LazyDfaContext {
             has_start_anchor,
             has_end_anchor,
             has_multiline_anchors,
+            has_multiline_start_anchor,
         };
 
         // Create the start state
         let mut start_set = BTreeSet::new();
         start_set.insert(ctx.nfa.start);
 
-        // Compute epsilon closure with assertion filtering
-        // At position 0 (start of input), we're at a word boundary because
-        // there's no preceding word character (NonWord -> first char is transition)
-        let is_at_boundary = if has_word_boundary { Some(true) } else { None };
+        // Whether position 0 is a word boundary depends on the byte that follows
+        // it, which is not known while the start state is being built: `\b` holds
+        // before "ab" and not before "  ". Leaving it unresolved keeps the
+        // pre-assertion states as the seeds, and `compute_transition` re-expands
+        // them once the byte — and so the boundary — is known. Claiming `true`
+        // here instead baked the assertion in as satisfied, which is what let
+        // `\b.` match at 0 in "  ".
+        let is_at_boundary = None;
 
         let start_closure = if has_word_boundary || has_anchors {
             epsilon_closure_with_context(
@@ -258,6 +271,11 @@ impl LazyDfaContext {
         self.has_multiline_anchors
     }
 
+    /// Returns whether the start anchor specifically is line-mode.
+    pub fn has_multiline_start_anchor(&self) -> bool {
+        self.has_multiline_start_anchor
+    }
+
     /// Returns the start state.
     pub fn start(&self) -> DfaStateId {
         self.start
@@ -290,11 +308,20 @@ pub fn nfa_has_word_boundary(nfa: &Nfa) -> bool {
 }
 
 /// Returns anchor information for an NFA.
-/// Returns (has_anchors, has_start_anchor, has_end_anchor, has_multiline_anchors).
-pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool) {
+///
+/// Returns `(has_anchors, has_start_anchor, has_end_anchor, has_multiline_anchors,
+/// has_multiline_start_anchor)`.
+///
+/// The last two are not the same question. `has_multiline_anchors` says the
+/// pattern contains *some* line anchor; `has_multiline_start_anchor` says the
+/// *start* anchor is one. `^a(?m)$` has both a plain `^` and a line-mode `$`, so
+/// its valid start positions are still "position 0 only" — treating every line
+/// start as valid would make it match the second line of "a\nb".
+pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool, bool) {
     let mut has_start_anchor = false;
     let mut has_end_anchor = false;
     let mut has_multiline_anchors = false;
+    let mut has_multiline_start_anchor = false;
 
     for state in &nfa.states {
         match &state.instruction {
@@ -303,6 +330,7 @@ pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool) {
             Some(NfaInstruction::StartOfLine) => {
                 has_start_anchor = true;
                 has_multiline_anchors = true;
+                has_multiline_start_anchor = true;
             }
             Some(NfaInstruction::EndOfLine) => {
                 has_end_anchor = true;
@@ -318,6 +346,7 @@ pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool) {
         has_start_anchor,
         has_end_anchor,
         has_multiline_anchors,
+        has_multiline_start_anchor,
     )
 }
 
