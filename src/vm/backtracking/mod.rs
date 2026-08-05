@@ -25,6 +25,7 @@ pub mod jit;
 // Re-exports
 pub use engine::BacktrackingEngine;
 pub use interpreter::BacktrackingVm;
+pub use shared::{BudgetExhausted, DEFAULT_BACKTRACK_LIMIT};
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use jit::{compile_backtracking, BacktrackingJit};

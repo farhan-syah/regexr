@@ -45,6 +45,8 @@ pub struct RegexBuilder {
     /// Whether to enable prefix optimization for large alternations.
     /// This is critical for tokenizer-style patterns with many literal alternatives.
     optimize_prefixes: bool,
+    /// Steps a backreference search may take; see [`RegexBuilder::backtrack_limit`].
+    backtrack_limit: u64,
 }
 
 impl RegexBuilder {
@@ -54,7 +56,26 @@ impl RegexBuilder {
             pattern: pattern.to_string(),
             jit: false,
             optimize_prefixes: false,
+            backtrack_limit: vm::backtracking::DEFAULT_BACKTRACK_LIMIT,
         }
+    }
+
+    /// Sets how many steps a backreference search may take before giving up.
+    ///
+    /// Every engine in this crate is linear in the input except the backtracking
+    /// one, and only patterns with backreferences reach it. Matching a
+    /// backreference is NP-hard in general — there is no polynomial bound to
+    /// fall back on — so a step budget is what guarantees the search ends.
+    ///
+    /// The default is high enough that ordinary patterns never approach it. A
+    /// search that does exhaust it makes [`Regex::try_find`],
+    /// [`Regex::try_captures`] and [`Regex::try_is_match`] return
+    /// [`error::ErrorKind::MatchLimitExceeded`]; the infallible [`Regex::find`],
+    /// [`Regex::captures`] and [`Regex::is_match`] report it as "no match",
+    /// which is why the fallible forms exist.
+    pub fn backtrack_limit(mut self, limit: u64) -> Self {
+        self.backtrack_limit = limit;
+        self
     }
 
     /// Enables or disables JIT compilation.
@@ -130,6 +151,7 @@ impl RegexBuilder {
             inner,
             pattern: self.pattern,
             named_groups,
+            backtrack_limit: self.backtrack_limit,
         })
     }
 }
@@ -192,6 +214,8 @@ pub struct Regex {
     pattern: String,
     /// Named capture groups: maps name to index.
     named_groups: Arc<HashMap<String, u32>>,
+    /// Steps a backreference search may take; see [`RegexBuilder::backtrack_limit`].
+    backtrack_limit: u64,
 }
 
 impl Regex {
@@ -210,6 +234,7 @@ impl Regex {
             inner,
             pattern: pattern.to_string(),
             named_groups,
+            backtrack_limit: vm::backtracking::DEFAULT_BACKTRACK_LIMIT,
         })
     }
 
@@ -252,6 +277,52 @@ impl Regex {
             slots,
             named_groups: Arc::clone(&self.named_groups),
         })
+    }
+
+    /// [`Self::is_match`], reporting an exhausted backtracking budget instead of
+    /// answering "no match".
+    ///
+    /// # Errors
+    /// [`error::ErrorKind::MatchLimitExceeded`] if a backreference search ran
+    /// past [`RegexBuilder::backtrack_limit`]. No other pattern can fail here.
+    pub fn try_is_match(&self, text: &str) -> Result<bool> {
+        Ok(self.try_find(text)?.is_some())
+    }
+
+    /// [`Self::find`], reporting an exhausted backtracking budget instead of
+    /// answering "no match".
+    ///
+    /// # Errors
+    /// [`error::ErrorKind::MatchLimitExceeded`] if a backreference search ran
+    /// past [`RegexBuilder::backtrack_limit`]. No other pattern can fail here.
+    pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>> {
+        self.inner
+            .try_find_from(text.as_bytes(), 0, self.backtrack_limit)
+            .map(|found| found.map(|(start, end)| Match { text, start, end }))
+            .map_err(|_| self.match_limit_error())
+    }
+
+    /// [`Self::captures`], reporting an exhausted backtracking budget instead of
+    /// answering "no match".
+    ///
+    /// # Errors
+    /// [`error::ErrorKind::MatchLimitExceeded`] if a backreference search ran
+    /// past [`RegexBuilder::backtrack_limit`]. No other pattern can fail here.
+    pub fn try_captures<'t>(&self, text: &'t str) -> Result<Option<Captures<'t>>> {
+        self.inner
+            .try_captures_from(text.as_bytes(), 0, self.backtrack_limit)
+            .map(|found| {
+                found.map(|slots| Captures {
+                    text,
+                    slots,
+                    named_groups: Arc::clone(&self.named_groups),
+                })
+            })
+            .map_err(|_| self.match_limit_error())
+    }
+
+    fn match_limit_error(&self) -> Error {
+        Error::new(error::ErrorKind::MatchLimitExceeded, &self.pattern)
     }
 
     /// Returns an iterator over all non-overlapping captures.

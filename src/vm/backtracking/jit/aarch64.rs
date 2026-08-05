@@ -24,7 +24,7 @@ use crate::hir::{Hir, HirAnchor, HirClass, HirExpr};
 
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
 
-use super::jit::BacktrackingJit;
+use super::jit::{BacktrackingJit, BUDGET_EXHAUSTED, STACK_EXHAUSTED};
 
 // ARM64 backtracking JIT enabled
 const ARM64_BACKTRACKING_JIT_ENABLED: bool = true;
@@ -43,6 +43,20 @@ pub(super) struct BacktrackingCompiler {
     no_match_label: dynasmrt::DynamicLabel,
     /// Label for trying next start position.
     next_start_label: dynasmrt::DynamicLabel,
+    /// Label for "the choice-point stack is full".
+    ///
+    /// The stack is a fixed frame, so a search that needs more choice points
+    /// than it holds has to stop rather than write past the end of it. Jumping
+    /// here returns `STACK_EXHAUSTED`, and the caller re-runs the search on the
+    /// interpreter, whose stack grows.
+    stack_exhausted_label: dynasmrt::DynamicLabel,
+    /// Label for "the step budget is spent".
+    ///
+    /// Every choice point costs a step, so a search that explores exponentially
+    /// many of them runs the budget down and stops here, returning
+    /// `BUDGET_EXHAUSTED`. Unlike a full stack this is not worth retrying on the
+    /// interpreter — it is the caller's limit, and the caller is told.
+    budget_exhausted_label: dynasmrt::DynamicLabel,
     /// Number of capture groups.
     capture_count: u32,
     /// Current capture index being filled.
@@ -62,6 +76,8 @@ impl BacktrackingCompiler {
         let match_success_label = asm.new_dynamic_label();
         let no_match_label = asm.new_dynamic_label();
         let next_start_label = asm.new_dynamic_label();
+        let stack_exhausted_label = asm.new_dynamic_label();
+        let budget_exhausted_label = asm.new_dynamic_label();
 
         Ok(Self {
             asm,
@@ -70,6 +86,8 @@ impl BacktrackingCompiler {
             match_success_label,
             no_match_label,
             next_start_label,
+            stack_exhausted_label,
+            budget_exhausted_label,
             capture_count: hir.props.capture_count,
             current_capture: None,
         })
@@ -105,15 +123,16 @@ impl BacktrackingCompiler {
             .map_err(|e| Error::new(ErrorKind::Jit(format!("Failed to finalize: {:?}", e)), ""))?;
 
         // ARM64 uses AAPCS64 calling convention (extern "C")
-        let match_fn: unsafe extern "C" fn(*const u8, usize, *mut i64) -> i64 =
+        let match_fn: unsafe extern "C" fn(*const u8, usize, *mut i64, u64) -> i64 =
             unsafe { std::mem::transmute(code.ptr(entry_offset)) };
 
         Ok(BacktrackingJit {
             code,
             match_fn,
             capture_count: self.capture_count,
-            // Attached by `compile_backtracking` when the pattern reads left context.
-            left_context_vm: None,
+            vm: crate::vm::backtracking::BacktrackingVm::new(&self.hir),
+            // Set by `compile_backtracking` when the pattern reads left context.
+            needs_left_context: false,
         })
     }
 
@@ -143,6 +162,7 @@ impl BacktrackingCompiler {
             ; mov x19, x0              // x19 = input_ptr
             ; mov x20, x1              // x20 = input_len
             ; mov x22, x2              // x22 = captures_ptr
+            ; str x3, [x29, #-0x58]    // Step budget
             ; mov x23, #0              // x23 = start_pos = 0
             ; mov x26, sp              // x26 = backtrack stack pointer (bottom)
 
@@ -361,6 +381,17 @@ impl BacktrackingCompiler {
                 // Save state for backtracking (32-byte entry)
                 dynasm!(self.asm
                     ; .arch aarch64
+                    // Refuse to push past the top of the frame (see
+                    // `stack_exhausted_label`). The frame ends 0x58 below x29:
+                    // 0x50 of spilled callee-saved registers, then the budget.
+                    ; ldr x9, [x29, #-0x58]
+                    ; subs x9, x9, #1
+                    ; str x9, [x29, #-0x58]
+                    ; b.ls =>self.budget_exhausted_label
+                    ; add x9, x26, #32
+                    ; sub x10, x29, #0x58
+                    ; cmp x9, x10
+                    ; b.hi =>self.stack_exhausted_label
                     ; str x21, [x26]             // Save position
                     ; adr x0, =>try_next
                     ; str x0, [x26, #8]          // Save resume address
@@ -438,6 +469,16 @@ impl BacktrackingCompiler {
             // Push choice point
             dynasm!(self.asm
                 ; .arch aarch64
+                // Refuse to push past the top of the frame; see
+                // `stack_exhausted_label`.
+                ; ldr x9, [x29, #-0x58]
+                ; subs x9, x9, #1
+                ; str x9, [x29, #-0x58]
+                ; b.ls =>self.budget_exhausted_label
+                ; add x9, x26, #32
+                ; sub x10, x29, #0x58
+                ; cmp x9, x10
+                ; b.hi =>self.stack_exhausted_label
                 ; str x21, [x26]
                 ; adr x0, =>try_backtrack
                 ; str x0, [x26, #8]
@@ -543,6 +584,16 @@ impl BacktrackingCompiler {
                 // Push choice point to try more later
                 dynasm!(self.asm
                     ; .arch aarch64
+                    // Refuse to push past the top of the frame; see
+                    // `stack_exhausted_label`.
+                    ; ldr x9, [x29, #-0x58]
+                    ; subs x9, x9, #1
+                    ; str x9, [x29, #-0x58]
+                    ; b.ls =>self.budget_exhausted_label
+                    ; add x9, x26, #32
+                    ; sub x10, x29, #0x58
+                    ; cmp x9, x10
+                    ; b.hi =>self.stack_exhausted_label
                     ; str x21, [x26]
                     ; adr x0, =>try_more
                     ; str x0, [x26, #8]
@@ -775,6 +826,16 @@ impl BacktrackingCompiler {
 
             ; =>self.no_match_label
             ; movn x0, 0
+            ; b >epilogue
+
+            // Choice-point stack full: the answer is unknown, not "no match".
+            ; =>self.stack_exhausted_label
+            ; movn x0, 1                    // -2
+            ; b >epilogue
+
+            // Step budget spent: the caller's limit, reported as such.
+            ; =>self.budget_exhausted_label
+            ; movn x0, 2                    // -3
 
             ; epilogue:
             // Deallocate backtrack stack

@@ -312,6 +312,52 @@ pub fn translate(ast: &Ast) -> Result<Hir> {
     translator.translate(ast)
 }
 
+/// Whether an expression can match the empty string.
+///
+/// Zero-width constructs (anchors, lookaround, and a backreference to a group
+/// that captured nothing) consume no input and therefore match empty; a class or
+/// a non-empty literal never does. Repetition matches empty when it may run zero
+/// times or when its body can.
+///
+/// This is what decides whether a repetition needs a progress guard: a loop over
+/// a body that matches empty can re-enter at a position it never advances past.
+pub fn matches_empty(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Empty | HirExpr::Anchor(_) | HirExpr::Lookaround(_) | HirExpr::Backref(_) => true,
+        HirExpr::Literal(bytes) => bytes.is_empty(),
+        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => false,
+        HirExpr::Concat(exprs) => exprs.iter().all(matches_empty),
+        HirExpr::Alt(branches) => branches.iter().any(matches_empty),
+        HirExpr::Repeat(r) => r.min == 0 || matches_empty(&r.expr),
+        HirExpr::Capture(c) => matches_empty(&c.expr),
+    }
+}
+
+/// Whether the expression contains an unbounded repetition over a body that can
+/// match the empty string (`(a*)*`, `()+`, `(a?)*`, …).
+///
+/// Such a loop needs a progress guard: without one it re-enters its body at a
+/// position it can never advance past. Bounded repeats are excluded because they
+/// unroll into a finite number of copies and cannot loop.
+pub fn has_unbounded_nullable_repeat(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Empty
+        | HirExpr::Literal(_)
+        | HirExpr::Class(_)
+        | HirExpr::UnicodeCpClass(_)
+        | HirExpr::Anchor(_)
+        | HirExpr::Backref(_) => false,
+        HirExpr::Concat(exprs) | HirExpr::Alt(exprs) => {
+            exprs.iter().any(has_unbounded_nullable_repeat)
+        }
+        HirExpr::Repeat(r) => {
+            (r.max.is_none() && matches_empty(&r.expr)) || has_unbounded_nullable_repeat(&r.expr)
+        }
+        HirExpr::Capture(c) => has_unbounded_nullable_repeat(&c.expr),
+        HirExpr::Lookaround(l) => has_unbounded_nullable_repeat(&l.expr),
+    }
+}
+
 /// Computes the maximum capture group index from an HIR expression.
 /// Returns 0 if there are no capture groups.
 pub fn compute_capture_count(expr: &HirExpr) -> u32 {
