@@ -23,7 +23,15 @@ fn reference_ranges(pattern: &str, text: &str) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     let mut last_end = 0usize;
     while last_end <= bytes.len() {
-        let (start, end) = regexr::reference::find_from(&hir.expr, ncaps, bytes, last_end)?;
+        // Running out of matches ends the iteration; it does not discard the
+        // ones already found. Propagating the `None` out of this function
+        // instead would make every terminating case look like "no expectation
+        // available", and the caller skips those — so the sweep would compare
+        // nothing at all except patterns that match more than 64 times.
+        let Some((start, end)) = regexr::reference::find_from(&hir.expr, ncaps, bytes, last_end)
+        else {
+            break;
+        };
         out.push((start, end));
         last_end = if start == end {
             ceil_char_boundary(text, end + 1)
@@ -38,9 +46,43 @@ fn reference_ranges(pattern: &str, text: &str) -> Option<Vec<(usize, usize)>> {
 }
 
 const FRAGMENTS: &[&str] = &[
-    "a", "ab", "[ab]", "a+", "a*", "a?", "a{2}", "a{1,2}", ".", "\\w", "\\w+", "\\s*", "(a)",
-    "(a)(b)", "(a|b)", "a|b", "(a)\\1", "(?:ab)+", "a+?", "[^a]", "(?=a)a", "(?!b)a", "(?<=a)b",
+    "a",
+    "ab",
+    "[ab]",
+    "a+",
+    "a*",
+    "a?",
+    "a{2}",
+    "a{1,2}",
+    ".",
+    "\\w",
+    "\\w+",
+    "\\s*",
+    "(a)",
+    "(a)(b)",
+    "(a|b)",
+    "a|b",
+    "(a)\\1",
+    "(?:ab)+",
+    "a+?",
+    "[^a]",
+    "(?=a)a",
+    "(?!b)a",
+    "(?<=a)b",
     "(?<!a)b",
+    // Loops over a body that can match the empty string. These decide how many
+    // times the loop runs at a position it cannot advance past, which is both a
+    // termination question and a capture-value question.
+    "(a*)*",
+    "(a?)*",
+    "()+",
+    "(|a)*",
+    "(a|)*",
+    "(a*)+",
+    "((a)*)*",
+    "(a{0,2})*",
+    "(a*)*b",
+    "(a*?)*",
 ];
 
 const PREFIXES: &[&str] = &["", "^", "\\A", "(?m)^", "\\b", "\\B", "(?i)"];
@@ -102,6 +144,68 @@ fn resumed_iteration_matches_reference() {
                 if caps != expected {
                     failures.push(format!(
                         "[{label}] captures {pattern:?} on {text:?}: ref={expected:?} got={caps:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} divergences (of {} patterns):\n{}",
+        failures.len(),
+        patterns.len(),
+        failures.join("\n")
+    );
+}
+
+/// Every group's span, not just the overall match.
+///
+/// `find` and `captures` run on different engines — an automaton for the bounds,
+/// a second pass for the slots — so agreeing on where a match starts and ends
+/// says nothing about agreeing on what each group captured. A loop over a body
+/// that can match empty is where the two most easily part company: the overall
+/// span is the same whether or not the loop takes a final zero-width iteration,
+/// but group 1 is not.
+#[test]
+fn capture_groups_match_reference() {
+    let mut patterns: Vec<String> = Vec::new();
+    for p in PREFIXES {
+        for f in FRAGMENTS {
+            for s in SUFFIXES {
+                patterns.push(format!("{p}{f}{s}"));
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    for pattern in &patterns {
+        let Ok(hir) = parse(pattern).and_then(|ast| translate(&ast)) else {
+            continue;
+        };
+        let ncaps = hir.props.capture_count as usize;
+        if ncaps == 0 {
+            continue;
+        }
+        for text in TEXTS {
+            let expected =
+                regexr::reference::captures(&hir.expr, ncaps, text.as_bytes()).map(|caps| {
+                    // The spec leaves slots for groups it never entered as
+                    // `None`, which is what the engines report too.
+                    caps.into_iter().collect::<Vec<_>>()
+                });
+            for (label, jit) in [("jit", true), ("interp", false)] {
+                let Ok(re) = RegexBuilder::new(pattern).jit(jit).build() else {
+                    continue;
+                };
+                let got = re.captures(text).map(|caps| {
+                    (0..caps.len())
+                        .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+                        .collect::<Vec<_>>()
+                });
+                if got != expected {
+                    failures.push(format!(
+                        "[{label}] {pattern:?} on {text:?}: ref={expected:?} got={got:?}"
                     ));
                 }
             }

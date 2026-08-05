@@ -207,7 +207,23 @@ impl CompiledRegex {
         if from > input.len() {
             return None;
         }
+        // A match never starts inside a codepoint. Byte-level constructs (`.`,
+        // byte classes) can match a single continuation byte, so an engine
+        // scanning start positions will happily report one; the PikeVM and the
+        // tagged NFA already refuse those starts, and this makes the rest agree.
+        // Rejecting a match and resuming one byte later converges on the
+        // leftmost match that does start at a boundary.
+        let mut from = from;
+        loop {
+            let (start, end) = self.find_from_inner(input, from)?;
+            if crate::nfa::is_utf8_boundary(input, start) {
+                return Some((start, end));
+            }
+            from = start + 1;
+        }
+    }
 
+    fn find_from_inner(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
         // Fast path: if prefilter can provide full match bounds (TeddyFull),
         // return directly without running the NFA
         if self.prefilter.is_full_match() {
@@ -697,7 +713,10 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             // - Patterns with anchors: EagerDfa doesn't handle anchors correctly
             // EagerDfa creates all reachable states upfront, which can be millions
             // for large Unicode classes.
-            if hir.props.has_large_unicode_class || hir.props.has_anchors {
+            if hir.props.has_large_unicode_class
+                || hir.props.has_utf8_class_trie
+                || hir.props.has_anchors
+            {
                 (
                     CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
                     capture_nfa,
@@ -717,7 +736,10 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             let capture_nfa = Some(nfa.clone());
 
             // Use LazyDfa for patterns with large Unicode classes or anchors
-            if hir.props.has_large_unicode_class || hir.props.has_anchors {
+            if hir.props.has_large_unicode_class
+                || hir.props.has_utf8_class_trie
+                || hir.props.has_anchors
+            {
                 (
                     CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
                     capture_nfa,
@@ -1061,8 +1083,12 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
 
     // 4. Simple patterns with effective prefilter → DFA JIT
     // DFA JIT benefits from prefilter to quickly skip non-matching positions.
+    // A negated class that expanded into UTF-8 sequences is excluded: the
+    // generated code cannot represent those multi-byte transitions and reports
+    // no match. The DFA interpreter below runs them correctly, and at the same
+    // speed as the `regex` crate.
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
+    if !hir.props.has_utf8_class_trie {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;

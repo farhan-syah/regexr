@@ -22,6 +22,84 @@ fn hir_uses_codepoint_class(expr: &HirExpr) -> bool {
     }
 }
 
+/// Whether no two branches can begin at the same byte, so none of them competes
+/// with another for a match at a given position.
+///
+/// Branches carrying an assertion are excluded outright. `a|b$` has disjoint
+/// first bytes, but the `$` is a zero-width condition these engines resolve for
+/// the pattern as a whole rather than per branch, so "only one branch is viable
+/// here" stops being the only thing that decides the match.
+fn branches_start_disjointly(branches: &[HirExpr]) -> bool {
+    let mut claimed = [false; 256];
+    for branch in branches {
+        if contains_assertion(branch) {
+            return false;
+        }
+        let Some(first) = first_bytes(branch) else {
+            return false;
+        };
+        for (byte, &possible) in first.iter().enumerate() {
+            if possible {
+                if claimed[byte] {
+                    return false;
+                }
+                claimed[byte] = true;
+            }
+        }
+    }
+    true
+}
+
+/// Whether an expression contains a zero-width assertion or a backreference.
+fn contains_assertion(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Anchor(_) | HirExpr::Lookaround(_) | HirExpr::Backref(_) => true,
+        HirExpr::Concat(exprs) | HirExpr::Alt(exprs) => exprs.iter().any(contains_assertion),
+        HirExpr::Repeat(r) => contains_assertion(&r.expr),
+        HirExpr::Capture(c) => contains_assertion(&c.expr),
+        HirExpr::Empty | HirExpr::Literal(_) | HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => {
+            false
+        }
+    }
+}
+
+/// The bytes an expression can start with, or `None` when that is not a settled
+/// question — it may match empty, or it is a construct whose first byte this
+/// does not model. `None` always means "assume it competes".
+fn first_bytes(expr: &HirExpr) -> Option<[bool; 256]> {
+    let mut set = [false; 256];
+    match expr {
+        HirExpr::Literal(bytes) => {
+            set[*bytes.first()? as usize] = true;
+        }
+        HirExpr::Class(class) => {
+            for byte in 0..=255u8 {
+                let in_ranges = class
+                    .ranges
+                    .iter()
+                    .any(|&(lo, hi)| lo <= byte && byte <= hi);
+                set[byte as usize] = in_ranges != class.negated;
+            }
+        }
+        HirExpr::Concat(exprs) => return first_bytes(exprs.first()?),
+        HirExpr::Alt(branches) => {
+            for branch in branches {
+                let branch_set = first_bytes(branch)?;
+                for (byte, possible) in branch_set.iter().enumerate() {
+                    set[byte] |= possible;
+                }
+            }
+        }
+        HirExpr::Capture(c) => return first_bytes(&c.expr),
+        HirExpr::Repeat(r) if r.min >= 1 => return first_bytes(&r.expr),
+        // Repetition that may run zero times, anchors, lookaround,
+        // backreferences and `UnicodeCpClass` are all either zero-width or not
+        // modelled here.
+        _ => return None,
+    }
+    Some(set)
+}
+
 /// Whether a pattern combines a word boundary with the ability to match empty
 /// (`\b`, `\Ba*`, `\b(?:xy)?`, `a*\B`, …).
 ///
@@ -44,12 +122,20 @@ pub fn needs_boundary_aware_empty_match(hir: &Hir) -> bool {
 /// be `ab` (the first branch) under leftmost-first/PCRE semantics, but a DFA
 /// stops at the shorter `a`; `\d+|\w+` on "12ab" must be `12`, but Shift-Or takes
 /// the longest `12ab`. Only an ordered NFA simulation (PikeVM) gets these right,
-/// so any pattern containing an alternation is routed there. (Unicode and byte
-/// classes are `UnicodeCpClass`/`Class`, never `Alt`, so this does not perturb
-/// class handling.)
+/// so any pattern containing an alternation is routed there.
+///
+/// Branch priority only decides anything when two branches can match at the
+/// same position. When their possible first bytes are disjoint, at most one
+/// branch is ever viable and every engine is forced to the same answer — so
+/// those do not count. That is what a negated class expands to (`[^a]` becomes
+/// "a surviving ASCII byte, or a UTF-8 sequence"), and it keeps such patterns on
+/// the DFA instead of dropping them onto the PikeVM.
 pub fn hir_has_alternation(expr: &HirExpr) -> bool {
     match expr {
-        HirExpr::Alt(branches) => branches.len() >= 2 || branches.iter().any(hir_has_alternation),
+        HirExpr::Alt(branches) => {
+            (branches.len() >= 2 && !branches_start_disjointly(branches))
+                || branches.iter().any(hir_has_alternation)
+        }
         HirExpr::Concat(exprs) => exprs.iter().any(hir_has_alternation),
         HirExpr::Repeat(r) => hir_has_alternation(&r.expr),
         HirExpr::Capture(c) => hir_has_alternation(&c.expr),

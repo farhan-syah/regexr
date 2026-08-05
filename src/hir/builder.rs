@@ -630,6 +630,41 @@ impl HirTranslator {
             return self.build_negated_unicode_class(byte_ranges, utf8_sequences);
         }
 
+        // A negated class is negated over *characters*, not bytes. `[^a]` means
+        // "a character other than a", so on "中" it has to match all three
+        // bytes; left as a negated byte class it matches one continuation byte
+        // at a time, which is how `[^a]b` came to miss "中b" entirely.
+        //
+        // The complement is written as "a surviving ASCII byte, or any non-ASCII
+        // character", the second half being a trie of complete UTF-8 sequences.
+        // It stays a byte-level automaton the DFA and Shift-Or still run, and it
+        // cannot match a lone continuation byte. The branches start on disjoint
+        // bytes, so this is not an alternation with a priority to preserve — see
+        // `hir_has_alternation`, which is what keeps these patterns off the
+        // PikeVM and on the DFA, where they run at full speed.
+        if negated && byte_ranges.iter().all(|&(_, hi)| hi <= 0x7f) {
+            let surviving_ascii = merge_byte_ranges(complement_within_ascii(&byte_ranges));
+            let non_ascii = any_non_ascii_character();
+
+            let mut alternatives = Vec::new();
+            if !surviving_ascii.is_empty() {
+                alternatives.push(HirExpr::Class(HirClass::new(surviving_ascii, false)));
+            }
+            if !non_ascii.is_empty() {
+                // Keeps this off the DFA JIT, which cannot represent multi-byte
+                // transitions; the DFA interpreter runs them correctly and at
+                // the same speed, so this must not imply the tagged-NFA route
+                // that `has_large_unicode_class` carries.
+                self.props.has_utf8_class_trie = true;
+                alternatives.push(self.build_utf8_trie(&non_ascii));
+            }
+            return match alternatives.len() {
+                0 => HirExpr::Class(HirClass::new(vec![], false)),
+                1 => alternatives.pop().unwrap(),
+                _ => HirExpr::Alt(alternatives),
+            };
+        }
+
         // IMPORTANT: Multi-byte UTF-8 sequences must use CodepointClass to ensure
         // matches only occur at valid UTF-8 codepoint boundaries. The trie-based approach
         // creates byte-level transitions that can match at partial UTF-8 sequences,
@@ -1152,4 +1187,39 @@ mod tests {
             "[α-ω] has multi-byte UTF-8, should skip DFA JIT"
         );
     }
+}
+
+/// "Any non-ASCII character", as UTF-8 byte sequences.
+///
+/// Three shapes rather than an exact enumeration of the scalar-value ranges.
+/// The exact form has to carve out surrogates and overlong encodings, which
+/// costs hundreds of DFA states per class — `[^x]+y` took seconds to compile —
+/// and buys nothing here: the public API matches `&str`, so the haystack is
+/// already valid UTF-8 and those sequences cannot occur in it. `C0`/`C1` are
+/// still excluded because they cannot begin any well-formed character.
+fn any_non_ascii_character() -> Vec<Utf8Sequence> {
+    vec![
+        Utf8Sequence::new(vec![(0xc2, 0xdf), (0x80, 0xbf)]),
+        Utf8Sequence::new(vec![(0xe0, 0xef), (0x80, 0xbf), (0x80, 0xbf)]),
+        Utf8Sequence::new(vec![(0xf0, 0xf4), (0x80, 0xbf), (0x80, 0xbf), (0x80, 0xbf)]),
+    ]
+}
+
+/// The ASCII bytes a negated class still admits: `0x00..=0x7f` minus `excluded`.
+fn complement_within_ascii(excluded: &[(u8, u8)]) -> Vec<(u8, u8)> {
+    let mut sorted = excluded.to_vec();
+    sorted.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut next = 0u16;
+    for (lo, hi) in sorted {
+        if lo as u16 > next {
+            out.push((next as u8, lo - 1));
+        }
+        next = next.max(hi as u16 + 1);
+    }
+    if next <= 0x7f {
+        out.push((next as u8, 0x7f));
+    }
+    out
 }
