@@ -46,27 +46,21 @@
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod calling_convention;
 
-// x86_64 backend
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+// The DFA JIT driver: materialization, the rules deciding what may be compiled,
+// and everything about running the result. None of it is architecture-specific,
+// and keeping one copy is what stops a fix landing on one target only.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod codegen;
 
+// The code emitters, which are the only architecture-specific part.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod x86_64;
-
-// aarch64 backend
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
-mod codegen_aarch64;
 
 #[cfg(all(feature = "jit", target_arch = "aarch64"))]
 mod aarch64;
 
-// Re-exports for x86_64
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use codegen::{CompiledRegex, JitCompiler, MaterializedDfa, MaterializedState};
-
-// Re-exports for aarch64
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
-pub use codegen_aarch64::{CompiledRegex, JitCompiler, MaterializedDfa, MaterializedState};
 
 // Re-export liveness types from nfa::tagged (the canonical location)
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

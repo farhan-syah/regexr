@@ -4,21 +4,38 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-06
 
 ### Fixed
 
 - Capture extraction runs on the same linear-time engines as `find`. Backtracking is now reserved for backreferences, bounded by a step budget.
 - Repetition over a body that can match the empty string terminates (`(a*)*`, `(a?)*`, `()+`).
 - Choice-point stack growth in the backtracking JIT is bounded; deep searches continue on the interpreter.
+- Freeing a match's capture history no longer recurses once per recorded group, so a long match over a capturing loop cannot exhaust the stack.
 - `$` matches before a trailing newline in every engine, and `(?m)` line anchors are distinguished from text anchors — including when `(?m)` appears mid-pattern.
 - Matches never start inside a multi-byte codepoint.
 - Negated classes match whole characters rather than single bytes, so `[^a]b` matches `"中b"`.
 - `\b`/`\B` at the start of a search is decided against the following byte rather than assumed.
+- aarch64 agrees with x86-64 on `\b`/`\B`-terminated patterns, which the ARM64 JIT compiled where a shorter end could satisfy the assertion (`a+\B` on `"aa"`).
+
+### Performance
+
+- Unanchored search is linear in the input across every engine. Patterns that consume a long run before failing — `(a+)+$`, `(a|a)+$`, `([a-zA-Z]+)*$` — used to cost one full scan per start position.
+- A prefilter that keeps most positions no longer drives one verification per candidate; the engine's own search takes over.
+- A `$`-anchored pattern whose every match ends on `$` rejects a non-matching start outright instead of re-checking it state by state.
 
 ### Added
 
 - `RegexBuilder::backtrack_limit` and `Regex::try_find` / `try_captures` / `try_is_match`, reporting `ErrorKind::MatchLimitExceeded` instead of "no match" when a backreference search exhausts its budget.
+- `reference::captures` / `captures_from`, so the executable spec can answer for group spans and not just the overall match.
+
+### Changed
+
+- `engine::hir_matches_empty` moved to `hir::matches_empty`. The predicate is unchanged; it now lives with the IR it inspects, and the duplicate copies in the selector and Shift-Or are gone.
+- `jit::MaterializedState` carries the character class of the byte that reached the state, which the JIT needs to decide whether a word-boundary match is safe to compile.
+- The DFA JIT is one driver for both architectures; only code emission is target-specific. `jit::CompiledRegex` and `jit::MaterializedState` are single types rather than a pair per target.
+- `vm::ShiftOrInterpreter` delegates to `ShiftOr` instead of reimplementing it.
+- `vm::PikeVmContext::new` takes only a state count, and its `capture_slots` field is gone; threads carry their own capture history.
 
 ## [0.1.5] - 2026-08-05
 

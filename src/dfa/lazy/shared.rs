@@ -173,6 +173,19 @@ pub struct LazyDfaContext {
     /// State IDs are premultiplied by STRIDE for direct indexing.
     /// Values are tagged: high bits indicate match/dead status.
     pub(crate) transitions: Vec<u32>,
+    /// Transitions for the *unanchored* automaton, indexed identically.
+    ///
+    /// Same subset construction, except the NFA start is folded into every
+    /// target set — the automaton is always also considering a match that begins
+    /// at the position just reached. One pass over the input therefore covers
+    /// every start position at once, instead of one pass per start.
+    ///
+    /// Built lazily and only for the searches that ask for it, so a pattern that
+    /// never leaves the anchored path never pays for it.
+    pub(crate) transitions_unanchored: Vec<u32>,
+    /// Input offset the last scan reached before dying, used to tell a start
+    /// attempt that gave up immediately from one that scanned to the end.
+    pub(crate) last_reach: usize,
     /// Map from state keys to DFA state IDs (premultiplied).
     pub(crate) state_map: HashMap<StateKey, DfaStateId>,
     /// The start state (premultiplied, for NonWord prev_class).
@@ -196,6 +209,14 @@ pub struct LazyDfaContext {
     /// Whether the *start* anchor specifically is line-mode — see
     /// [`nfa_anchor_info`].
     pub(crate) has_multiline_start_anchor: bool,
+    /// Whether any accepting state is reachable without an end assertion.
+    ///
+    /// When none is — every match this pattern can make ends on `$` — the
+    /// greedy end is the only candidate worth checking, because `$` holds at
+    /// one position and a shorter end cannot reach it. That lets the anchored
+    /// scan reject a start outright instead of re-checking it per state, which
+    /// is what `([a-zA-Z]+)*$` needs to stay fast over a non-matching input.
+    pub(crate) has_clean_accept: bool,
 }
 
 impl LazyDfaContext {
@@ -216,10 +237,23 @@ impl LazyDfaContext {
             has_multiline_start_anchor,
         ) = nfa_anchor_info(&nfa);
 
+        // Conservative: an accepting state that does not itself carry an end
+        // assertion may be reachable without one. Saying "yes" only costs the
+        // per-state re-check.
+        let has_clean_accept = nfa.states.iter().any(|s| {
+            s.is_match
+                && !matches!(
+                    s.instruction,
+                    Some(NfaInstruction::EndOfText) | Some(NfaInstruction::EndOfLine)
+                )
+        });
+
         let mut ctx = Self {
             nfa,
             states: Vec::new(),
             transitions: Vec::new(),
+            transitions_unanchored: Vec::new(),
+            last_reach: 0,
             state_map: HashMap::new(),
             start: 0,
             cache_limit: DEFAULT_CACHE_LIMIT,
@@ -230,6 +264,7 @@ impl LazyDfaContext {
             has_end_anchor,
             has_multiline_anchors,
             has_multiline_start_anchor,
+            has_clean_accept,
         };
 
         // Create the start state
@@ -300,6 +335,11 @@ impl LazyDfaContext {
     /// Returns whether the start anchor specifically is line-mode.
     pub fn has_multiline_start_anchor(&self) -> bool {
         self.has_multiline_start_anchor
+    }
+
+    /// Returns whether any accepting state is reachable without an end assertion.
+    pub fn has_clean_accept(&self) -> bool {
+        self.has_clean_accept
     }
 
     /// Returns the start state.
@@ -551,6 +591,10 @@ pub fn get_or_create_state_with_class(
     ));
     ctx.transitions
         .resize(ctx.transitions.len() + STRIDE as usize, UNKNOWN_STATE);
+    if !ctx.transitions_unanchored.is_empty() {
+        ctx.transitions_unanchored
+            .resize(ctx.transitions.len(), UNKNOWN_STATE);
+    }
     ctx.state_map.insert(key, premul_id);
 
     premul_id
@@ -568,6 +612,7 @@ pub fn flush_cache(ctx: &mut LazyDfaContext) {
 
     ctx.states.clear();
     ctx.transitions.clear();
+    ctx.transitions_unanchored.clear();
     ctx.state_map.clear();
 
     let key = if ctx.has_word_boundary {

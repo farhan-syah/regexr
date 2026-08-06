@@ -15,6 +15,17 @@
 use crate::dfa::{CharClass, DfaStateId, LazyDfa};
 use crate::error::{Error, ErrorKind, Result};
 use dynasmrt::{AssemblyOffset, ExecutableBuffer};
+use std::sync::Mutex;
+
+/// How much input the per-candidate retries in
+/// [`CompiledRegex::execute_unanchored_validated`] may walk in total before the
+/// interpreter takes over. Matches the lazy DFA's and Shift-Or's rule.
+const SCAN_BUDGET_FACTOR: usize = 4;
+
+/// Largest DFA the ARM64 emitter will take, bounded by branch displacement and
+/// code size rather than by anything about the pattern.
+#[cfg(target_arch = "aarch64")]
+const MAX_ARM64_DFA_STATES: usize = 64;
 
 /// A JIT-compiled regex matcher.
 ///
@@ -50,6 +61,15 @@ pub struct CompiledRegex {
     pub(crate) match_needs_end_of_text: bool,
     /// Whether any match state requires EndOfLine assertion.
     pub(crate) match_needs_end_of_line: bool,
+    /// The DFA this code was generated from, kept only for patterns that need
+    /// [`CompiledRegex::execute_unanchored_validated`].
+    ///
+    /// The generated code reports one candidate per scan, so a candidate whose
+    /// end fails its assertion has to be retried from the next position — one
+    /// full scan per start, which is quadratic over an input where every start
+    /// produces a failing candidate. The interpreter covers every start in a
+    /// single pass, so it takes over once the retries have proven expensive.
+    dfa_fallback: Option<Mutex<LazyDfa>>,
 }
 
 impl CompiledRegex {
@@ -137,6 +157,8 @@ impl CompiledRegex {
         input: &[u8],
         start_from: usize,
     ) -> Option<(usize, usize)> {
+        let budget = input.len().saturating_mul(SCAN_BUDGET_FACTOR);
+        let mut walked = 0usize;
         let mut from = start_from;
         loop {
             let prev_class = if self.has_word_boundary && from > 0 {
@@ -154,6 +176,12 @@ impl CompiledRegex {
             let next = start + 1;
             if next > input.len() {
                 return None;
+            }
+            walked += end - from;
+            if walked > budget {
+                if let Some(dfa) = &self.dfa_fallback {
+                    return dfa.lock().unwrap().find_from(input, next);
+                }
             }
             from = next;
         }
@@ -378,6 +406,20 @@ impl JitCompiler {
         // Step 1: Materialize all reachable DFA states
         let materialized = self.materialize_dfa(dfa)?;
 
+        // The ARM64 emitter resolves branches within a limited displacement, so
+        // a large DFA — a wide Unicode class, typically — has to go elsewhere.
+        #[cfg(target_arch = "aarch64")]
+        if materialized.states.len() > MAX_ARM64_DFA_STATES {
+            return Err(Error::new(
+                ErrorKind::Jit(format!(
+                    "DFA too large for ARM64 JIT ({} states, max {})",
+                    materialized.states.len(),
+                    MAX_ARM64_DFA_STATES
+                )),
+                "",
+            ));
+        }
+
         // The generated code reports one end per start — the greedy one — and
         // checks the assertion there, so a `\b`/`\B`-gated match state is only
         // safe when no *shorter* end could satisfy what the greedy one fails.
@@ -425,9 +467,13 @@ impl JitCompiler {
             ));
         }
 
-        // Step 2: Compile to machine code
+        // Step 2: Compile to machine code with the target's emitter.
+        #[cfg(target_arch = "x86_64")]
         let (code, entry_point, entry_point_word) =
             crate::jit::x86_64::compile_states(&materialized)?;
+        #[cfg(target_arch = "aarch64")]
+        let (code, entry_point, entry_point_word) =
+            crate::jit::aarch64::compile_states(&materialized)?;
 
         // Collect boundary and anchor requirements from all match states
         let mut match_needs_word_boundary = false;
@@ -443,7 +489,7 @@ impl JitCompiler {
             }
         }
 
-        Ok(CompiledRegex {
+        let mut compiled = CompiledRegex {
             code,
             entry_point,
             entry_point_word,
@@ -456,7 +502,15 @@ impl JitCompiler {
             has_multiline_start_anchor: materialized.has_multiline_start_anchor,
             match_needs_end_of_text,
             match_needs_end_of_line,
-        })
+            dfa_fallback: None,
+        };
+
+        // Only the retry loop needs it, and only unanchored patterns reach that.
+        if !compiled.has_start_anchor && compiled.has_post_validated_assertions() {
+            compiled.dfa_fallback = Some(Mutex::new(dfa.clone()));
+        }
+
+        Ok(compiled)
     }
 
     /// Materializes all reachable states in the DFA.

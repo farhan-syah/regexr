@@ -14,7 +14,7 @@
 
 use crate::dfa::DfaStateId;
 use crate::error::{Error, ErrorKind, Result};
-use crate::jit::codegen_aarch64::{MaterializedDfa, MaterializedState};
+use crate::jit::codegen::{MaterializedDfa, MaterializedState};
 use dynasm::dynasm;
 use dynasmrt::{
     aarch64::Assembler, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer,

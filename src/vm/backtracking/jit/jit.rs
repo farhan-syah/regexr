@@ -171,9 +171,9 @@ impl BacktrackingJit {
     /// Finds the leftmost match starting at or after `from`.
     ///
     /// Patterns that read left context go to the interpreter, which matches at an
-    /// absolute position with the full input visible (see [`Self::vm`]);
-    /// everything else can safely run on the suffix slice, whose end — and so
-    /// `$`/`\Z` — is the end of the input.
+    /// absolute position with the full input visible; everything else can safely
+    /// run on the suffix slice, whose end — and so `$`/`\Z` — is the end of the
+    /// input.
     pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
         self.captures_from(input, from).and_then(|caps| caps[0])
     }

@@ -98,7 +98,7 @@ impl PikeVm {
 
     /// Creates a reusable context for this VM.
     pub fn create_context(&self) -> PikeVmContext {
-        PikeVmContext::new(self.nfa.capture_count as usize, self.nfa.states.len())
+        PikeVmContext::new(self.nfa.states.len())
     }
 
     /// Returns capture groups using a pre-allocated context.
