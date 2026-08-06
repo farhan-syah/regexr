@@ -27,8 +27,9 @@ use crate::nfa::{Nfa, NfaInstruction, StateId as NfaStateId};
 
 use super::super::shared::{
     epsilon_closure_with_context, flush_cache, get_or_create_state_with_class, is_dead_state,
-    is_tagged_match, is_unknown_state, state_index, tag_state, untag_state, CharClass, DfaStateId,
-    LazyDfaContext, PositionContext, DEAD_STATE, UNKNOWN_STATE,
+    is_tagged_match, is_unknown_state, match_reachable_without_end_assertion, state_index,
+    tag_state, untag_state, CharClass, DfaStateId, LazyDfaContext, PositionContext, DEAD_STATE,
+    UNKNOWN_STATE,
 };
 
 /// A lazy DFA that builds states on demand.
@@ -206,7 +207,14 @@ impl LazyDfa {
             return None;
         }
 
-        let next_id = get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class);
+        let next_clean = match_reachable_without_end_assertion(
+            &self.ctx.nfa,
+            &next_states,
+            None,
+            target_pos_ctx,
+        );
+        let next_id =
+            get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class, next_clean);
 
         let next_idx = state_index(next_id);
         let is_match = self.ctx.states.get(next_idx).is_some_and(|s| s.is_match);
@@ -328,8 +336,14 @@ impl LazyDfa {
                     continue;
                 }
 
-                let next_id =
-                    get_or_create_state_with_class(&mut self.ctx, next_closure, CharClass::NonWord);
+                let next_clean =
+                    match_reachable_without_end_assertion(&self.ctx.nfa, targets, None, None);
+                let next_id = get_or_create_state_with_class(
+                    &mut self.ctx,
+                    next_closure,
+                    CharClass::NonWord,
+                    next_clean,
+                );
                 result[byte as usize] = Some(next_id);
 
                 let next_idx = state_index(next_id);
@@ -492,7 +506,13 @@ impl LazyDfa {
                 is_at_boundary,
                 Some(pos_ctx),
             );
-            get_or_create_state_with_class(&mut self.ctx, start_closure, prev_class)
+            let start_clean = match_reachable_without_end_assertion(
+                &self.ctx.nfa,
+                &start_set,
+                is_at_boundary,
+                Some(pos_ctx),
+            );
+            get_or_create_state_with_class(&mut self.ctx, start_closure, prev_class, start_clean)
         } else if self.ctx.has_word_boundary && start > 0 {
             self.get_start_state_with_prev_class(prev_class)
         } else {
@@ -510,7 +530,9 @@ impl LazyDfa {
         start_set.insert(self.ctx.nfa.start);
 
         let start_closure = epsilon_closure_with_context(&self.ctx.nfa, &start_set, None, None);
-        get_or_create_state_with_class(&mut self.ctx, start_closure, prev_class)
+        let start_clean =
+            match_reachable_without_end_assertion(&self.ctx.nfa, &start_set, None, None);
+        get_or_create_state_with_class(&mut self.ctx, start_closure, prev_class, start_clean)
     }
 
     /// Internal find implementation with explicit start state.
@@ -528,6 +550,16 @@ impl LazyDfa {
             return self.find_at_with_state_anchored(input, start, state);
         }
 
+        self.find_at_with_state_checked(input, start, state)
+    }
+
+    /// Find that re-checks every candidate end against that state's assertions.
+    fn find_at_with_state_checked(
+        &mut self,
+        input: &[u8],
+        start: usize,
+        state: DfaStateId,
+    ) -> Option<usize> {
         let mut last_match = if self.is_match(state) {
             if self.check_end_assertions(input, start, state) {
                 Some(start)
@@ -568,14 +600,18 @@ impl LazyDfa {
         let potential_match = self.find_at_with_state_fast(input, start, state);
 
         if let Some(end_pos) = potential_match {
-            if self.ctx.has_end_anchor
-                && !crate::nfa::at_end_or_before_final_newline(input, end_pos)
+            if !self.ctx.has_end_anchor
+                || crate::nfa::at_end_or_before_final_newline(input, end_pos)
             {
-                return None;
+                return potential_match;
             }
+            // The greedy end fails `$`, but `$` belongs to the branch carrying
+            // it: `a|b$` on "aa" reaches a match through `a`, which asks for
+            // nothing at the end. Only the per-state check tells those apart.
+            return self.find_at_with_state_checked(input, start, state);
         }
 
-        potential_match
+        None
     }
 
     /// Fast find implementation for patterns without assertions.
@@ -699,11 +735,11 @@ impl LazyDfa {
         // For end anchors: If there's a match path that doesn't require end anchors,
         // the match is valid without satisfying them. This handles patterns like `^A|B$`.
         // Note: This only applies to end anchors, not word boundaries.
-        if self.ctx.has_anchors && !self.ctx.has_word_boundary {
-            let has_clean_match_path = self.has_match_without_end_anchors(&dfa_state.nfa_states);
-            if has_clean_match_path {
-                return true;
-            }
+        if self.ctx.has_anchors
+            && !self.ctx.has_word_boundary
+            && dfa_state.match_without_end_assertion
+        {
+            return true;
         }
 
         // No clean match path - check if assertions are satisfied
@@ -768,30 +804,6 @@ impl LazyDfa {
         true
     }
 
-    /// Checks if there's a match state that doesn't have any pending END anchors.
-    /// This handles patterns like `^A|B$` where branch 1 can match without EndOfLine.
-    ///
-    /// Note: This only checks for END anchors (EndOfLine, EndOfText), not word boundaries.
-    /// Word boundaries are handled differently during transition computation.
-    fn has_match_without_end_anchors(&self, nfa_states: &BTreeSet<NfaStateId>) -> bool {
-        // Find all match states in the closure
-        for &nfa_id in nfa_states {
-            if let Some(nfa_state) = self.ctx.nfa.get(nfa_id) {
-                if nfa_state.is_match {
-                    // Check if this match state has any pending END anchor
-                    let has_end_anchor = nfa_state.instruction.as_ref().is_some_and(|instr| {
-                        matches!(instr, NfaInstruction::EndOfLine | NfaInstruction::EndOfText)
-                    });
-                    if !has_end_anchor {
-                        // Found a match state without pending end anchors
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
     /// Helper to check if any NFA state in the set has a pending assertion.
     ///
     /// Important: We only check states that are actually IN the nfa_states set,
@@ -837,6 +849,14 @@ impl LazyDfa {
         (needs_word_boundary, needs_not_word_boundary)
     }
 
+    /// Whether a match is reachable in `state` without passing an end assertion.
+    pub fn get_state_match_without_end_assertion(&self, state: DfaStateId) -> bool {
+        self.ctx
+            .states
+            .get(state_index(state))
+            .is_some_and(|s| s.match_without_end_assertion)
+    }
+
     /// Returns the anchor requirements for a state.
     pub fn get_state_anchor_requirements(&self, state: DfaStateId) -> (bool, bool) {
         let state_idx = state_index(state);
@@ -859,5 +879,57 @@ impl LazyDfa {
     /// Provides access to the internal NFA reference.
     pub fn nfa(&self) -> &Nfa {
         &self.ctx.nfa
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dfa::EagerDfa;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn dfa(pattern: &str) -> LazyDfa {
+        let hir = parse(pattern).and_then(|ast| translate(&ast)).unwrap();
+        LazyDfa::new(crate::nfa::compile(&hir).unwrap())
+    }
+
+    /// An end anchor belongs to the branch that carries it, not to the pattern.
+    ///
+    /// `a|b$` can match through `a`, which asks for nothing at the end, so 0..1
+    /// of "aa" stands even though `$` does not hold there. `a$|b` must not get
+    /// the same treatment, and `world$` — where the anchor sits on the accepting
+    /// state itself rather than a predecessor — must still enforce it.
+    ///
+    /// Driven against the engines directly: engine selection sends these to the
+    /// PikeVM today, which would hide a regression here behind the selector.
+    /// Every expectation was taken from `regexr::reference` and cross-checked
+    /// against the `regex` crate.
+    #[test]
+    fn end_anchor_in_one_branch_does_not_gate_the_others() {
+        for (pattern, input, expected) in [
+            ("a|b$", "aa", Some((0, 1))),
+            ("a|b$", "ab", Some((0, 1))),
+            ("a|b$", "ba", Some((1, 2))),
+            ("a|a$", "aa", Some((0, 1))),
+            ("a$|b", "ab", Some((1, 2))),
+            ("a$|b", "aa", Some((1, 2))),
+            ("world$", "world hello", None),
+            ("world$", "hello world", Some((6, 11))),
+        ] {
+            let mut lazy = dfa(pattern);
+            assert_eq!(
+                lazy.find_from(input.as_bytes(), 0),
+                expected,
+                "LazyDfa {pattern:?} on {input:?}"
+            );
+
+            let eager = EagerDfa::from_lazy(&mut lazy);
+            assert_eq!(
+                eager.find_from(input.as_bytes(), 0),
+                expected,
+                "EagerDfa {pattern:?} on {input:?}"
+            );
+        }
     }
 }

@@ -176,6 +176,8 @@ impl EagerDfa {
                         needs_not_word_boundary,
                         needs_end_of_text,
                         needs_end_of_line,
+                        match_without_end_assertion: lazy
+                            .get_state_match_without_end_assertion(lazy_state),
                     }
                 })
                 .collect()
@@ -332,6 +334,8 @@ impl EagerDfa {
     /// Fast matching loop for patterns without complex assertions.
     #[inline(never)]
     fn find_at_fast(&self, input: &[u8], start: usize, mut state: u32) -> Option<usize> {
+        // Kept for the hand-off below: the loop overwrites `state`.
+        let start_state = state;
         let mut last_match = if state & TAG_MATCH != 0 {
             Some(start)
         } else {
@@ -359,7 +363,9 @@ impl EagerDfa {
         // input or just before a final newline (PCRE/Python semantics).
         if let Some(end_pos) = last_match {
             if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end_pos) {
-                return None;
+                // See the lazy DFA: `$` belongs to the branch carrying it, so a
+                // greedy end that fails it does not condemn the start position.
+                return self.find_at_slow(input, start, start_state);
             }
         }
 
@@ -434,7 +440,14 @@ impl EagerDfa {
 
         // Check anchor assertions
         if self.has_anchors {
-            if metadata.needs_end_of_text && pos != input.len() {
+            // The anchor belongs to the branch carrying it; if some other branch
+            // reaches a match without one, the match stands wherever it ends.
+            if metadata.match_without_end_assertion {
+                return true;
+            }
+
+            if metadata.needs_end_of_text && !crate::nfa::at_end_or_before_final_newline(input, pos)
+            {
                 return false;
             }
 

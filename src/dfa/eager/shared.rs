@@ -23,6 +23,9 @@ pub struct StateMetadata {
     pub needs_end_of_text: bool,
     /// Whether this match state requires end of line (multiline $) assertion.
     pub needs_end_of_line: bool,
+    /// Whether a match is reachable here without passing an end assertion — see
+    /// `DfaState::match_without_end_assertion`.
+    pub match_without_end_assertion: bool,
 }
 
 /// Check if a byte is a word character.

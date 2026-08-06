@@ -131,15 +131,30 @@ pub struct DfaState {
     /// The character class this state was created with (for word boundary patterns).
     /// This is the class of the byte that transitioned INTO this state.
     pub prev_class: CharClass,
+    /// Whether a match is reachable here without passing an end assertion.
+    ///
+    /// An end anchor belongs to the branch that carries it, not to the pattern.
+    /// After `a` in `a|b$`, a match is reachable through the anchor-free branch,
+    /// so the match stands anywhere; after `a` in `a$|b` it is not, and `$` has
+    /// to hold. The state set cannot tell those apart on its own — the closure
+    /// follows the assertion's epsilon, so the shared match state appears in
+    /// both — so this is settled while the closure is built and recorded here.
+    pub match_without_end_assertion: bool,
 }
 
 impl DfaState {
     /// Creates a new DFA state.
-    pub fn new(nfa_states: BTreeSet<NfaStateId>, is_match: bool, prev_class: CharClass) -> Self {
+    pub fn new(
+        nfa_states: BTreeSet<NfaStateId>,
+        is_match: bool,
+        prev_class: CharClass,
+        match_without_end_assertion: bool,
+    ) -> Self {
         Self {
             is_match,
             nfa_states,
             prev_class,
+            match_without_end_assertion,
         }
     }
 }
@@ -241,7 +256,18 @@ impl LazyDfaContext {
             ctx.nfa.epsilon_closure(&start_set)
         };
 
-        ctx.start = get_or_create_state_with_class(&mut ctx, start_closure, CharClass::NonWord);
+        let start_clean = match_reachable_without_end_assertion(
+            &ctx.nfa,
+            &start_set,
+            is_at_boundary,
+            Some(PositionContext::start_of_input()),
+        );
+        ctx.start = get_or_create_state_with_class(
+            &mut ctx,
+            start_closure,
+            CharClass::NonWord,
+            start_clean,
+        );
 
         ctx
     }
@@ -426,11 +452,70 @@ pub fn epsilon_closure_with_context(
     closure
 }
 
+/// Whether a match is reachable from `seeds` without passing an end assertion.
+///
+/// Same walk as [`epsilon_closure_with_context`], except it stops at `EndOfText`
+/// and `EndOfLine` instead of stepping through them. If a match state is reached
+/// anyway, some branch gets there without asking for `$`, and a match in this
+/// state stands wherever it ends.
+pub fn match_reachable_without_end_assertion(
+    nfa: &Nfa,
+    seeds: &BTreeSet<NfaStateId>,
+    is_at_boundary: Option<bool>,
+    pos_ctx: Option<PositionContext>,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<NfaStateId> = seeds.iter().copied().collect();
+
+    while let Some(state_id) = stack.pop() {
+        if !visited.insert(state_id) {
+            continue;
+        }
+        let Some(state) = nfa.get(state_id) else {
+            continue;
+        };
+
+        // Checked before `is_match`, not after: when `$` ends the whole pattern
+        // the assertion sits *on* the accepting state (`world$`), while in
+        // `a|b$` it sits on a predecessor. Either way the state is not a match
+        // that skipped the assertion, and it is not stepped through.
+        if matches!(
+            state.instruction,
+            Some(NfaInstruction::EndOfText) | Some(NfaInstruction::EndOfLine)
+        ) {
+            continue;
+        }
+
+        if state.is_match {
+            return true;
+        }
+
+        let follow = match &state.instruction {
+            Some(NfaInstruction::WordBoundary) => is_at_boundary == Some(true),
+            Some(NfaInstruction::NotWordBoundary) => is_at_boundary == Some(false),
+            Some(NfaInstruction::StartOfText) => pos_ctx.is_some_and(|ctx| ctx.at_start_of_input),
+            Some(NfaInstruction::StartOfLine) => pos_ctx.is_some_and(|ctx| ctx.at_start_of_line),
+            _ => true,
+        };
+
+        if follow {
+            for &target in &state.epsilon {
+                if !visited.contains(&target) {
+                    stack.push(target);
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Gets or creates a DFA state for a set of NFA states with a given character class.
 pub fn get_or_create_state_with_class(
     ctx: &mut LazyDfaContext,
     nfa_states: BTreeSet<NfaStateId>,
     prev_class: CharClass,
+    match_without_end_assertion: bool,
 ) -> DfaStateId {
     let key = if ctx.has_word_boundary {
         StateKey::WithClass(nfa_states.clone(), prev_class)
@@ -458,8 +543,12 @@ pub fn get_or_create_state_with_class(
     let state_index = ctx.states.len();
     let premul_id = (state_index as u32) * STRIDE;
 
-    ctx.states
-        .push(DfaState::new(nfa_states, is_match, prev_class));
+    ctx.states.push(DfaState::new(
+        nfa_states,
+        is_match,
+        prev_class,
+        match_without_end_assertion,
+    ));
     ctx.transitions
         .resize(ctx.transitions.len() + STRIDE as usize, UNKNOWN_STATE);
     ctx.state_map.insert(key, premul_id);
@@ -475,6 +564,7 @@ pub fn flush_cache(ctx: &mut LazyDfaContext) {
     let start_nfa_states = ctx.states[start_index].nfa_states.clone();
     let start_is_match = ctx.states[start_index].is_match;
     let start_prev_class = ctx.states[start_index].prev_class;
+    let start_clean = ctx.states[start_index].match_without_end_assertion;
 
     ctx.states.clear();
     ctx.transitions.clear();
@@ -489,6 +579,7 @@ pub fn flush_cache(ctx: &mut LazyDfaContext) {
         start_nfa_states,
         start_is_match,
         start_prev_class,
+        start_clean,
     ));
     ctx.transitions.resize(STRIDE as usize, UNKNOWN_STATE);
     ctx.state_map.insert(key, 0);
