@@ -99,6 +99,18 @@ const FRAGMENTS: &[&str] = &[
     "\\ a",
     "\\@|a",
     "[\\e\\a]",
+    // `\X` expands to a large alternation with assertions inside it; every
+    // engine must agree with the spec on where its clusters end.
+    "\\X",
+    "\\X+",
+    "a\\X",
+    "\\Xb",
+    "(\\X)",
+    // Quoting is resolved in the lexer, so these must behave exactly like the
+    // escaped spellings next to them.
+    "\\Qa.b\\E",
+    "\\Qa\\Eb",
+    "x\\Q.\\Ey",
 ];
 
 const PREFIXES: &[&str] = &["", "^", "\\A", "(?m)^", "\\b", "\\B", "(?i)"];

@@ -6,6 +6,8 @@
 //! - Lookahead and lookbehind assertions
 //! - Character escapes
 //! - Extended (`x`) mode
+//! - Grapheme clusters (`\X`)
+//! - Literal quoting (`\Q…\E`)
 //! - Named captures
 //! - Rejection of malformed patterns
 //! - Syntax validation
@@ -34,9 +36,11 @@ mod backreference;
 mod case_insensitive;
 mod escape_sequences;
 mod extended_mode;
+mod grapheme_cluster;
 mod inline_flags;
 mod lookaround;
 mod named_capture;
 mod pattern_rejection;
+mod quoting;
 mod syntax;
 mod word_boundary;

@@ -119,6 +119,8 @@ impl Parser<'_> {
 
             EscapeKind::Backref(n) => Ok(Expr::Backref(n)),
 
+            EscapeKind::GraphemeCluster => Ok(Expr::GraphemeCluster),
+
             EscapeKind::UnicodeProperty(name) => Ok(Expr::UnicodeProperty {
                 name,
                 negated: false,

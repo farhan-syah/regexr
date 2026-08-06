@@ -23,11 +23,30 @@ assert!(re.is_match("hello world"));
 - `\uHHHH` / `\u{H...}` - Unicode escape, e.g. `\u{1F600}`
 - `\` followed by any non-alphanumeric ASCII character - that character
   literally, e.g. `\.`, `\ `, `\#`, `\"`
+- `\Q…\E` - everything between is literal, including metacharacters and
+  whitespace. An unterminated `\Q` runs to the end of the pattern, and a `\E`
+  with no `\Q` is ignored.
 
-Escaping an ASCII letter that has no assigned meaning (`\j`, `\X`, `\Q`, …) is
+Escaping an ASCII letter that has no assigned meaning (`\j`, `\K`, `\G`, …) is
 an error rather than a literal, so that assigning a meaning to it later cannot
 silently change what a pattern matches. Non-ASCII characters never need
 escaping and cannot be escaped.
+
+### Grapheme Clusters
+
+`\X` matches one extended grapheme cluster — what a reader calls a single
+character, however many codepoints it takes:
+
+```rust
+let re = Regex::new(r"\X").unwrap();
+let clusters: Vec<&str> = re.find_iter("é👨‍👩‍👧🇺🇸").map(|m| m.as_str()).collect();
+assert_eq!(clusters.len(), 3);
+```
+
+The boundaries follow [UAX #29](https://www.unicode.org/reports/tr29/) in full,
+including Hangul syllables, emoji ZWJ sequences, regional-indicator flag pairs
+and Indic conjuncts. `\X` is not valid inside a character class, because it
+matches a sequence rather than a single character.
 
 ### Character Classes
 

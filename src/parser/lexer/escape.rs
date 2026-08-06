@@ -48,6 +48,10 @@ impl Lexer<'_> {
             'a' => EscapeKind::Literal('\u{07}'),
             'e' => EscapeKind::Literal('\u{1b}'),
 
+            // One extended grapheme cluster. Expanded by the HIR builder into
+            // the UAX #29 boundary rules.
+            'X' => EscapeKind::GraphemeCluster,
+
             // Hex escape
             'x' => {
                 let ch = self.lex_hex_escape(start)?;

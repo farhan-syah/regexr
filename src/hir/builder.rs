@@ -89,6 +89,8 @@ impl HirTranslator {
 
             Expr::Literal(c) => self.translate_literal(*c),
 
+            Expr::GraphemeCluster => Ok(super::grapheme::grapheme_cluster()),
+
             Expr::Dot => {
                 // Dot matches any byte except newline (unless dot_all mode is enabled)
                 if self.flags.dot_all {

@@ -199,6 +199,11 @@ generate_tables() {
     echo "  Generating grapheme_cluster_break.rs..."
     ucd-generate grapheme-cluster-break "$ucd_dir" > "$output_dir/grapheme_cluster_break.rs"
 
+    # Indic_Conjunct_Break has no ucd-generate command, but UAX #29 rule GB9c
+    # needs it; derive it from DerivedCoreProperties.txt in the same shape.
+    echo "  Generating indic_conjunct_break.rs..."
+    python3 "$SCRIPT_DIR/derive_incb.py" "$ucd_dir" "$output_dir/indic_conjunct_break.rs"
+
     # Age property
     echo "  Generating age.rs..."
     ucd-generate age "$ucd_dir" > "$output_dir/age.rs"

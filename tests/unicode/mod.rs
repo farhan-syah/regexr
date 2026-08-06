@@ -28,6 +28,7 @@ pub fn regex(pattern: &str) -> Regex {
 }
 
 mod basic;
+mod grapheme_break_conformance;
 mod greedy_backtracking;
 mod mode;
 mod negated;

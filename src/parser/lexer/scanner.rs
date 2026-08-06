@@ -17,6 +17,8 @@ pub struct Lexer<'a> {
     /// Extended mode (`x`): unescaped ASCII whitespace and `#` comments outside
     /// a character class are not part of the pattern.
     extended: bool,
+    /// Inside a `\Q…\E` span, where every character is a literal.
+    quoted: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -28,6 +30,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             class_depth: 0,
             extended: false,
+            quoted: false,
         }
     }
 
@@ -71,30 +74,73 @@ impl<'a> Lexer<'a> {
 
     /// Returns the next token.
     pub fn next_token(&mut self) -> Result<Token> {
-        if self.extended && self.class_depth == 0 {
-            self.skip_extended_trivia();
-        }
-
-        let (start, c) = match self.next_char() {
-            Some(pair) => pair,
-            None => {
-                return Ok(Token {
-                    kind: TokenKind::Eof,
-                    span: Span::point(self.pos),
-                });
+        loop {
+            // Inside `\Q…\E` every character stands for itself: metacharacters,
+            // whitespace under extended mode, and `]` inside a class alike. Only
+            // `\E` ends the span, and an unterminated `\Q` quotes to the end of
+            // the pattern.
+            if self.quoted {
+                return match self.next_char() {
+                    None => Ok(Token {
+                        kind: TokenKind::Eof,
+                        span: Span::point(self.pos),
+                    }),
+                    Some((_, '\\')) if self.peek_char() == Some('E') => {
+                        self.next_char();
+                        self.quoted = false;
+                        continue;
+                    }
+                    Some((start, c)) => Ok(Token {
+                        kind: TokenKind::Literal(c),
+                        span: Span::new(start, self.pos),
+                    }),
+                };
             }
-        };
 
-        let kind = if self.class_depth > 0 {
-            self.lex_class_char(c, start)?
-        } else {
-            self.lex_char(c, start)?
-        };
+            if self.extended && self.class_depth == 0 {
+                self.skip_extended_trivia();
+            }
 
-        Ok(Token {
-            kind,
-            span: Span::new(start, self.pos),
-        })
+            let (start, c) = match self.next_char() {
+                Some(pair) => pair,
+                None => {
+                    return Ok(Token {
+                        kind: TokenKind::Eof,
+                        span: Span::point(self.pos),
+                    });
+                }
+            };
+
+            // `\Q` opens a quoted span. A stray `\E` is a no-op, as in PCRE, so
+            // that `\Q…\E` can be spliced in unconditionally. `\\Q` is a literal
+            // backslash followed by `Q` and must not reach here — it doesn't,
+            // because the peek only fires when `\` is the escape's own opener.
+            if c == '\\' {
+                match self.peek_char() {
+                    Some('Q') => {
+                        self.next_char();
+                        self.quoted = true;
+                        continue;
+                    }
+                    Some('E') => {
+                        self.next_char();
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            let kind = if self.class_depth > 0 {
+                self.lex_class_char(c, start)?
+            } else {
+                self.lex_char(c, start)?
+            };
+
+            return Ok(Token {
+                kind,
+                span: Span::new(start, self.pos),
+            });
+        }
     }
 
     /// Consumes whitespace and `#` comments that extended mode strips from the

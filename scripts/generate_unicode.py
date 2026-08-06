@@ -134,6 +134,29 @@ def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def parse_segmentation_table(path: Path) -> dict[str, list[tuple[int, int]]]:
+    """Read a ucd-generate-shaped enumerated-property file into {value: ranges}.
+
+    Used for Grapheme_Cluster_Break and Indic_Conjunct_Break, which the HIR
+    builder reads directly rather than exposing as `\\p{...}`.
+    """
+    if not path.is_file():
+        print(f"Error: missing {path}", file=sys.stderr)
+        print("Run update_unicode_tables.sh to generate it.", file=sys.stderr)
+        sys.exit(1)
+
+    content = path.read_text()
+    out = {}
+    for name, const_name in parse_by_name(content).items():
+        ranges = parse_rust_ranges(content, const_name)
+        if ranges:
+            out[name] = merge_ranges(ranges)
+    if not out:
+        print(f"Error: no property values parsed from {path}", file=sys.stderr)
+        sys.exit(1)
+    return out
+
+
 def generate_rust_module(
     general_categories: dict[str, list[tuple[int, int]]],
     scripts: dict[str, list[tuple[int, int]]],
@@ -141,11 +164,17 @@ def generate_rust_module(
     perl_word: list[tuple[int, int]],
     perl_decimal: list[tuple[int, int]],
     perl_space: list[tuple[int, int]],
-    case_folding: list[tuple[int, int]] = None
+    case_folding: list[tuple[int, int]] = None,
+    gcb: dict[str, list[tuple[int, int]]] = None,
+    incb: dict[str, list[tuple[int, int]]] = None
 ) -> str:
     """Generate the complete Rust module."""
     if case_folding is None:
         case_folding = []
+    if gcb is None:
+        gcb = {}
+    if incb is None:
+        incb = {}
 
     lines = [
         "//! Unicode property data tables.",
@@ -258,6 +287,35 @@ def generate_rust_module(
         lines.append("".join(fold_lines).rstrip(", "))
         lines.append("];")
         lines.append("")
+
+    # Grapheme cluster segmentation. These are not addressable as `\p{...}`;
+    # they exist so the HIR builder can expand `\X` into the UAX #29 boundary
+    # rules, which is the only thing that reads them.
+    if gcb:
+        lines.append("// =============================================================================")
+        lines.append("// Grapheme_Cluster_Break (UAX #29)")
+        lines.append("// =============================================================================")
+        lines.append("")
+        for name in sorted(gcb.keys()):
+            const_name = name.upper().replace(" ", "_").replace("-", "_")
+            lines.append(f"/// Grapheme_Cluster_Break: {name}")
+            lines.append(f"pub const GCB_{const_name}: &[(u32, u32)] = &[")
+            lines.append(format_ranges(gcb[name]))
+            lines.append("];")
+            lines.append("")
+
+    if incb:
+        lines.append("// =============================================================================")
+        lines.append("// Indic_Conjunct_Break (UAX #29 rule GB9c)")
+        lines.append("// =============================================================================")
+        lines.append("")
+        for name in sorted(incb.keys()):
+            const_name = name.upper().replace(" ", "_").replace("-", "_")
+            lines.append(f"/// Indic_Conjunct_Break: {name}")
+            lines.append(f"pub const INCB_{const_name}: &[(u32, u32)] = &[")
+            lines.append(format_ranges(incb[name]))
+            lines.append("];")
+            lines.append("")
 
     # Generate lookup functions
     lines.extend(generate_lookup_functions(general_categories, scripts, bool_properties, case_folding))
@@ -737,6 +795,13 @@ def run(data_dir: Path, output_file: Path, verify_only: bool = False, show_stats
         case_folding = parse_rust_ranges(case_folding_content, "CASE_FOLDING_SIMPLE")
         print(f"  Case Folding: {len(case_folding)} mappings")
 
+    # Parse segmentation tables used by `\X` (UAX #29). Both are required:
+    # without them `\X` would silently expand to a weaker approximation.
+    gcb = parse_segmentation_table(data_dir / "grapheme_cluster_break.rs")
+    print(f"  Grapheme_Cluster_Break: {len(gcb)} classes")
+    incb = parse_segmentation_table(data_dir / "indic_conjunct_break.rs")
+    print(f"  Indic_Conjunct_Break: {len(incb)} classes")
+
     # Show statistics if requested
     if show_stats:
         print_stats(
@@ -752,7 +817,7 @@ def run(data_dir: Path, output_file: Path, verify_only: bool = False, show_stats
     output = generate_rust_module(
         general_categories, scripts, bool_properties,
         merge_ranges(perl_word), merge_ranges(perl_decimal), merge_ranges(perl_space),
-        case_folding
+        case_folding, gcb, incb
     )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)

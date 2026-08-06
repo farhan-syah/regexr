@@ -3,6 +3,7 @@
 //! Translates the AST into a byte-oriented representation suitable for NFA construction.
 
 mod builder;
+mod grapheme;
 mod prefix_opt;
 pub mod unicode;
 pub mod unicode_data;

@@ -36,6 +36,9 @@ pub enum Expr {
     Backref(u32),
     /// Dot - matches any character (except newline by default).
     Dot,
+    /// One extended grapheme cluster (`\X`), expanded to the UAX #29 boundary
+    /// rules by the HIR builder.
+    GraphemeCluster,
     /// Unicode property (\p{Letter}, \P{Number}, etc.).
     UnicodeProperty {
         /// The property name.
@@ -79,6 +82,8 @@ impl Expr {
             Expr::Lookaround(_) => true, // Lookarounds don't consume input
             Expr::Backref(_) => false,   // Could be nullable, but conservative
             Expr::Dot => false,
+            // A cluster is at least one codepoint.
+            Expr::GraphemeCluster => false,
             Expr::UnicodeProperty { .. } => false,
             Expr::PerlClass(_) => false,
         }
@@ -275,6 +280,7 @@ impl fmt::Display for Expr {
         match self {
             Expr::Empty => Ok(()),
             Expr::Literal(c) => write!(f, "{}", escape_char(*c)),
+            Expr::GraphemeCluster => write!(f, "\\X"),
             Expr::Concat(exprs) => {
                 for expr in exprs {
                     write!(f, "{}", expr)?;

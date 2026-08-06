@@ -111,6 +111,8 @@ pub enum EscapeKind {
     Unicode(char),
     /// \1, \2, etc. - backreference.
     Backref(u32),
+    /// \X - one extended grapheme cluster (UAX #29).
+    GraphemeCluster,
     /// \p{PropertyName} - Unicode property.
     UnicodeProperty(String),
     /// \P{PropertyName} - negated Unicode property.
