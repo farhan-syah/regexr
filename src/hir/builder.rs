@@ -979,6 +979,41 @@ fn merge_codepoint_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
+/// "Any non-ASCII character", as UTF-8 byte sequences.
+///
+/// Three shapes rather than an exact enumeration of the scalar-value ranges.
+/// The exact form has to carve out surrogates and overlong encodings, which
+/// costs hundreds of DFA states per class — `[^x]+y` took seconds to compile —
+/// and buys nothing here: the public API matches `&str`, so the haystack is
+/// already valid UTF-8 and those sequences cannot occur in it. `C0`/`C1` are
+/// still excluded because they cannot begin any well-formed character.
+fn any_non_ascii_character() -> Vec<Utf8Sequence> {
+    vec![
+        Utf8Sequence::new(vec![(0xc2, 0xdf), (0x80, 0xbf)]),
+        Utf8Sequence::new(vec![(0xe0, 0xef), (0x80, 0xbf), (0x80, 0xbf)]),
+        Utf8Sequence::new(vec![(0xf0, 0xf4), (0x80, 0xbf), (0x80, 0xbf), (0x80, 0xbf)]),
+    ]
+}
+
+/// The ASCII bytes a negated class still admits: `0x00..=0x7f` minus `excluded`.
+fn complement_within_ascii(excluded: &[(u8, u8)]) -> Vec<(u8, u8)> {
+    let mut sorted = excluded.to_vec();
+    sorted.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut next = 0u16;
+    for (lo, hi) in sorted {
+        if lo as u16 > next {
+            out.push((next as u8, lo - 1));
+        }
+        next = next.max(hi as u16 + 1);
+    }
+    if next <= 0x7f {
+        out.push((next as u8, 0x7f));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,39 +1222,4 @@ mod tests {
             "[α-ω] has multi-byte UTF-8, should skip DFA JIT"
         );
     }
-}
-
-/// "Any non-ASCII character", as UTF-8 byte sequences.
-///
-/// Three shapes rather than an exact enumeration of the scalar-value ranges.
-/// The exact form has to carve out surrogates and overlong encodings, which
-/// costs hundreds of DFA states per class — `[^x]+y` took seconds to compile —
-/// and buys nothing here: the public API matches `&str`, so the haystack is
-/// already valid UTF-8 and those sequences cannot occur in it. `C0`/`C1` are
-/// still excluded because they cannot begin any well-formed character.
-fn any_non_ascii_character() -> Vec<Utf8Sequence> {
-    vec![
-        Utf8Sequence::new(vec![(0xc2, 0xdf), (0x80, 0xbf)]),
-        Utf8Sequence::new(vec![(0xe0, 0xef), (0x80, 0xbf), (0x80, 0xbf)]),
-        Utf8Sequence::new(vec![(0xf0, 0xf4), (0x80, 0xbf), (0x80, 0xbf), (0x80, 0xbf)]),
-    ]
-}
-
-/// The ASCII bytes a negated class still admits: `0x00..=0x7f` minus `excluded`.
-fn complement_within_ascii(excluded: &[(u8, u8)]) -> Vec<(u8, u8)> {
-    let mut sorted = excluded.to_vec();
-    sorted.sort_unstable();
-
-    let mut out = Vec::new();
-    let mut next = 0u16;
-    for (lo, hi) in sorted {
-        if lo as u16 > next {
-            out.push((next as u8, lo - 1));
-        }
-        next = next.max(hi as u16 + 1);
-    }
-    if next <= 0x7f {
-        out.push((next as u8, 0x7f));
-    }
-    out
 }
