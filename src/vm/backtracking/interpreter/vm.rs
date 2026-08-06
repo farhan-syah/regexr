@@ -72,10 +72,11 @@ impl BacktrackingVm {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
         let mut budget = limit;
+        let mut scratch = Scratch::new(self.progress_regs);
 
         for pos in start..=input.len() {
             slots.fill(-1);
-            if self.exec(input, pos, &mut slots, &mut budget)? {
+            if self.exec(input, pos, &mut slots, &mut budget, &mut scratch)? {
                 let s = slots[0];
                 let e = slots[1];
                 if s >= 0 && e >= 0 {
@@ -110,10 +111,11 @@ impl BacktrackingVm {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
         let mut budget = limit;
+        let mut scratch = Scratch::new(self.progress_regs);
 
         for start in from..=input.len() {
             slots.fill(-1);
-            if self.exec(input, start, &mut slots, &mut budget)? {
+            if self.exec(input, start, &mut slots, &mut budget, &mut scratch)? {
                 return Ok(Some(self.extract_captures(&slots)));
             }
         }
@@ -147,9 +149,11 @@ impl BacktrackingVm {
         start: usize,
         slots: &mut [i32],
         budget: &mut u64,
+        scratch: &mut Scratch,
     ) -> Result<bool, BudgetExhausted> {
-        let mut trail = Trail::new();
-        let mut progress = vec![usize::MAX; self.progress_regs];
+        let Scratch { trail, progress } = scratch;
+        trail.clear();
+        progress.fill(usize::MAX);
 
         let mut pc = 0u32;
         let mut pos = start;
@@ -161,17 +165,12 @@ impl BacktrackingVm {
             if pc as usize >= self.code.len() {
                 return Ok(false);
             }
-            if *budget == 0 {
-                return Err(BudgetExhausted);
-            }
-            *budget -= 1;
-
             match self.code[pc as usize] {
                 Op::Byte(b) => {
                     if pos < input.len() && input[pos] == b {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -180,7 +179,7 @@ impl BacktrackingVm {
                     if pos < input.len() && input[pos] >= lo && input[pos] <= hi {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -201,7 +200,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -222,7 +221,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -235,7 +234,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -248,7 +247,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -266,7 +265,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -283,7 +282,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -292,13 +291,23 @@ impl BacktrackingVm {
                     if pos < input.len() {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
 
                 Op::Split(target) => {
-                    trail.push(target, pos);
+                    // The budget is spent here rather than on every
+                    // instruction. A choice point is what multiplies the search
+                    // — everything between two of them is a forward scan, whose
+                    // cost is already bounded by the input and the program — so
+                    // bounding choice points bounds the whole search, and it is
+                    // the same quantity the generated code charges for.
+                    if *budget == 0 {
+                        return Err(BudgetExhausted);
+                    }
+                    *budget -= 1;
+                    trail.push(target, pos, self.progress_regs);
                     pc += 1;
                 }
 
@@ -328,7 +337,7 @@ impl BacktrackingVm {
                     // which is where the choice point pushed at the loop head
                     // resumes, with the slots this iteration wrote put back.
                     if pos == progress[reg as usize] {
-                        if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                        if !trail.pop(&mut pc, &mut pos, slots, progress) {
                             return Ok(false);
                         }
                     } else {
@@ -344,7 +353,7 @@ impl BacktrackingVm {
                 Op::StartAnchor => {
                     if pos == 0 {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -352,7 +361,7 @@ impl BacktrackingVm {
                 Op::StartLineAnchor => {
                     if pos == 0 || input[pos - 1] == b'\n' {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -361,7 +370,7 @@ impl BacktrackingVm {
                     // End of text, or just before a trailing newline.
                     if pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n') {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -369,7 +378,7 @@ impl BacktrackingVm {
                 Op::EndLineAnchor => {
                     if pos == input.len() || input[pos] == b'\n' {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -379,7 +388,7 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before != after {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -389,7 +398,7 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before == after {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -407,11 +416,30 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, &mut progress) {
+                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
                         return Ok(false);
                     }
                 }
             }
+        }
+    }
+}
+
+/// Working storage for [`BacktrackingVm::exec`], reused across start positions.
+///
+/// A search tries every start offset in turn, so anything allocated per call is
+/// allocated per byte of input. Hoisting it here keeps that to one allocation
+/// per search.
+struct Scratch {
+    trail: Trail,
+    progress: Vec<usize>,
+}
+
+impl Scratch {
+    fn new(progress_regs: usize) -> Self {
+        Self {
+            trail: Trail::new(progress_regs),
+            progress: vec![usize::MAX; progress_regs],
         }
     }
 }
@@ -436,21 +464,38 @@ struct Trail {
 }
 
 impl Trail {
-    fn new() -> Self {
+    fn new(progress_regs: usize) -> Self {
+        // The register side stays empty for the patterns that have no nullable
+        // loop, which is most of them.
+        let (regs, reg_frames) = if progress_regs > 0 {
+            (Vec::with_capacity(16), Vec::with_capacity(32))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Self {
             stack: Vec::with_capacity(32),
             slots: Vec::with_capacity(64),
             slot_frames: Vec::with_capacity(32),
-            regs: Vec::with_capacity(16),
-            reg_frames: Vec::with_capacity(32),
+            regs,
+            reg_frames,
         }
+    }
+
+    fn clear(&mut self) {
+        self.stack.clear();
+        self.slots.clear();
+        self.slot_frames.clear();
+        self.regs.clear();
+        self.reg_frames.clear();
     }
 
     /// Records a choice point resuming at `pc` with the input at `pos`.
     #[inline]
-    fn push(&mut self, pc: u32, pos: usize) {
+    fn push(&mut self, pc: u32, pos: usize, progress_regs: usize) {
         self.slot_frames.push(self.slots.len());
-        self.reg_frames.push(self.regs.len());
+        if progress_regs > 0 {
+            self.reg_frames.push(self.regs.len());
+        }
         self.stack.push((pc, pos));
     }
 
