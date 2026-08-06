@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.2.1] - 2026-08-06
+
+### Performance
+
+- A greedy Unicode quantifier (`\p{L}+`, `\p{N}+`, …) no longer allocates while matching. The tagged-NFA interpreter recorded every codepoint boundary of the run in case one had to be given back; it now steps backwards through UTF-8 only when that happens.
+
 ## [0.2.0] - 2026-08-06
 
 ### Fixed
