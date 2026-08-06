@@ -49,13 +49,6 @@ pub struct HirProps {
     /// Whether the pattern contains large Unicode character classes.
     /// These cause DFA state explosion and should use PikeVM instead of JIT.
     pub has_large_unicode_class: bool,
-    /// Whether a negated class expanded into a trie of UTF-8 sequences.
-    ///
-    /// Byte-level, so the DFA runs it at full speed, but multi-byte transitions
-    /// are something the DFA JIT cannot represent — it answers "no match" for
-    /// `[^x]y`. Distinct from `has_large_unicode_class`, which additionally
-    /// means "route to the tagged NFA"; these patterns want the plain DFA.
-    pub has_utf8_class_trie: bool,
     /// Number of capture groups.
     pub capture_count: u32,
     /// Minimum match length in bytes.
