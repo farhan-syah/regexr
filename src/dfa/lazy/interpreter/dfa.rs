@@ -32,6 +32,12 @@ use super::super::shared::{
     UNKNOWN_STATE,
 };
 
+/// How much input the per-start attempts in [`LazyDfa::find_from`] may walk in
+/// total before the single-pass search takes over. A few passes' worth: high
+/// enough that attempts which fail near their start never reach it, low enough
+/// that ones which scan to the end trip it within a handful of tries.
+const SCAN_BUDGET_FACTOR: usize = 4;
+
 /// A lazy DFA that builds states on demand.
 #[derive(Debug, Clone)]
 pub struct LazyDfa {
@@ -80,6 +86,11 @@ impl LazyDfa {
     /// Returns true if this DFA has an end anchor ($).
     pub fn has_end_anchor(&self) -> bool {
         self.ctx.has_end_anchor()
+    }
+
+    /// Returns true if any accepting state is reachable without an end assertion.
+    pub fn has_clean_accept(&self) -> bool {
+        self.ctx.has_clean_accept()
     }
 
     /// Returns true if this DFA has multiline anchors.
@@ -447,9 +458,27 @@ impl LazyDfa {
                 None
             }
         } else {
+            // Trying one start at a time is right while the attempts are cheap:
+            // most give up within a byte or two of where they began, and the
+            // first one that matches ends the search. It collapses when they are
+            // not — a pattern that consumes a long run before failing costs a
+            // full scan per start, and the search turns quadratic.
+            //
+            // So the attempts are metered. Once they have collectively walked
+            // several times the input, the pattern is one of those, and the
+            // single-pass search takes over from where the loop stopped.
+            let budget = input.len().saturating_mul(SCAN_BUDGET_FACTOR);
+            let mut walked = 0usize;
+
             for start_pos in from..=input.len() {
+                self.ctx.last_reach = start_pos;
                 if let Some(end) = self.find_at(input, start_pos) {
                     return Some((start_pos, end));
+                }
+                walked += self.ctx.last_reach.saturating_sub(start_pos);
+                if walked > budget {
+                    let start = self.leftmost_start(input, start_pos + 1)?;
+                    return self.find_at(input, start).map(|end| (start, end));
                 }
             }
             None
@@ -582,10 +611,14 @@ impl LazyDfa {
                         }
                     }
                 }
-                None => break,
+                None => {
+                    self.ctx.last_reach = start + i;
+                    return last_match;
+                }
             }
         }
 
+        self.ctx.last_reach = input.len();
         last_match
     }
 
@@ -605,9 +638,14 @@ impl LazyDfa {
             {
                 return potential_match;
             }
-            // The greedy end fails `$`, but `$` belongs to the branch carrying
-            // it: `a|b$` on "aa" reaches a match through `a`, which asks for
-            // nothing at the end. Only the per-state check tells those apart.
+            // The greedy end fails `$`. If every accepting state requires it,
+            // no shorter end can satisfy it either — `$` holds at one position,
+            // and a shorter end is further from it — so the start is rejected.
+            if !self.ctx.has_clean_accept {
+                return None;
+            }
+            // Otherwise `$` belongs to the branch carrying it: `a|b$` on "aa"
+            // reaches a match through `a`, which asks for nothing at the end.
             return self.find_at_with_state_checked(input, start, state);
         }
 
@@ -632,6 +670,15 @@ impl LazyDfa {
         let len = bytes.len();
         let mut i = 0;
 
+        // Every exit records how far the scan walked. `find_from` uses it to
+        // notice when start attempts are scanning the whole input each time.
+        macro_rules! done {
+            () => {{
+                self.ctx.last_reach = start + i;
+                return last_match;
+            }};
+        }
+
         while i + 4 <= len {
             let b0 = unsafe { *bytes.get_unchecked(i) };
             let b1 = unsafe { *bytes.get_unchecked(i + 1) };
@@ -640,7 +687,7 @@ impl LazyDfa {
 
             let tagged0 = self.transition_or_compute(state, b0);
             if is_dead_state(tagged0) {
-                return last_match;
+                done!();
             }
             state = untag_state(tagged0);
             if is_tagged_match(tagged0) {
@@ -649,7 +696,7 @@ impl LazyDfa {
 
             let tagged1 = self.transition_or_compute(state, b1);
             if is_dead_state(tagged1) {
-                return last_match;
+                done!();
             }
             state = untag_state(tagged1);
             if is_tagged_match(tagged1) {
@@ -658,7 +705,7 @@ impl LazyDfa {
 
             let tagged2 = self.transition_or_compute(state, b2);
             if is_dead_state(tagged2) {
-                return last_match;
+                done!();
             }
             state = untag_state(tagged2);
             if is_tagged_match(tagged2) {
@@ -667,7 +714,7 @@ impl LazyDfa {
 
             let tagged3 = self.transition_or_compute(state, b3);
             if is_dead_state(tagged3) {
-                return last_match;
+                done!();
             }
             state = untag_state(tagged3);
             if is_tagged_match(tagged3) {
@@ -690,7 +737,164 @@ impl LazyDfa {
             i += 1;
         }
 
+        self.ctx.last_reach = start + i;
         last_match
+    }
+
+    /// Transition in the unanchored automaton: like [`LazyDfa::transition`], but
+    /// the target set also contains a match beginning at the position reached.
+    ///
+    /// Never dead — the start is always live — so this returns a plain state.
+    fn transition_unanchored(&mut self, state: DfaStateId, byte: u8) -> DfaStateId {
+        let idx = (state + byte as u32) as usize;
+        if idx < self.ctx.transitions_unanchored.len() {
+            let tagged = self.ctx.transitions_unanchored[idx];
+            if !is_unknown_state(tagged) {
+                return untag_state(tagged);
+            }
+        }
+        self.compute_transition_unanchored(state, byte)
+    }
+
+    /// Subset construction for one unanchored transition.
+    ///
+    /// Identical to [`LazyDfa::compute_transition`] except that the NFA start is
+    /// added to the target set before its closure is taken. Seeding through the
+    /// closure — rather than by hand — is what makes `^` behave: the closure runs
+    /// in mid-input context, which kills a start-anchored branch at every
+    /// position but the first.
+    fn compute_transition_unanchored(&mut self, state: DfaStateId, byte: u8) -> DfaStateId {
+        let state_idx = state_index(state);
+        let (nfa_states, prev_class) = match self.ctx.states.get(state_idx) {
+            Some(st) => (st.nfa_states.clone(), st.prev_class),
+            None => return self.ctx.start,
+        };
+
+        let curr_class = CharClass::from_byte(byte);
+
+        let is_at_boundary = if self.ctx.has_word_boundary {
+            Some(prev_class != curr_class)
+        } else {
+            None
+        };
+        let pos_ctx = if self.ctx.has_anchors {
+            Some(PositionContext::middle())
+        } else {
+            None
+        };
+
+        let expanded = if self.ctx.has_word_boundary || self.ctx.has_anchors {
+            epsilon_closure_with_context(&self.ctx.nfa, &nfa_states, is_at_boundary, pos_ctx)
+        } else {
+            nfa_states
+        };
+
+        let mut next_states = BTreeSet::new();
+        for &nfa_state in &expanded {
+            if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
+                for (range, target) in &nfa_s.transitions {
+                    if range.contains(byte) {
+                        next_states.insert(*target);
+                    }
+                }
+            }
+        }
+        next_states.insert(self.ctx.nfa.start);
+
+        let target_pos_ctx = if self.ctx.has_anchors {
+            if self.ctx.has_multiline_anchors && byte == b'\n' {
+                Some(PositionContext::after_newline())
+            } else {
+                Some(PositionContext::middle())
+            }
+        } else {
+            None
+        };
+
+        let next_closure = if self.ctx.has_word_boundary || self.ctx.has_anchors {
+            epsilon_closure_with_context(&self.ctx.nfa, &next_states, None, target_pos_ctx)
+        } else {
+            self.ctx.nfa.epsilon_closure(&next_states)
+        };
+        let next_clean = match_reachable_without_end_assertion(
+            &self.ctx.nfa,
+            &next_states,
+            None,
+            target_pos_ctx,
+        );
+        let next_id =
+            get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class, next_clean);
+
+        let is_match = self
+            .ctx
+            .states
+            .get(state_index(next_id))
+            .is_some_and(|st| st.is_match);
+
+        if self.ctx.transitions_unanchored.len() < self.ctx.transitions.len() {
+            self.ctx
+                .transitions_unanchored
+                .resize(self.ctx.transitions.len(), UNKNOWN_STATE);
+        }
+        let idx = (state + byte as u32) as usize;
+        if idx < self.ctx.transitions_unanchored.len() {
+            self.ctx.transitions_unanchored[idx] = tag_state(next_id, is_match);
+        }
+
+        next_id
+    }
+
+    /// One pass over `input[from..]`, reporting whether any match starting at or
+    /// before `seed_until` exists.
+    ///
+    /// Positions up to `seed_until` transition in the unanchored automaton, so
+    /// each is considered as a start; past it the anchored automaton takes over
+    /// and no new start is introduced. `seed_until >= input.len()` therefore asks
+    /// "does this pattern match at all", and a smaller value asks "does it match
+    /// starting no later than here" — which is monotone in `seed_until`, and so
+    /// binary-searchable for the leftmost start.
+    fn matches_starting_by(&mut self, input: &[u8], from: usize, seed_until: usize) -> bool {
+        let mut state = self.get_start_state_for_position(input, from);
+        if self.is_match(state) && self.check_end_assertions(input, from, state) {
+            return true;
+        }
+
+        for (i, &byte) in input[from..].iter().enumerate() {
+            let pos = from + i;
+            state = if pos < seed_until {
+                self.transition_unanchored(state, byte)
+            } else {
+                match self.transition(state, byte) {
+                    Some(next) => next,
+                    None => return false,
+                }
+            };
+            if self.is_match(state) && self.check_end_assertions(input, pos + 1, state) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// The leftmost start position at or after `from` that begins a match.
+    ///
+    /// Binary search over [`LazyDfa::matches_starting_by`]: each probe is one
+    /// pass, so this costs O(n log n) where trying every start costs O(n²).
+    fn leftmost_start(&mut self, input: &[u8], from: usize) -> Option<usize> {
+        if !self.matches_starting_by(input, from, input.len() + 1) {
+            return None;
+        }
+        let (mut lo, mut hi) = (from, input.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.matches_starting_by(input, from, mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
     }
 
     /// Get transition, computing if needed, returning tagged state.

@@ -57,6 +57,11 @@ pub struct ShiftOr {
     pub(crate) has_end_anchor: bool,
 }
 
+/// How much input the per-start attempts in [`ShiftOr::find_end_anchored`] may
+/// walk in total before the binary search takes over. Matches the lazy DFA's
+/// rule: attempts that fail near their start never reach it.
+const SCAN_BUDGET_FACTOR: usize = 4;
+
 impl ShiftOr {
     /// Tries to compile an HIR into a Shift-Or matcher.
     /// Returns None if the pattern is not suitable for Shift-Or.
@@ -233,13 +238,15 @@ impl ShiftOr {
         // `scan_limit` first rules out "no match anywhere" in a single pass and
         // otherwise caps how far this scan has to walk.
         let scan_end = self.scan_limit(input, 0)?;
-        for start in 0..=scan_end {
-            if let Some(end) = self.match_at(input, start) {
-                // For end anchor: only accept if match ends at input end
-                if self.has_end_anchor && !crate::nfa::at_end_or_before_final_newline(input, end) {
-                    continue;
+        if self.has_end_anchor {
+            if let Some(found) = self.find_end_anchored(input, 0) {
+                return Some(found);
+            }
+        } else {
+            for start in 0..=scan_end {
+                if let Some(end) = self.match_at(input, start) {
+                    return Some((start, end));
                 }
-                return Some((start, end));
             }
         }
 
@@ -269,6 +276,9 @@ impl ShiftOr {
         // "no match anywhere" in a single pass and otherwise caps how far this
         // scan has to walk.
         let scan_end = self.scan_limit(input, search_start)?;
+        if self.has_end_anchor && !self.has_start_anchor {
+            return self.find_end_anchored(input, search_start);
+        }
         for start in search_start..=scan_end {
             if let Some(end) = self.match_at(input, start) {
                 // For end anchor: only accept if match ends at input end
@@ -355,6 +365,112 @@ impl ShiftOr {
         }
     }
 
+    /// One unanchored pass that accepts only where `$` allows, counting starts
+    /// no later than `seed_until`.
+    ///
+    /// The bit-parallel state is a set of reachable pattern positions and says
+    /// nothing about which start reached them, so it cannot rank two starts. It
+    /// can, however, be told which starts to consider at all: `First` is injected
+    /// while the scan is at or before `seed_until` and withheld afterwards. That
+    /// makes the answer monotone in `seed_until` — a start that qualifies also
+    /// qualifies under any larger bound — which is what
+    /// [`ShiftOr::leftmost_end_anchored_start`] binary-searches.
+    fn matches_end_anchored_starting_by(
+        &self,
+        input: &[u8],
+        from: usize,
+        seed_until: usize,
+    ) -> bool {
+        let mut state = !0u64;
+
+        for pos in from..=input.len() {
+            // A nullable pattern matches empty wherever `$` holds, and that empty
+            // match starts — and ends — right here.
+            if self.nullable
+                && pos <= seed_until
+                && crate::nfa::at_end_or_before_final_newline(input, pos)
+            {
+                return true;
+            }
+            if pos == input.len() {
+                break;
+            }
+
+            let mut reachable = if pos <= seed_until { self.first } else { 0 };
+            let mut active = !state;
+            while active != 0 {
+                let p = active.trailing_zeros() as usize;
+                reachable |= self.follow[p];
+                active &= active - 1;
+            }
+
+            state = (!reachable) | self.masks[input[pos] as usize];
+
+            if (state | self.accept) != !0u64
+                && crate::nfa::at_end_or_before_final_newline(input, pos + 1)
+            {
+                return true;
+            }
+            // Nothing live and nothing more to seed: no later start qualifies.
+            if state == !0u64 && pos >= seed_until {
+                return false;
+            }
+        }
+
+        false
+    }
+
+    /// The leftmost start at or after `from` of a match that ends where `$`
+    /// allows, in O(n log n) rather than the O(n²) of trying every start.
+    fn leftmost_end_anchored_start(&self, input: &[u8], from: usize) -> Option<usize> {
+        if !self.matches_end_anchored_starting_by(input, from, input.len()) {
+            return None;
+        }
+        let (mut lo, mut hi) = (from, input.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.matches_end_anchored_starting_by(input, from, mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    }
+
+    /// Scans starts from `from` for a match that ends where `$` allows.
+    ///
+    /// Trying one start at a time is right while the attempts give up near where
+    /// they began. It collapses when they do not: `(a+)+$` over `"aaaa…"` runs
+    /// every attempt to the end of the input and never accepts, one full pass per
+    /// start. So the attempts are metered, and once they have collectively walked
+    /// several times the input the binary search takes over.
+    fn find_end_anchored(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        let budget = input.len().saturating_mul(SCAN_BUDGET_FACTOR);
+        let mut walked = 0usize;
+
+        for start in from..=input.len() {
+            let (end, reach) = self.match_at_reach(input, start);
+            if let Some(end) = end {
+                if crate::nfa::at_end_or_before_final_newline(input, end) {
+                    return Some((start, end));
+                }
+            }
+            walked += reach.saturating_sub(start);
+            if walked > budget {
+                let s = self.leftmost_end_anchored_start(input, start + 1)?;
+                let end = self.match_at(input, s)?;
+                // `$` holds at one position, so a shorter end is further from it
+                // than the greedy one — if the greedy end misses, none reaches.
+                if !crate::nfa::at_end_or_before_final_newline(input, end) {
+                    return None;
+                }
+                return Some((s, end));
+            }
+        }
+        None
+    }
+
     /// Tries to match at exactly the given position.
     /// Returns (start, end) if matched, None otherwise.
     /// Use this when you know the match should start at exactly `pos` (e.g., from a prefilter).
@@ -377,8 +493,14 @@ impl ShiftOr {
 
     /// Attempts to match at a specific position.
     fn match_at(&self, input: &[u8], start: usize) -> Option<usize> {
+        self.match_at_reach(input, start).0
+    }
+
+    /// [`ShiftOr::match_at`], also reporting how far the scan walked before the
+    /// state went empty. `find_end_anchored` meters attempts with it.
+    fn match_at_reach(&self, input: &[u8], start: usize) -> (Option<usize>, usize) {
         if start > input.len() {
-            return None;
+            return (None, start);
         }
 
         // Track the last match position found
@@ -428,11 +550,11 @@ impl ShiftOr {
 
             // If all bits are 1, no possible match from this starting point
             if state == !0u64 {
-                break;
+                return (last_match, start + i + 1);
             }
         }
 
-        last_match
+        (last_match, input.len())
     }
 }
 

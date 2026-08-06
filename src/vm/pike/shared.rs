@@ -73,9 +73,6 @@ pub struct PikeVmContext {
     /// Monotonic priority sequence assigned to scheduled threads. Lower = higher
     /// priority. Assigned in priority order so the queue stays leftmost-first.
     pub seq_counter: u64,
-    /// Capture slot storage (reused across calls)
-    #[allow(dead_code)]
-    pub capture_slots: Vec<Option<(usize, usize)>>,
     /// Stack for iterative epsilon closure (avoids recursion stack overflow)
     pub epsilon_stack: Vec<Thread>,
     /// Memoization cache for lookaround results.
@@ -86,15 +83,18 @@ pub struct PikeVmContext {
 }
 
 impl PikeVmContext {
-    /// Create a new context for the given capture count and state count.
-    pub fn new(capture_count: usize, state_count: usize) -> Self {
+    /// Create a new context sized for an NFA with `state_count` states.
+    ///
+    /// Captures need no storage here: a thread carries its own history as a
+    /// shared linked list of capture actions, and the slot vector is built only
+    /// when a match is reconstructed.
+    pub fn new(state_count: usize) -> Self {
         Self {
             current_threads: Vec::with_capacity(32),
             future_threads: BinaryHeap::new(),
             visited: vec![0; state_count],
             generation: 0,
             seq_counter: 0,
-            capture_slots: vec![None; capture_count + 1],
             epsilon_stack: Vec::with_capacity(32),
             lookaround_cache: HashMap::new(),
         }
@@ -111,9 +111,6 @@ impl PikeVmContext {
         // Just increment once to ensure fresh start
         self.generation = self.generation.wrapping_add(1);
         self.seq_counter = 0;
-        for slot in &mut self.capture_slots {
-            *slot = None;
-        }
         // Clear lookaround cache for new match attempt
         self.lookaround_cache.clear();
     }
@@ -152,6 +149,26 @@ impl CaptureNode {
     #[inline]
     pub fn new(action: CaptureAction, parent: Option<Arc<CaptureNode>>) -> Arc<Self> {
         Arc::new(Self { action, parent })
+    }
+}
+
+/// Frees the history iteratively.
+///
+/// The list is one node per capture action, so a thread that goes round a
+/// capturing loop once per input byte owns a list as long as the input. The
+/// derived drop would recurse once per node and overflow the stack on a long
+/// match; this walks the chain instead, releasing each node whose last owner it
+/// is and stopping at the first one another thread still shares.
+impl Drop for CaptureNode {
+    fn drop(&mut self) {
+        let mut next = self.parent.take();
+        while let Some(node) = next {
+            match Arc::try_unwrap(node) {
+                Ok(mut node) => next = node.parent.take(),
+                // Still shared; whoever holds it last frees the rest.
+                Err(_) => break,
+            }
+        }
     }
 }
 

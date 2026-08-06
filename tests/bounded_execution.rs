@@ -48,6 +48,12 @@ const CHILD_ADDRESS_SPACE_KIB: u64 = 4_000_000;
 /// `case` must be the name of the calling test, because that is the filter the
 /// child is invoked with.
 fn bounded(case: &str, body: impl FnOnce()) {
+    bounded_within(case, DEADLINE, body)
+}
+
+/// [`bounded`] with an explicit deadline, for cases whose correct behaviour is
+/// still measured in seconds rather than microseconds.
+fn bounded_within(case: &str, deadline: Duration, body: impl FnOnce()) {
     if env::var(CASE_VAR).as_deref() == Ok(case) {
         body();
         return;
@@ -80,10 +86,10 @@ fn bounded(case: &str, body: impl FnOnce()) {
         match child.try_wait().expect("poll isolated case") {
             Some(status) if status.success() => return,
             Some(status) => panic!("{case}: isolated run failed ({status})"),
-            None if started.elapsed() >= DEADLINE => {
+            None if started.elapsed() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{case}: search did not terminate within {DEADLINE:?}");
+                panic!("{case}: search did not terminate within {deadline:?}");
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
@@ -395,6 +401,75 @@ fn long_greedy_run_captures_agree_with_find() {
             let found = re.find(&text).map(|m| (m.start(), m.end()));
             let captured = capture_spans(&re, &text).and_then(|s| s[0]);
             assert_eq!(found, captured, "{label}");
+        }
+    });
+}
+
+// =============================================================================
+// A search over a long non-matching input stays linear in its length
+// =============================================================================
+// Every engine here searches unanchored input by trying start positions. That is
+// right while a failed attempt gives up near where it began, and quadratic when
+// it does not: `(a+)+$` over a run of `a` consumes the whole run from every
+// start and rejects it at `$`, so the cost is one full scan per byte. The
+// engines answer that with a single pass that covers every start at once.
+//
+// The input below is long enough that the difference is not a matter of
+// constants: linear finishes in milliseconds, and one scan per byte would need
+// far longer than [`DEADLINE`] allows.
+
+/// Input length for the scaling cases.
+const LONG_INPUT: usize = 20_000;
+
+/// Deadline for the scaling cases.
+///
+/// Unlike the termination cases, these do real work even when correct — tens of
+/// thousands of bytes through every engine, in a debug build. The deadline is
+/// not a performance target and is deliberately far above what linear costs on
+/// any machine, emulated ones included; it only has to sit below what one scan
+/// per byte would take at [`LONG_INPUT`], which is minutes.
+const SCALING_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Patterns whose failed attempts each consume the whole run before rejecting
+/// it, spread across the engines that search by start position: Shift-Or, the
+/// lazy DFA and its JIT, and the PikeVM.
+const LONG_RUN_NON_MATCHING: &[&str] = &[
+    r"(a|a)+$",
+    r"(?:a|a)+$",
+    r"(a|aa)+$",
+    r"(a+)+$",
+    r"(a|b)+$",
+    r"(x+x+)+y",
+    r"([a-zA-Z]+)*b$",
+];
+
+#[test]
+fn long_run_rejection_stays_linear() {
+    bounded_within("long_run_rejection_stays_linear", SCALING_DEADLINE, || {
+        let text = format!("{}!", "a".repeat(LONG_INPUT));
+        for pattern in LONG_RUN_NON_MATCHING {
+            for (label, re) in builds(pattern) {
+                assert!(!re.is_match(&text), "{label} {pattern}");
+                assert_eq!(
+                    re.find(&text).map(|m| (m.start(), m.end())),
+                    None,
+                    "{label} {pattern}"
+                );
+                assert_eq!(capture_spans(&re, &text), None, "{label} {pattern}");
+            }
+        }
+    });
+}
+
+#[test]
+fn long_run_iteration_stays_linear() {
+    bounded_within("long_run_iteration_stays_linear", SCALING_DEADLINE, || {
+        let text = format!("{}!", "a".repeat(LONG_INPUT));
+        for pattern in LONG_RUN_NON_MATCHING {
+            for (label, re) in builds(pattern) {
+                assert_eq!(re.find_iter(&text).count(), 0, "{label} {pattern}");
+                assert_eq!(iterated_spans(&re, &text).len(), 0, "{label} {pattern}");
+            }
         }
     });
 }

@@ -95,6 +95,55 @@ enum CompiledInner {
     JitShiftOr(jit::JitShiftOr),
 }
 
+/// Decides when prefilter-driven verification has stopped paying for itself.
+///
+/// Verifying one candidate at a time is a win when a failed attempt gives up
+/// near the candidate. It is a trap when the pattern consumes a long run before
+/// failing and the prefilter keeps most positions: `(?:a|a)+$` over `"aaaa…"`
+/// makes every byte a candidate and every attempt scan to the end, so the search
+/// costs one engine pass per byte.
+///
+/// Every engine has a complete linear-time search of its own
+/// ([`CompiledRegex::find_engine_from`]), so the escape is to stop verifying and
+/// hand the rest of the input to it. This tracks how many attempts have failed
+/// and how much input they span: past [`MAX_ATTEMPTS`], a prefilter still
+/// keeping more than one position in [`MIN_SELECTIVITY`] is not filtering, and
+/// the handoff is taken. A prefilter that is genuinely selective never trips it
+/// and keeps the candidate loop for the whole search.
+struct PrefilterDrive {
+    attempts: usize,
+    first_candidate: usize,
+}
+
+/// Failed attempts to allow before the selectivity of a prefilter is judged.
+/// The handoff costs one engine pass, so this bounds the waste at a constant
+/// number of passes rather than one per candidate.
+const MAX_ATTEMPTS: usize = 64;
+
+/// One candidate in this many positions is the point below which a prefilter is
+/// discarding enough of the input to be worth verifying position by position.
+const MIN_SELECTIVITY: usize = 8;
+
+impl PrefilterDrive {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            first_candidate: 0,
+        }
+    }
+
+    /// Records a failed attempt at `candidate`. Returns true when the caller
+    /// should abandon the loop and search from `candidate` with the engine.
+    fn give_up(&mut self, candidate: usize) -> bool {
+        if self.attempts == 0 {
+            self.first_candidate = candidate;
+        }
+        self.attempts += 1;
+        self.attempts > MAX_ATTEMPTS
+            && self.attempts * MIN_SELECTIVITY > candidate - self.first_candidate + 1
+    }
+}
+
 impl CompiledRegex {
     /// Returns the name of the engine being used (for debugging).
     pub fn engine_name(&self) -> &'static str {
@@ -142,9 +191,20 @@ impl CompiledRegex {
 
         // Use prefilter to skip to candidate positions
         if !self.prefilter.is_none() {
+            if self.engine_searches_single_pass() {
+                let first = self.prefilter.find_candidates(input).next();
+                return match first {
+                    Some(first) => self.find_engine_from_boundary(input, first).is_some(),
+                    None => false,
+                };
+            }
+            let mut drive = PrefilterDrive::new();
             for candidate in self.prefilter.find_candidates(input) {
                 if self.is_match_at(input, candidate) {
                     return true;
+                }
+                if drive.give_up(candidate) {
+                    return self.find_engine_from_boundary(input, candidate).is_some();
                 }
             }
             return false;
@@ -169,6 +229,19 @@ impl CompiledRegex {
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::JitShiftOr(jit) => jit.find(input).is_some(),
         }
+    }
+
+    /// Whether the engine's own unanchored search already covers every start
+    /// position in one pass over the input.
+    ///
+    /// Such an engine gains nothing from being handed candidates one at a time —
+    /// each call would redo the whole scan — so the prefilter is used only to
+    /// skip to the first candidate, and the engine takes it from there. The
+    /// PikeVM seeds a start thread at every position into one priority queue and
+    /// so qualifies; the DFA and Shift-Or engines scan per start and do not.
+    #[inline]
+    fn engine_searches_single_pass(&self) -> bool {
+        matches!(self.inner, CompiledInner::PikeVm(_))
     }
 
     /// Returns true if this regex uses a TeddyFull prefilter.
@@ -236,6 +309,7 @@ impl CompiledRegex {
         if self.prefilter.is_inner_byte() {
             let lookback = self.prefilter.inner_byte_lookback();
             let mut search_pos = from;
+            let mut drive = PrefilterDrive::new();
 
             while let Some(inner_pos) = self.prefilter.find_candidate(input, search_pos) {
                 // Find the likely start position by looking back for a word boundary
@@ -260,6 +334,11 @@ impl CompiledRegex {
                     return Some((start, end));
                 }
 
+                if drive.give_up(inner_pos) {
+                    // The caller applies the codepoint-boundary rule.
+                    return self.find_engine_from(input, candidate);
+                }
+
                 // No match found around this inner byte, skip past it
                 search_pos = inner_pos + 1;
             }
@@ -270,9 +349,19 @@ impl CompiledRegex {
         // IMPORTANT: Use find_at_pos (exact position) not find_at (linear search from pos)
         // The prefilter already tells us where candidates are - we only need to verify each one.
         if !self.prefilter.is_none() {
+            if self.engine_searches_single_pass() {
+                // The caller applies the codepoint-boundary rule.
+                let first = self.prefilter.find_candidates_from(input, from).next()?;
+                return self.find_engine_from(input, first);
+            }
+            let mut drive = PrefilterDrive::new();
             for candidate in self.prefilter.find_candidates_from(input, from) {
                 if let Some(result) = self.find_at_pos(input, candidate) {
                     return Some(result);
+                }
+                if drive.give_up(candidate) {
+                    // The caller applies the codepoint-boundary rule.
+                    return self.find_engine_from(input, candidate);
                 }
             }
             return None;
@@ -280,6 +369,19 @@ impl CompiledRegex {
 
         // No prefilter - let the engine scan from the resume position
         self.find_engine_from(input, from)
+    }
+
+    /// [`CompiledRegex::find_engine_from`] under the codepoint-boundary rule, for
+    /// callers that are not already inside [`CompiledRegex::find_from`]'s loop.
+    fn find_engine_from_boundary(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        let mut from = from;
+        loop {
+            let (start, end) = self.find_engine_from(input, from)?;
+            if crate::nfa::is_utf8_boundary(input, start) {
+                return Some((start, end));
+            }
+            from = start + 1;
+        }
     }
 
     /// Runs the engine's own unanchored search from `from`, with no prefilter.
