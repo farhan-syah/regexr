@@ -29,6 +29,10 @@ use super::jit::{BacktrackingJit, BUDGET_EXHAUSTED, STACK_EXHAUSTED};
 // ARM64 backtracking JIT enabled
 const ARM64_BACKTRACKING_JIT_ENABLED: bool = true;
 
+// The exhaustion sentinels are emitted as `movn` literals below (`movn xN, k`
+// yields `!k`), so they cannot reference the constants directly. Pin them.
+const _: () = assert!(STACK_EXHAUSTED == -2 && BUDGET_EXHAUSTED == -3);
+
 /// The backtracking JIT compiler for ARM64.
 pub(super) struct BacktrackingCompiler {
     /// The assembler.
@@ -162,7 +166,8 @@ impl BacktrackingCompiler {
             ; mov x19, x0              // x19 = input_ptr
             ; mov x20, x1              // x20 = input_len
             ; mov x22, x2              // x22 = captures_ptr
-            ; str x3, [x29, #-0x58]    // Step budget
+            ; sub x9, x29, #0x58       // x9 = &budget slot
+            ; str x3, [x9]             // Step budget
             ; mov x23, #0              // x23 = start_pos = 0
             ; mov x26, sp              // x26 = backtrack stack pointer (bottom)
 
@@ -384,9 +389,10 @@ impl BacktrackingCompiler {
                     // Refuse to push past the top of the frame (see
                     // `stack_exhausted_label`). The frame ends 0x58 below x29:
                     // 0x50 of spilled callee-saved registers, then the budget.
-                    ; ldr x9, [x29, #-0x58]
-                    ; subs x9, x9, #1
-                    ; str x9, [x29, #-0x58]
+                    ; sub x9, x29, #0x58
+                    ; ldr x10, [x9]
+                    ; subs x10, x10, #1
+                    ; str x10, [x9]
                     ; b.ls =>self.budget_exhausted_label
                     ; add x9, x26, #32
                     ; sub x10, x29, #0x58
@@ -471,9 +477,10 @@ impl BacktrackingCompiler {
                 ; .arch aarch64
                 // Refuse to push past the top of the frame; see
                 // `stack_exhausted_label`.
-                ; ldr x9, [x29, #-0x58]
-                ; subs x9, x9, #1
-                ; str x9, [x29, #-0x58]
+                ; sub x9, x29, #0x58
+                ; ldr x10, [x9]
+                ; subs x10, x10, #1
+                ; str x10, [x9]
                 ; b.ls =>self.budget_exhausted_label
                 ; add x9, x26, #32
                 ; sub x10, x29, #0x58
@@ -586,9 +593,10 @@ impl BacktrackingCompiler {
                     ; .arch aarch64
                     // Refuse to push past the top of the frame; see
                     // `stack_exhausted_label`.
-                    ; ldr x9, [x29, #-0x58]
-                    ; subs x9, x9, #1
-                    ; str x9, [x29, #-0x58]
+                    ; sub x9, x29, #0x58
+                    ; ldr x10, [x9]
+                    ; subs x10, x10, #1
+                    ; str x10, [x9]
                     ; b.ls =>self.budget_exhausted_label
                     ; add x9, x26, #32
                     ; sub x10, x29, #0x58
