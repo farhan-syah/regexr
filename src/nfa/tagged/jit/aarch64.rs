@@ -1277,107 +1277,135 @@ impl TaggedNfaJitCompiler {
         remaining: &[PatternStep],
         fail_label: dynasmrt::DynamicLabel,
     ) -> Result<()> {
+        self.emit_greedy_codepoint_plus_with_backtracking_impl(
+            cpclass, remaining, fail_label, false,
+        )
+    }
+
+    /// As [`Self::emit_greedy_codepoint_plus_with_backtracking`], but the
+    /// remaining steps are emitted through `emit_capture_step` so group slots are
+    /// recorded. `emit_captures_fn` needs its own entry point because the plain
+    /// [`Self::emit_greedy_codepoint_plus`] never gives a codepoint back: it would
+    /// let `\p{L}+` swallow the whole run and leave a following `(\p{L})` with
+    /// nothing to match.
+    fn emit_greedy_codepoint_plus_with_backtracking_captures(
+        &mut self,
+        cpclass: &CodepointClass,
+        remaining: &[PatternStep],
+        fail_label: dynasmrt::DynamicLabel,
+    ) -> Result<()> {
+        self.emit_greedy_codepoint_plus_with_backtracking_impl(cpclass, remaining, fail_label, true)
+    }
+
+    /// A greedy codepoint run that gives characters back until the rest of the
+    /// pattern fits, mirroring the x86-64 emitter of the same name.
+    ///
+    /// Two stack slots carry the search: `[sp]` is the boundary currently being
+    /// tried and `[sp + 16]` is `min_pos`, the end of the mandatory first
+    /// codepoint. Shrinking walks backwards over UTF-8 continuation bytes rather
+    /// than replaying a recorded list, so the run costs two slots however long it
+    /// is — a 500-character word does not push 500 slots onto the machine stack.
+    fn emit_greedy_codepoint_plus_with_backtracking_impl(
+        &mut self,
+        cpclass: &CodepointClass,
+        remaining: &[PatternStep],
+        fail_label: dynasmrt::DynamicLabel,
+        for_captures: bool,
+    ) -> Result<()> {
         use dynasmrt::DynasmLabelApi;
 
-        // For codepoint backtracking, we save character boundaries on the stack
         let loop_start = self.asm.new_dynamic_label();
-        let loop_done = self.asm.new_dynamic_label();
+        let greedy_done = self.asm.new_dynamic_label();
         let try_remaining = self.asm.new_dynamic_label();
         let backtrack = self.asm.new_dynamic_label();
-        let success = self.asm.new_dynamic_label();
-        let first_fail_stack = self.asm.new_dynamic_label();
-        let loop_fail_no_stack = self.asm.new_dynamic_label();
-        let loop_fail_stack = self.asm.new_dynamic_label();
-        let no_more_boundaries = self.asm.new_dynamic_label();
+        let back_cont = self.asm.new_dynamic_label();
+        let set_boundary = self.asm.new_dynamic_label();
+        let bt_fail = self.asm.new_dynamic_label();
+        let first_fail = self.asm.new_dynamic_label();
+        let loop_memb_fail = self.asm.new_dynamic_label();
+        let done = self.asm.new_dynamic_label();
 
-        // x24 will track the number of saved boundaries on stack
-        dynasm!(self.asm
-            ; .arch aarch64
-            ; mov x24, xzr                    // x24 = boundary count = 0
-        );
-
-        // First iteration: must match at least one codepoint
+        // The first codepoint is mandatory (the `+`). End of input or a codepoint
+        // outside the class before any match fails outright, with no slot pushed.
         self.emit_utf8_decode(fail_label)?;
+        dynasm!(self.asm ; .arch aarch64 ; str x1, [sp, -16]!);
+        self.emit_codepoint_class_membership_check(cpclass, first_fail)?;
         dynasm!(self.asm
             ; .arch aarch64
-            ; str x1, [sp, -16]!              // Save byte length
-        );
-        self.emit_codepoint_class_membership_check(cpclass, first_fail_stack)?;
-        dynasm!(self.asm
-            ; .arch aarch64
-            ; ldr x1, [sp], 16                // Restore byte length
-            ; add x22, x22, x1                // Advance position
-            ; str x22, [sp, -16]!             // Save boundary position
-            ; add x24, x24, 1                 // boundary count++
+            ; ldr x1, [sp], 16
+            ; add x22, x22, x1                // consume the first codepoint
+            ; str x22, [sp, -16]!             // [sp] = min_pos
 
-            // Greedy loop: match more codepoints
+            // Greedy loop: consume as many further codepoints as possible.
             ; =>loop_start
         );
-
-        self.emit_utf8_decode(loop_fail_no_stack)?;
+        // End of input or invalid UTF-8 stops the run; only min_pos is on the stack.
+        self.emit_utf8_decode(greedy_done)?;
+        dynasm!(self.asm ; .arch aarch64 ; str x1, [sp, -16]!);
+        self.emit_codepoint_class_membership_check(cpclass, loop_memb_fail)?;
         dynasm!(self.asm
             ; .arch aarch64
-            ; str x1, [sp, -16]!              // Save byte length
-        );
-        self.emit_codepoint_class_membership_check(cpclass, loop_fail_stack)?;
-        dynasm!(self.asm
-            ; .arch aarch64
-            ; ldr x1, [sp], 16                // Restore byte length
-            ; add x22, x22, x1                // Advance position
-            ; str x22, [sp, -16]!             // Save boundary position
-            ; add x24, x24, 1                 // boundary count++
+            ; ldr x1, [sp], 16
+            ; add x22, x22, x1
             ; b =>loop_start
 
-            ; =>first_fail_stack
-            ; add sp, sp, 16                  // Pop saved byte length
-            ; b =>fail_label                  // First match failed - overall fail
-
-            ; =>loop_fail_no_stack
-            ; b =>loop_done
-
-            ; =>loop_fail_stack
-            ; add sp, sp, 16                  // Pop saved byte length
-            ; b =>loop_done
-
-            ; =>loop_done
-            // Greedy matching done
-            // Stack has boundary positions, x24 = count
-            // Try remaining steps with backtracking
-
-            ; =>try_remaining
-        );
-
-        // Emit code for remaining steps
-        for step in remaining {
-            self.emit_step_inline(step, backtrack)?;
-        }
-
-        // All remaining steps matched - success!
-        // Clean up stack (pop all saved boundaries)
-        dynasm!(self.asm
-            ; .arch aarch64
-            ; =>success
-            ; lsl x0, x24, 4                  // x0 = boundary_count * 16 (stack slot size)
-            ; add sp, sp, x0                  // Pop all boundary positions
-            ; b >done
-
-            ; =>backtrack
-            // Remaining steps failed - backtrack to previous boundary
-            ; cmp x24, 1
-            ; b.le =>no_more_boundaries       // Need at least 1 match (plus semantics)
-
-            ; ldr x22, [sp], 16               // Pop and discard current boundary
-            ; sub x24, x24, 1
-            ; ldr x22, [sp]                   // Peek previous boundary (don't pop yet)
-            ; b =>try_remaining
-
-            ; =>no_more_boundaries
-            // Can't backtrack more - clean up and fail
-            ; lsl x0, x24, 4                  // x0 = boundary_count * 16
-            ; add sp, sp, x0                  // Pop all remaining boundaries
+            ; =>first_fail
+            ; add sp, sp, 16                  // drop the saved length; min_pos not pushed
             ; b =>fail_label
 
-            ; done:
+            ; =>loop_memb_fail
+            ; add sp, sp, 16                  // drop the saved length, leaving min_pos
+            // falls through to greedy_done
+
+            ; =>greedy_done
+            // x22 is the greedy end. Push it as the running boundary:
+            //   [sp] = boundary, [sp + 16] = min_pos.
+            ; str x22, [sp, -16]!
+
+            ; =>try_remaining
+            // Reset the working position from the (shrinking) boundary — the
+            // remaining steps consume input, so a failed attempt leaves x22 past it.
+            ; ldr x22, [sp]
+        );
+
+        for step in remaining {
+            if for_captures {
+                self.emit_capture_step(step, backtrack, 0)?;
+            } else {
+                self.emit_step_inline(step, backtrack)?;
+            }
+        }
+
+        dynasm!(self.asm
+            ; .arch aarch64
+            ; add sp, sp, 32                  // success: pop boundary + min_pos
+            ; b =>done
+
+            ; =>backtrack
+            // Shrink the boundary by one whole codepoint, never below min_pos.
+            ; ldr x0, [sp]                    // x0 = boundary
+            ; ldr x1, [sp, 16]                // x1 = min_pos
+            ; cmp x0, x1
+            ; b.le =>bt_fail                  // at the mandatory minimum — exhausted
+            ; sub x0, x0, 1                   // back up at least one byte
+            ; =>back_cont
+            ; cmp x0, x1
+            ; b.le =>set_boundary             // reached min_pos, itself a boundary
+            ; ldrb w2, [x19, x0]
+            ; and w2, w2, 0xC0
+            ; cmp w2, 0x80
+            ; b.ne =>set_boundary             // a lead byte — this is the boundary
+            ; sub x0, x0, 1
+            ; b =>back_cont
+            ; =>set_boundary
+            ; str x0, [sp]
+            ; b =>try_remaining
+
+            ; =>bt_fail
+            ; add sp, sp, 32                  // pop boundary + min_pos
+            ; b =>fail_label
+
+            ; =>done
         );
 
         Ok(())
@@ -1528,8 +1556,25 @@ impl TaggedNfaJitCompiler {
             ; str x21, [x23]  // group 0 start
         );
 
-        for step in steps {
+        let mut step_idx = 0;
+        while step_idx < steps.len() {
+            let step = &steps[step_idx];
+            // A greedy codepoint run followed by anything that consumes input has
+            // to be able to give characters back; `emit_capture_step` alone would
+            // consume the whole run and strand the steps after it.
+            if let PatternStep::GreedyCodepointPlus(cpclass) = step {
+                let remaining = &steps[step_idx + 1..];
+                if remaining.iter().any(Self::step_forces_backtrack) {
+                    self.emit_greedy_codepoint_plus_with_backtracking_captures(
+                        cpclass,
+                        remaining,
+                        byte_mismatch,
+                    )?;
+                    break;
+                }
+            }
             self.emit_capture_step(step, byte_mismatch, num_slots)?;
+            step_idx += 1;
         }
 
         dynasm!(self.asm ; .arch aarch64 ; b =>match_found);

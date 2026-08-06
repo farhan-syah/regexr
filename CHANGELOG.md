@@ -6,6 +6,10 @@ Each release must have a non-empty section here before it can be tagged — `.gi
 
 ## [0.2.1] - 2026-08-06
 
+### Fixed
+
+- aarch64 agrees with x86-64 on capture groups after a greedy Unicode quantifier. The ARM64 tagged-NFA JIT let `\p{L}+` consume its whole run when extracting captures, so `(\p{L}+)(\p{L})` reported no match on input it matches.
+
 ### Performance
 
 - A greedy Unicode quantifier (`\p{L}+`, `\p{N}+`, …) no longer allocates while matching. The tagged-NFA interpreter recorded every codepoint boundary of the run in case one had to be given back; it now steps backwards through UTF-8 only when that happens.

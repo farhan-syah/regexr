@@ -27,7 +27,9 @@ use super::regex;
 fn greedy_letters_give_back_one_multibyte_character() {
     // The run must give back the final 好 so the literal can match it.
     for pattern in [r"\p{L}+好", r"\p{L}+好(?=$)"] {
-        let m = regex(pattern).find("你我好").expect("matches");
+        let m = regex(pattern)
+            .find("你我好")
+            .unwrap_or_else(|| panic!("{pattern} must match"));
         assert_eq!(m.as_str(), "你我好", "pattern {pattern}");
     }
 }
@@ -38,7 +40,9 @@ fn greedy_letters_backtrack_across_mixed_widths() {
     // `a` (1) + `é` (2) + `中` (3) + `𝔸` (4), then a required trailing letter.
     for pattern in [r"(\p{L}+)(\p{L})", r"(\p{L}+)(\p{L})(?=$)"] {
         let re = regex(pattern);
-        let caps = re.captures("aé中𝔸z").expect("matches");
+        let caps = re
+            .captures("aé中𝔸z")
+            .unwrap_or_else(|| panic!("{pattern} must match"));
         assert_eq!(
             caps.get(1).map(|m| m.as_str()),
             Some("aé中𝔸"),
@@ -58,7 +62,9 @@ fn greedy_letters_backtrack_to_the_mandatory_first_character() {
     // `+` must keep at least one character; the rest of the run is given back.
     for pattern in [r"(\p{L}+)(\p{L}+)$", r"(\p{L}+)(\p{L}+)(?=$)"] {
         let re = regex(pattern);
-        let caps = re.captures("中文字").expect("matches");
+        let caps = re
+            .captures("中文字")
+            .unwrap_or_else(|| panic!("{pattern} must match"));
         let (first, second) = (
             caps.get(1).map(|m| m.as_str()).expect("group 1"),
             caps.get(2).map(|m| m.as_str()).expect("group 2"),
@@ -108,7 +114,9 @@ fn greedy_letters_under_a_negative_lookahead() {
 fn greedy_letters_backtrack_over_a_long_multibyte_run() {
     let text: String = "中".repeat(500) + "字";
     for pattern in [r"\p{L}+字", r"\p{L}+字(?=$)"] {
-        let m = regex(pattern).find(&text).expect("matches");
+        let m = regex(pattern)
+            .find(&text)
+            .unwrap_or_else(|| panic!("{pattern} must match"));
         assert_eq!(m.as_str(), text, "pattern {pattern}");
     }
 }
@@ -118,7 +126,9 @@ fn greedy_letters_backtrack_over_a_long_multibyte_run() {
 fn greedy_letters_backtrack_over_astral_characters() {
     let text: String = "𝔹".repeat(50) + "𝔸";
     for pattern in [r"\p{L}+𝔸", r"\p{L}+𝔸(?=$)"] {
-        let m = regex(pattern).find(&text).expect("matches");
+        let m = regex(pattern)
+            .find(&text)
+            .unwrap_or_else(|| panic!("{pattern} must match"));
         assert_eq!(m.as_str(), text, "pattern {pattern}");
     }
 }
