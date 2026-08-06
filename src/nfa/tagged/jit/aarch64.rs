@@ -2102,11 +2102,7 @@ impl TaggedNfaJitCompiler {
         }
         let mut ends = Vec::new();
         for &alt_start in &state.epsilon {
-            if let Some(e) = self.trace_to_merge_depth(alt_start, start, depth) {
-                ends.push(e);
-            } else {
-                return None;
-            }
+            ends.push(self.trace_to_merge_depth(alt_start, start, depth)?);
         }
         if ends.is_empty() {
             return None;
