@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [Unreleased]
+
+### Fixed
+
+- Capture extraction runs on the same linear-time engines as `find`. Backtracking is now reserved for backreferences, bounded by a step budget.
+- Repetition over a body that can match the empty string terminates (`(a*)*`, `(a?)*`, `()+`).
+- Choice-point stack growth in the backtracking JIT is bounded; deep searches continue on the interpreter.
+- `$` matches before a trailing newline in every engine, and `(?m)` line anchors are distinguished from text anchors — including when `(?m)` appears mid-pattern.
+- Matches never start inside a multi-byte codepoint.
+- Negated classes match whole characters rather than single bytes, so `[^a]b` matches `"中b"`.
+- `\b`/`\B` at the start of a search is decided against the following byte rather than assumed.
+
+### Added
+
+- `RegexBuilder::backtrack_limit` and `Regex::try_find` / `try_captures` / `try_is_match`, reporting `ErrorKind::MatchLimitExceeded` instead of "no match" when a backreference search exhausts its budget.
+
 ## [0.1.5] - 2026-08-05
 
 ### Added
