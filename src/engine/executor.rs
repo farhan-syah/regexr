@@ -11,7 +11,7 @@ use crate::hir::Hir;
 use crate::literal::{extract_literals, Prefilter};
 use crate::nfa::tagged::TaggedNfaEngine;
 use crate::nfa::{self, Nfa};
-use crate::vm::backtracking::BudgetExhausted;
+use crate::vm::backtracking::{BudgetExhausted, CaptureSlots};
 use crate::vm::{
     BacktrackingVm, CodepointClassMatcher, PikeVm, PikeVmContext, ShiftOr, ShiftOrWide,
 };
@@ -396,7 +396,7 @@ impl CompiledRegex {
         input: &[u8],
         from: usize,
         limit: u64,
-    ) -> std::result::Result<Option<Vec<Option<(usize, usize)>>>, BudgetExhausted> {
+    ) -> std::result::Result<Option<CaptureSlots>, BudgetExhausted> {
         if from > input.len() {
             return Ok(None);
         }
