@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.2.2] - 2026-08-07
+
+### Fixed
+
+- A malformed escape at the start of a pattern is rejected instead of compiling to the empty pattern, which matched every input. `\e`, `\a`, `\q`, `\x`, `\u{`, `\p{` and a lone `\` all reported success and matched everywhere; only the first token was affected, so the same escape one character later already errored.
+- Inline flag negation works: `(?-i)`, `(?im-sx)` and `(?-x:…)` were rejected as invalid groups because `-` never reached the flag parser.
+- A mid-pattern `(?flags)` applies to what follows it rather than to the whole pattern. The change previously reached only the AST's single global flag set, so `(?i)ab(?-i)CD` matched case-sensitively throughout.
+- An escape that is invalid inside a character class names itself: `[\b]` reported `invalid escape sequence '\?'`.
+
+### Added
+
+- Extended mode (`x`) is implemented. Unescaped ASCII whitespace and `#` comments outside a character class are no longer part of the pattern; previously the flag was accepted and ignored.
+- `\X` matches one extended grapheme cluster, following UAX #29 in full — Hangul syllables, emoji ZWJ sequences, regional-indicator flag pairs and Indic conjuncts included. Checked against the complete Unicode grapheme-break test suite.
+- `\Q…\E` quotes everything between it literally, including metacharacters, extended-mode whitespace and character-class syntax. An unterminated `\Q` runs to the end of the pattern and a stray `\E` is ignored, as in PCRE.
+- `\a` (alert, U+0007) and `\e` (escape, U+001B).
+- `\` followed by any non-alphanumeric ASCII character is that character, matching PCRE, Perl, Java and the `regex` crate. `\ `, `\"`, `\@` and `\#` previously failed to compile.
+
+### Changed
+
+- `escape` also escapes `#` and ASCII whitespace, so its output is safe to splice into an extended-mode pattern.
+- `Parser::new` returns `Result<Self>`, and `Lexer::read_ident` is replaced by the infallible `Lexer::read_ident_rest`. Both are internal parsing types exposed through `regexr::parser`; `Regex` and `RegexBuilder` are unaffected.
+
 ## [0.2.1] - 2026-08-06
 
 ### Fixed
