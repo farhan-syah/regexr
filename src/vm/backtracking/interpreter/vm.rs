@@ -8,7 +8,7 @@ use crate::hir::{CodepointClass, Hir, HirAnchor, HirExpr};
 use crate::nfa::{ByteClass, ByteRange};
 
 use super::super::shared::{
-    decode_utf8, is_word_byte, BudgetExhausted, Op, DEFAULT_BACKTRACK_LIMIT,
+    decode_utf8, is_word_byte, BudgetExhausted, CaptureSlots, Op, DEFAULT_BACKTRACK_LIMIT,
 };
 
 /// A compiled backtracking regex.
@@ -106,7 +106,7 @@ impl BacktrackingVm {
         input: &[u8],
         from: usize,
         limit: u64,
-    ) -> Result<Option<Vec<Option<(usize, usize)>>>, BudgetExhausted> {
+    ) -> Result<Option<CaptureSlots>, BudgetExhausted> {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut slots = vec![-1i32; num_slots];
         let mut budget = limit;

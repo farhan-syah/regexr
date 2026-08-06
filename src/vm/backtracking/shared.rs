@@ -18,6 +18,10 @@
 /// spends one per choice point, which is the quantity that actually explodes.
 pub const DEFAULT_BACKTRACK_LIMIT: u64 = 100_000_000;
 
+/// Spans of every capture group of a match, indexed by group number; index 0 is
+/// the overall match. `None` means the group did not participate.
+pub type CaptureSlots = Vec<Option<(usize, usize)>>;
+
 /// A backtracking search stopped because it ran out of steps.
 ///
 /// Distinct from "no match": the search never finished, so the answer is

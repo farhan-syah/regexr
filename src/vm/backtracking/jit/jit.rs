@@ -6,7 +6,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::hir::Hir;
 
 use super::super::interpreter::BacktrackingVm;
-use super::super::shared::{BudgetExhausted, DEFAULT_BACKTRACK_LIMIT};
+use super::super::shared::{BudgetExhausted, CaptureSlots, DEFAULT_BACKTRACK_LIMIT};
 
 use dynasmrt::ExecutableBuffer;
 
@@ -87,11 +87,7 @@ impl BacktrackingJit {
     /// `Ok(Some(..))`/`Ok(None)` is a finished search; `Err(Retry)` means it ran
     /// out of choice-point stack and the caller must ask the interpreter, and
     /// `Err(Budget)` means the caller's own limit stopped it.
-    fn run(
-        &self,
-        input: &[u8],
-        limit: u64,
-    ) -> std::result::Result<Option<Vec<Option<(usize, usize)>>>, Halt> {
+    fn run(&self, input: &[u8], limit: u64) -> std::result::Result<Option<CaptureSlots>, Halt> {
         let num_slots = (self.capture_count as usize + 1) * 2;
         let mut buf: Vec<i64> = vec![-1; num_slots];
 
@@ -141,7 +137,7 @@ impl BacktrackingJit {
         input: &[u8],
         from: usize,
         limit: u64,
-    ) -> std::result::Result<Option<Vec<Option<(usize, usize)>>>, BudgetExhausted> {
+    ) -> std::result::Result<Option<CaptureSlots>, BudgetExhausted> {
         if from > input.len() {
             return Ok(None);
         }
