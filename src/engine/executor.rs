@@ -713,10 +713,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             // - Patterns with anchors: EagerDfa doesn't handle anchors correctly
             // EagerDfa creates all reachable states upfront, which can be millions
             // for large Unicode classes.
-            if hir.props.has_large_unicode_class
-                || hir.props.has_utf8_class_trie
-                || hir.props.has_anchors
-            {
+            if hir.props.has_large_unicode_class || hir.props.has_anchors {
                 (
                     CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
                     capture_nfa,
@@ -736,10 +733,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             let capture_nfa = Some(nfa.clone());
 
             // Use LazyDfa for patterns with large Unicode classes or anchors
-            if hir.props.has_large_unicode_class
-                || hir.props.has_utf8_class_trie
-                || hir.props.has_anchors
-            {
+            if hir.props.has_large_unicode_class || hir.props.has_anchors {
                 (
                     CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
                     capture_nfa,
@@ -1083,12 +1077,8 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
 
     // 4. Simple patterns with effective prefilter → DFA JIT
     // DFA JIT benefits from prefilter to quickly skip non-matching positions.
-    // A negated class that expanded into UTF-8 sequences is excluded: the
-    // generated code cannot represent those multi-byte transitions and reports
-    // no match. The DFA interpreter below runs them correctly, and at the same
-    // speed as the `regex` crate.
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    if !hir.props.has_utf8_class_trie {
+    {
         let literals = extract_literals(hir);
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;

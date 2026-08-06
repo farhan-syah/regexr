@@ -378,22 +378,49 @@ impl JitCompiler {
         // Step 1: Materialize all reachable DFA states
         let materialized = self.materialize_dfa(dfa)?;
 
-        // A match state gated on `\b`/`\B` is only safe here when it is the
-        // end of the road. The generated code reports one end per start — the
-        // greedy one — and the caller checks the assertion there. If the
-        // automaton can carry on past that match state, a *shorter* end may be
-        // the one that satisfies the boundary: `a+\B` on "aa" has to reject the
-        // greedy end at 2 and report the one at 1, which this design cannot
-        // reach. A terminal match state has no shorter alternative, so `\bfoo\b`
-        // stays on the JIT. Refusing sends the rest to the DFA interpreter,
-        // which carries the assertion inside the automaton.
+        // The generated code reports one end per start — the greedy one — and
+        // checks the assertion there, so a `\b`/`\B`-gated match state is only
+        // safe when no *shorter* end could satisfy what the greedy one fails.
+        //
+        // For `\b` that holds when the state was reached by consuming a word
+        // byte and can only continue on word bytes: then `\b` holds exactly
+        // where the next byte is a non-word one, which is exactly where the
+        // automaton has no transition and stops — so any end satisfying `\b`
+        // *is* the greedy end. `\w+\b` and `\b(?:\d{1,3}\.){3}\d{1,3}\b`
+        // qualify; `[a-z ]+\b` does not, because it can carry on across the
+        // space that makes the boundary true.
+        //
+        // `\B` never qualifies: it holds *inside* a run and fails at the end of
+        // one, so the greedy end is the one candidate guaranteed to be wrong
+        // (`a+\B` on "aa" must report 0..1).
         if materialized.states.iter().any(|s| {
-            s.is_match
-                && (s.needs_word_boundary || s.needs_not_word_boundary)
-                && s.transitions.iter().any(|t| t.is_some())
+            if !s.is_match || !(s.needs_word_boundary || s.needs_not_word_boundary) {
+                return false;
+            }
+            // Nothing follows, so the greedy end is the only end there is.
+            if !s.transitions.iter().any(|t| t.is_some()) {
+                return false;
+            }
+            // `\B` holds inside a run and fails at the end of one, so once the
+            // run can continue, the greedy end is the candidate guaranteed to be
+            // wrong: `a+\B` on "aa" has to report 0..1.
+            if s.needs_not_word_boundary {
+                return true;
+            }
+            // `\b` is safe when this state was reached on a word byte and can
+            // only continue on word bytes: then `\b` holds exactly where the
+            // next byte is non-word, which is exactly where the automaton has no
+            // transition and stops — so any end satisfying it *is* the greedy
+            // end. `\w+\b` and `\b(?:\d{1,3}\.){3}\d{1,3}\b` qualify;
+            // `[a-z ]+\b` does not, since it carries on across the space that
+            // makes the boundary true.
+            s.prev_class != CharClass::Word
+                || s.transitions.iter().enumerate().any(|(byte, target)| {
+                    target.is_some() && !crate::hir::unicode::is_word_byte(byte as u8)
+                })
         }) {
             return Err(Error::new(
-                ErrorKind::Jit("word-boundary match state with a continuation".to_string()),
+                ErrorKind::Jit("word-boundary match state a shorter end could satisfy".to_string()),
                 "",
             ));
         }
@@ -505,6 +532,7 @@ impl JitCompiler {
                 needs_not_word_boundary,
                 needs_end_of_text,
                 needs_end_of_line,
+                prev_class: dfa.get_state_prev_class(state_id),
             });
         }
 
@@ -562,6 +590,8 @@ pub struct MaterializedState {
     pub needs_end_of_text: bool,
     /// Whether this state requires EndOfLine ($) assertion (multiline).
     pub needs_end_of_line: bool,
+    /// Character class of the byte consumed to reach this state.
+    pub prev_class: CharClass,
 }
 
 impl MaterializedState {
@@ -688,6 +718,7 @@ mod tests {
             needs_not_word_boundary: false,
             needs_end_of_text: false,
             needs_end_of_line: false,
+            prev_class: CharClass::NonWord,
         };
 
         // Set up some transitions

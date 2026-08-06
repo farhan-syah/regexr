@@ -651,11 +651,6 @@ impl HirTranslator {
                 alternatives.push(HirExpr::Class(HirClass::new(surviving_ascii, false)));
             }
             if !non_ascii.is_empty() {
-                // Keeps this off the DFA JIT, which cannot represent multi-byte
-                // transitions; the DFA interpreter runs them correctly and at
-                // the same speed, so this must not imply the tagged-NFA route
-                // that `has_large_unicode_class` carries.
-                self.props.has_utf8_class_trie = true;
                 alternatives.push(self.build_utf8_trie(&non_ascii));
             }
             return match alternatives.len() {
