@@ -246,26 +246,33 @@ impl TaggedNfa {
                     } else {
                         return None;
                     }
-                    // Track character boundaries for backtracking
-                    let mut boundaries = vec![pos]; // After first match
-                                                    // Match as many as possible
+                    // The first codepoint is mandatory, so it is also the
+                    // shortest the run may backtrack to.
+                    let min_pos = pos;
+                    // Match as many as possible
                     while let Some((cp, len)) = Self::decode_utf8(input, pos) {
                         if !cpclass.contains(cp) {
                             break;
                         }
                         pos += len;
-                        boundaries.push(pos);
                     }
                     // Try to match remaining steps, backtracking if needed
                     let remaining_steps = &steps[step_idx + 1..];
                     if !remaining_steps.is_empty() {
-                        // Backtrack from longest match to shortest
-                        for &boundary in boundaries.iter().rev() {
+                        // Backtrack from longest match to shortest, walking the
+                        // run's codepoint boundaries backwards rather than
+                        // recording them on the way in — see
+                        // [`TaggedNfa::prev_boundary`].
+                        let mut boundary = pos;
+                        loop {
                             if let Some(end) = Self::match_steps(remaining_steps, input, boundary) {
                                 return Some(end);
                             }
+                            if boundary <= min_pos {
+                                return None;
+                            }
+                            boundary = Self::prev_boundary(input, boundary);
                         }
-                        return None;
                     }
                 }
                 PatternStep::Alt(alternatives) => {
@@ -460,24 +467,22 @@ impl TaggedNfa {
                         }
                         end += len2;
                     }
-                    // Backtrack from longest match to shortest (at least 1)
-                    // Track UTF-8 character boundaries
-                    let mut boundaries: Vec<usize> = vec![pos + len];
-                    let mut p = pos + len;
-                    while let Some((cp2, len2)) = Self::decode_utf8(input, p) {
-                        if !cpclass.contains(cp2) || p >= end {
-                            break;
-                        }
-                        boundaries.push(p + len2);
-                        p += len2;
-                    }
-                    // Backtrack
-                    for &boundary in boundaries.iter().rev() {
+                    // Backtrack from longest match to shortest (at least 1),
+                    // walking the run's codepoint boundaries backwards rather
+                    // than recording them on the way in — see
+                    // [`TaggedNfa::prev_boundary`]. The first codepoint is
+                    // mandatory, so `pos + len` is the shortest run allowed.
+                    let min_pos = pos + len;
+                    let mut boundary = end;
+                    loop {
                         if Self::check_lookahead_recursive(rest, input, boundary) {
                             return true;
                         }
+                        if boundary <= min_pos {
+                            return false;
+                        }
+                        boundary = Self::prev_boundary(input, boundary);
                     }
-                    false
                 } else {
                     false
                 }
@@ -553,6 +558,31 @@ impl TaggedNfa {
     #[inline]
     fn is_word_char(b: u8) -> bool {
         matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+    }
+
+    /// The start of the UTF-8 codepoint that ends at `end`.
+    ///
+    /// Lets a greedy codepoint run backtrack without recording where it has
+    /// been. UTF-8 is self-synchronizing — a continuation byte is `10xxxxxx`
+    /// and a leading byte never is — so the previous boundary is found by
+    /// stepping back over continuation bytes, in O(1) for the ≤4 bytes a
+    /// codepoint can occupy.
+    ///
+    /// This replaced a `Vec` of boundaries collected on the way in, which grew
+    /// by doubling with the length of the run: matching `\p{L}+` against a
+    /// 400-character word cost nine reallocations, on every call, for a
+    /// quantifier that in the common case never backtracks at all.
+    ///
+    /// `end` must be a codepoint boundary strictly inside `input` (every call
+    /// site derives it from a decoded codepoint, and only steps back while it
+    /// is above the run's mandatory first codepoint).
+    #[inline]
+    fn prev_boundary(input: &[u8], end: usize) -> usize {
+        let mut i = end - 1;
+        while i > 0 && (input[i] & 0xC0) == 0x80 {
+            i -= 1;
+        }
+        i
     }
 
     /// Decodes one UTF-8 codepoint from input at the given position.
