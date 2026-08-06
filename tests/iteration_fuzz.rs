@@ -83,6 +83,22 @@ const FRAGMENTS: &[&str] = &[
     "(a{0,2})*",
     "(a*)*b",
     "(a*?)*",
+    // Mid-pattern flag changes wrap the rest of the branch in a scoped group,
+    // so the AST shape here differs from the same pattern with the flag set up
+    // front. Every engine must still agree with the spec.
+    "a(?i)b",
+    "(?i)a(?-i)b",
+    "(?i:a)b",
+    "(?i)a|b",
+    // Extended mode removes tokens before the parser sees them; the resulting
+    // pattern must behave exactly like the whitespace-free spelling.
+    "(?x) a b",
+    "(?x)a#c\nb",
+    "(?x)[a b]",
+    // Escapes that resolve to a plain character, including inside a class.
+    "\\ a",
+    "\\@|a",
+    "[\\e\\a]",
 ];
 
 const PREFIXES: &[&str] = &["", "^", "\\A", "(?m)^", "\\b", "\\B", "(?i)"];
@@ -90,7 +106,8 @@ const SUFFIXES: &[&str] = &["", "$", "\\z", "\\b", "\\B", "(?m)$"];
 
 const TEXTS: &[&str] = &[
     "", "a", "aa", "ab", "ba", "abab", "aabb", "a b", " ab ", "a\na", "a\nb\na", "cab", "xaby",
-    "aaa\n", "b", "bb", "abc abc", "héllo", "中a中", "AaBb", "\n", "  ", "abababab",
+    "aaa\n", "b", "bb", "abc abc", "héllo", "中a中", "AaBb", "\n", "  ", "abababab", "a@b",
+    "a\u{1b}b", "a\u{07}b", "a#c\nb",
 ];
 
 #[test]

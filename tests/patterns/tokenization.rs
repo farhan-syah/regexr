@@ -538,11 +538,19 @@ fn test_combining_marks() {
 
 #[test]
 fn test_grapheme_clusters() {
-    let re = regex(r"\X");
+    // regexr has no `\X` grapheme-cluster escape; a base character followed by
+    // its combining marks is spelled out instead.
+    let re = regex(r"\P{M}\p{M}*");
 
-    // Should match grapheme clusters
-    assert!(re.is_match("é")); // e + combining acute
-    assert!(re.is_match("ñ")); // n + combining tilde
+    assert_eq!(re.find("e\u{301}").map(|m| m.as_str()), Some("e\u{301}")); // e + combining acute
+    assert_eq!(re.find("n\u{303}").map(|m| m.as_str()), Some("n\u{303}")); // n + combining tilde
+}
+
+#[test]
+fn test_grapheme_cluster_escape_is_unsupported() {
+    // `\X` is a PCRE/Perl extension regexr does not implement. It must be
+    // rejected rather than quietly compiling to something else.
+    assert!(regexr::Regex::new(r"\X").is_err());
 }
 
 #[test]

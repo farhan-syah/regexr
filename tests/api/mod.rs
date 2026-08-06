@@ -688,8 +688,22 @@ mod escape_fn {
     fn test_escape_does_not_over_escape_safe_characters() {
         // Characters that are already safe unescaped should pass through
         // byte-for-byte, so escape() output stays minimal and readable.
-        for s in ["-", ":", "<", ">", "=", "!", ",", "#", "&", "~", "/", "0"] {
+        for s in ["-", ":", "<", ">", "=", "!", ",", "&", "~", "/", "0"] {
             assert_eq!(escape(s), s);
+        }
+    }
+
+    #[test]
+    fn test_escape_output_survives_extended_mode() {
+        // Extended mode strips unescaped whitespace and `#` comments, so
+        // escaped text spliced into an `(?x)` pattern must keep them.
+        for s in ["a b", "a#b", "a # not a comment\nb", "a\tb"] {
+            let re = Regex::new(&format!("(?x){}", escape(s)))
+                .unwrap_or_else(|e| panic!("escape({s:?}) failed to compile under (?x): {e}"));
+            let m = re
+                .find(s)
+                .unwrap_or_else(|| panic!("escape({s:?}) did not match under (?x)"));
+            assert_eq!(m.as_str(), s);
         }
     }
 }

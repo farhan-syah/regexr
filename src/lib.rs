@@ -166,21 +166,19 @@ impl RegexBuilder {
 ///
 /// # Which characters are escaped
 ///
-/// Escaping covers exactly the characters regexr's parser treats specially
-/// at the top level (outside a character class): `\ . * + ? | ^ $ ( ) [ ] { }`.
-/// Every other character - including `-`, `:`, `<`, `>`, `=`, `!`, `,`, `#`,
-/// `&`, `~`, digits, whitespace, and non-ASCII text - already parses as a
-/// literal on its own and is passed through unchanged.
+/// Escaping covers the characters regexr's parser treats specially at the top
+/// level (outside a character class) - `\ . * + ? | ^ $ ( ) [ ] { }` - plus
+/// `#` and ASCII whitespace, which extended (`x`) mode strips. Every
+/// other character - including `-`, `:`, `<`, `>`, `=`, `!`, `,`, `&`, `~`,
+/// digits, and non-ASCII text - already parses as a literal on its own and is
+/// passed through unchanged.
 ///
-/// Note this differs from `regex::escape`, which also escapes `#`, `&`, `~`,
-/// and `-` defensively (they can matter inside a character class, or under
-/// verbose/extended mode in other engines). regexr does not treat `#`/`&`/`~`
-/// specially anywhere, and the `-` is only special inside `[...]`; since the
-/// output of this function is never itself an unescaped `[...]`, none of
-/// those characters need escaping here. The result of `escape` is therefore
-/// only guaranteed to be safe when used as a standalone pattern (or
-/// concatenated with other *escaped* text) - not when spliced directly
-/// inside a hand-written character class.
+/// This differs from `regex::escape` only in leaving `&`, `~` and `-` alone:
+/// those matter inside a character class in engines with class-set operators,
+/// and regexr has none. The result of `escape` is therefore safe as a
+/// standalone pattern, concatenated with other *escaped* text, or spliced into
+/// an extended-mode pattern - but not when spliced directly inside a
+/// hand-written character class.
 ///
 /// # Example
 ///
@@ -196,13 +194,25 @@ impl RegexBuilder {
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(
-            c,
+        match c {
+            // Line-oriented whitespace gets its symbolic escape so the output
+            // stays readable when logged or embedded in source.
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
             '\\' | '.' | '*' | '+' | '?' | '|' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}'
-        ) {
-            out.push('\\');
+            // `#` starts a comment and whitespace separates nothing under
+            // extended mode, so both must survive being spliced into `(?x)`.
+            | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_ascii_whitespace() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
         }
-        out.push(c);
     }
     out
 }
@@ -660,8 +670,12 @@ mod tests {
     #[test]
     fn test_escape_shape() {
         assert_eq!(escape(r"\.*+?|^$(){}[]"), r"\\\.\*\+\?\|\^\$\(\)\{\}\[\]");
-        assert_eq!(escape("plain text"), "plain text");
+        assert_eq!(escape("plain"), "plain");
         assert_eq!(escape(""), "");
+        // Extended mode would otherwise drop these.
+        assert_eq!(escape("plain text"), r"plain\ text");
+        assert_eq!(escape("a#b"), r"a\#b");
+        assert_eq!(escape("a\nb"), r"a\nb");
     }
 
     /// `ceil_char_boundary` is the resume-position rule for `Matches` /

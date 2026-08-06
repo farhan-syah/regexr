@@ -55,6 +55,9 @@ pub enum ErrorKind {
     UnmatchedCloseBracket,
     /// Invalid escape sequence.
     InvalidEscape(char),
+    /// An escape that is valid in a pattern but meaningless inside a character
+    /// class, such as the anchor `\b`. Carries the escape as written.
+    EscapeNotAllowedInClass(String),
     /// Invalid hex escape.
     InvalidHexEscape,
     /// Invalid unicode escape.
@@ -174,6 +177,9 @@ impl fmt::Display for ErrorKind {
             ErrorKind::UnmatchedOpenBracket => write!(f, "unmatched '['"),
             ErrorKind::UnmatchedCloseBracket => write!(f, "unmatched ']'"),
             ErrorKind::InvalidEscape(c) => write!(f, "invalid escape sequence '\\{}'", c),
+            ErrorKind::EscapeNotAllowedInClass(esc) => {
+                write!(f, "escape '{}' is not allowed in a character class", esc)
+            }
             ErrorKind::InvalidHexEscape => write!(f, "invalid hex escape sequence"),
             ErrorKind::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
             ErrorKind::InvalidUnicodeProperty => write!(f, "invalid unicode property syntax"),

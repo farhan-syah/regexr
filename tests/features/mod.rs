@@ -4,7 +4,10 @@
 //! - Backreferences
 //! - Case-insensitive matching
 //! - Lookahead and lookbehind assertions
+//! - Character escapes
+//! - Extended (`x`) mode
 //! - Named captures
+//! - Rejection of malformed patterns
 //! - Syntax validation
 
 use regexr::Regex;
@@ -29,7 +32,11 @@ pub fn regex(pattern: &str) -> Regex {
 
 mod backreference;
 mod case_insensitive;
+mod escape_sequences;
+mod extended_mode;
+mod inline_flags;
 mod lookaround;
 mod named_capture;
+mod pattern_rejection;
 mod syntax;
 mod word_boundary;

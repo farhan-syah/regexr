@@ -13,6 +13,22 @@ let re = Regex::new("hello").unwrap();
 assert!(re.is_match("hello world"));
 ```
 
+### Character Escapes
+
+- `\n` `\r` `\t` `\f` `\v` - newline, carriage return, tab, form feed, vertical tab
+- `\a` - alert/bell (U+0007)
+- `\e` - escape (U+001B)
+- `\0` - null (U+0000)
+- `\xHH` - hex escape, e.g. `\x41`
+- `\uHHHH` / `\u{H...}` - Unicode escape, e.g. `\u{1F600}`
+- `\` followed by any non-alphanumeric ASCII character - that character
+  literally, e.g. `\.`, `\ `, `\#`, `\"`
+
+Escaping an ASCII letter that has no assigned meaning (`\j`, `\X`, `\Q`, …) is
+an error rather than a literal, so that assigning a meaning to it later cannot
+silently change what a pattern matches. Non-ASCII characters never need
+escaping and cannot be escaped.
+
 ### Character Classes
 
 #### Basic Classes
@@ -237,6 +253,42 @@ assert!(re.is_match("HELLO"));
 assert!(re.is_match("Hello"));
 assert!(re.is_match("café")); // Unicode case folding
 ```
+
+## Inline Flags
+
+- `i` - case-insensitive
+- `m` - multi-line: `^` and `$` match at line boundaries
+- `s` - dot-all: `.` matches newlines
+- `u` - full Unicode matching
+- `x` - extended: unescaped ASCII whitespace and `#` comments are not part of
+  the pattern
+
+`(?flags)` applies to everything after it; `(?flags:...)` applies only inside
+the group. A leading `-` negates every flag after it.
+
+```rust
+let re = Regex::new(r"(?i)ab(?-i)CD").unwrap();
+assert!(re.is_match("ABCD"));
+assert!(!re.is_match("abcd"));
+```
+
+Extended mode makes long patterns readable. Whitespace stays literal inside a
+character class, and `\ ` / `\#` keep a space or a `#` in the pattern:
+
+```rust
+let re = Regex::new(
+    r"(?x)
+    ^ (\d{4})   # year
+      - (\d{2}) # month
+      - (\d{2}) # day
+    $",
+)
+.unwrap();
+assert!(re.is_match("2026-08-07"));
+```
+
+Use [`escape`](https://docs.rs/regexr/latest/regexr/fn.escape.html) when
+splicing literal text into a pattern; its output is safe under extended mode.
 
 ## JIT Compilation
 
