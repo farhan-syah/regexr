@@ -108,6 +108,12 @@ fn resumed_iteration_matches_reference() {
     // "anchored at 0" gets these wrong.
     for p in [
         "^a|b", "a|^b", "(?m)^a|b", "\\ba|b", "^a$|b", "^a|b$", "\\Aa|b",
+        // Disjoint first bytes, but one branch carries an anchor. These must
+        // keep the ordered engine: the anchor is a condition the DFA family
+        // resolves for the pattern as a whole, so "only one branch can match
+        // here" is not on its own enough to decide the match (`a|b$` on "aa"
+        // reports only 1..2 without it).
+        "a|b$", "a$|b", "a|b\\b", "a\\b|b",
     ] {
         patterns.push(p.to_string());
     }

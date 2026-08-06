@@ -42,8 +42,9 @@ pub struct CompiledRegex {
     /// Whether this regex has an end anchor ($).
     #[allow(dead_code)]
     pub(crate) has_end_anchor: bool,
-    /// Whether this regex uses multiline mode for anchors.
-    pub(crate) has_multiline_anchors: bool,
+    /// Whether the *start* anchor specifically is line-mode. `^a(?m)$` has a
+    /// line-mode `$` but a plain `^`, so only position 0 is a valid start.
+    pub(crate) has_multiline_start_anchor: bool,
     /// Whether any match state requires EndOfText assertion.
     pub(crate) match_needs_end_of_text: bool,
     /// Whether any match state requires EndOfLine assertion.
@@ -176,7 +177,7 @@ impl CompiledRegex {
         }
 
         if self.has_start_anchor {
-            if self.has_multiline_anchors {
+            if self.has_multiline_start_anchor {
                 if start_from == 0 {
                     if let Some((start, end)) = self.find_at(input, 0) {
                         return Some((start, end));
@@ -276,7 +277,7 @@ impl CompiledRegex {
         }
 
         if self.has_start_anchor {
-            let valid_start = if self.has_multiline_anchors {
+            let valid_start = if self.has_multiline_start_anchor {
                 start_pos == 0 || (start_pos > 0 && input[start_pos - 1] == b'\n')
             } else {
                 start_pos == 0
@@ -372,7 +373,7 @@ impl JitCompiler {
             has_anchors: materialized.has_anchors,
             has_start_anchor: materialized.has_start_anchor,
             has_end_anchor: materialized.has_end_anchor,
-            has_multiline_anchors: materialized.has_multiline_anchors,
+            has_multiline_start_anchor: materialized.has_multiline_start_anchor,
             match_needs_end_of_text,
             match_needs_end_of_line,
         })
@@ -385,6 +386,7 @@ impl JitCompiler {
         let has_start_anchor = dfa.has_start_anchor();
         let has_end_anchor = dfa.has_end_anchor();
         let has_multiline_anchors = dfa.has_multiline_anchors();
+        let has_multiline_start_anchor = dfa.has_multiline_start_anchor();
 
         let start_nonword = dfa.get_start_state_for_class(CharClass::NonWord);
         let start_word = if has_word_boundary {
@@ -402,6 +404,7 @@ impl JitCompiler {
             has_start_anchor,
             has_end_anchor,
             has_multiline_anchors,
+            has_multiline_start_anchor,
         };
 
         let mut queue = vec![start_nonword];
@@ -472,6 +475,8 @@ pub struct MaterializedDfa {
     pub has_end_anchor: bool,
     /// Whether this DFA uses multiline mode for anchors.
     pub has_multiline_anchors: bool,
+    /// Whether the *start* anchor specifically is line-mode.
+    pub has_multiline_start_anchor: bool,
 }
 
 /// A materialized DFA state with all transitions computed.

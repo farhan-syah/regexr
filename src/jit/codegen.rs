@@ -43,8 +43,6 @@ pub struct CompiledRegex {
     /// Note: Currently used only in tests, but kept for API consistency.
     #[allow(dead_code)]
     pub(crate) has_end_anchor: bool,
-    /// Whether this regex uses multiline mode for anchors.
-    pub(crate) has_multiline_anchors: bool,
     /// Whether the *start* anchor specifically is line-mode. `^a(?m)$` has a
     /// line-mode `$` but a plain `^`, so only position 0 is a valid start.
     pub(crate) has_multiline_start_anchor: bool,
@@ -428,7 +426,6 @@ impl JitCompiler {
             has_anchors: materialized.has_anchors,
             has_start_anchor: materialized.has_start_anchor,
             has_end_anchor: materialized.has_end_anchor,
-            has_multiline_anchors: materialized.has_multiline_anchors,
             has_multiline_start_anchor: materialized.has_multiline_start_anchor,
             match_needs_end_of_text,
             match_needs_end_of_line,
@@ -839,7 +836,7 @@ mod tests {
         let compiled = compile_pattern("(?m)^hello").unwrap();
         assert!(compiled.has_anchors);
         assert!(compiled.has_start_anchor);
-        assert!(compiled.has_multiline_anchors);
+        assert!(compiled.has_multiline_start_anchor);
 
         // Should match at start and after newlines
         assert!(compiled.is_match(b"hello world"));
