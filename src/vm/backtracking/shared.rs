@@ -13,9 +13,10 @@
 /// reported through [`crate::error::ErrorKind::MatchLimitExceeded`] rather than
 /// being quietly answered "no match".
 ///
-/// The value bounds the worst case at a few hundred milliseconds. The
-/// interpreter spends one unit per bytecode instruction; the generated code
-/// spends one per choice point, which is the quantity that actually explodes.
+/// The value bounds the worst case at a few hundred milliseconds. A unit is one
+/// choice point — the quantity that actually explodes — in both the interpreter
+/// and the generated code; the forward scanning between two choice points is
+/// already bounded by the input and the program.
 pub const DEFAULT_BACKTRACK_LIMIT: u64 = 100_000_000;
 
 /// Spans of every capture group of a match, indexed by group number; index 0 is
