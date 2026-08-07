@@ -2,7 +2,7 @@
 //!
 //! Translates the AST into a byte-oriented representation suitable for NFA construction.
 
-mod builder;
+pub mod builder;
 mod grapheme;
 mod prefix_opt;
 pub mod unicode;
@@ -295,10 +295,18 @@ pub enum HirLookaroundKind {
     NegativeLookbehind,
 }
 
-/// Translates an AST to HIR.
+/// Translates an AST to HIR, under the default expansion limit.
 pub fn translate(ast: &Ast) -> Result<Hir> {
+    translate_with_limit(ast, builder::DEFAULT_EXPANDED_SIZE)
+}
+
+/// [`translate`] under a caller-chosen ceiling on the expanded pattern.
+///
+/// See [`crate::RegexBuilder::size_limit`] for what the number means and when
+/// raising it is the right call.
+pub fn translate_with_limit(ast: &Ast, limit: u32) -> Result<Hir> {
     let mut translator = HirTranslator::new();
-    translator.translate(ast)
+    translator.translate_with_limit(ast, limit)
 }
 
 /// Whether an expression can match the empty string.

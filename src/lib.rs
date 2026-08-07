@@ -47,6 +47,8 @@ pub struct RegexBuilder {
     optimize_prefixes: bool,
     /// Steps a backreference search may take; see [`RegexBuilder::backtrack_limit`].
     backtrack_limit: u64,
+    /// Elements the pattern may expand to; see [`RegexBuilder::size_limit`].
+    size_limit: u32,
 }
 
 impl RegexBuilder {
@@ -57,7 +59,42 @@ impl RegexBuilder {
             jit: false,
             optimize_prefixes: false,
             backtrack_limit: vm::backtracking::DEFAULT_BACKTRACK_LIMIT,
+            size_limit: hir::builder::DEFAULT_EXPANDED_SIZE,
         }
+    }
+
+    /// Sets how large a pattern may expand to before it is refused.
+    ///
+    /// Every engine here compiles `{n,m}` by emitting the subexpression `m`
+    /// times, so what a pattern costs to build is its *expanded* size, not its
+    /// text length: `\w{200000,}` is eleven characters and minutes of work.
+    /// Anything compiling a pattern it did not write needs that bounded, so the
+    /// default refuses a pattern past [`hir::builder::DEFAULT_EXPANDED_SIZE`]
+    /// elements — roughly a tenth of a second of compilation.
+    ///
+    /// Raise it when you own the pattern and the cost is acceptable. The error
+    /// reports the size the pattern reached, so it also tells you what to raise
+    /// it to.
+    ///
+    /// The count is taken *after* classes are lowered, which is worth knowing
+    /// for a pattern that looks small: a large Unicode property compiles to a
+    /// single node, but a small multi-byte class becomes a UTF-8 trie of up to
+    /// 64 branches, and a bounded repetition multiplies that.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regexr::RegexBuilder;
+    ///
+    /// assert!(RegexBuilder::new(r"a{50000}").build().is_err());
+    /// assert!(RegexBuilder::new(r"a{50000}")
+    ///     .size_limit(100_000)
+    ///     .build()
+    ///     .is_ok());
+    /// ```
+    pub fn size_limit(mut self, limit: u32) -> Self {
+        self.size_limit = limit;
+        self
     }
 
     /// Sets how many steps a backreference search may take before giving up.
@@ -131,7 +168,7 @@ impl RegexBuilder {
     /// Builds the regex with the configured options.
     pub fn build(self) -> Result<Regex> {
         let ast = parser::parse(&self.pattern)?;
-        let mut hir_result = hir::translate(&ast)?;
+        let mut hir_result = hir::translate_with_limit(&ast, self.size_limit)?;
 
         // Apply prefix optimization if enabled
         if self.optimize_prefixes {

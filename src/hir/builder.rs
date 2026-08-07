@@ -73,6 +73,11 @@ impl HirTranslator {
 
     /// Translates an AST to HIR.
     pub fn translate(&mut self, ast: &Ast) -> Result<Hir> {
+        self.translate_with_limit(ast, DEFAULT_EXPANDED_SIZE)
+    }
+
+    /// [`Self::translate`] under a caller-chosen expansion ceiling.
+    pub fn translate_with_limit(&mut self, ast: &Ast, limit: u32) -> Result<Hir> {
         self.flags = ast.flags;
         let expr = self.translate_expr(&ast.expr)?;
 
@@ -99,14 +104,12 @@ impl HirTranslator {
         }
 
         let size = expanded_size(&expr);
-        if size > MAX_EXPANDED_SIZE {
+        if size > limit {
             return Err(Error::new(
-                ErrorKind::ExpansionTooLarge {
-                    size,
-                    limit: MAX_EXPANDED_SIZE,
-                },
+                ErrorKind::ExpansionTooLarge { size, limit },
                 format!(
-                    "the pattern expands to {size} elements, past the limit of {MAX_EXPANDED_SIZE}"
+                    "the pattern expands to {size} elements, past the limit of {limit}; \
+                     raise it with RegexBuilder::size_limit if the cost is acceptable"
                 ),
             ));
         }
@@ -1223,8 +1226,9 @@ fn complement_within_ascii(excluded: &[(u8, u8)]) -> Vec<(u8, u8)> {
 /// Calibrated against compile time, which runs at roughly 14 us per element:
 /// this bounds `Regex::new` at about 150 ms for the worst pattern it accepts.
 /// It is far more permissive than the `regex` crate, whose default size limit
-/// refuses `\w{1000}` outright.
-const MAX_EXPANDED_SIZE: u32 = 10_000;
+/// refuses `\w{1000}` outright. A caller who knows their own workload can raise
+/// it with [`crate::RegexBuilder::size_limit`].
+pub const DEFAULT_EXPANDED_SIZE: u32 = 10_000;
 
 /// How many elements the engines will emit for this expression.
 ///

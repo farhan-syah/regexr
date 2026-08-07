@@ -70,6 +70,35 @@ fn ordinary_repetitions_still_compile() {
     }
 }
 
+/// The ceiling is the caller's to raise.
+///
+/// A default that cannot be overridden decides for every user of the crate that
+/// their pattern is not worth the compile time, which is not the library's call
+/// to make permanently — `backtrack_limit` is the same bargain. The error names
+/// the size the pattern reached, so it also says what to raise the limit to.
+#[test]
+fn the_expansion_limit_can_be_raised() {
+    let pattern = r"a{50000}";
+    assert!(
+        regexr::Regex::new(pattern).is_err(),
+        "{pattern} is past the default"
+    );
+
+    let raised = regexr::RegexBuilder::new(pattern)
+        .size_limit(100_000)
+        .build()
+        .expect("a caller who owns the pattern may pay for it");
+    assert!(raised.is_match(&"a".repeat(50_000)));
+    assert!(!raised.is_match(&"a".repeat(49_999)));
+
+    // Lowering it works the same way, so a caller taking untrusted patterns can
+    // be stricter than the default rather than only more permissive.
+    assert!(regexr::RegexBuilder::new(r"(?:ab){100}")
+        .size_limit(10)
+        .build()
+        .is_err());
+}
+
 /// Whatever the ceiling admits must compile in a time a caller can absorb.
 ///
 /// This is the property the number was chosen for; the number itself is free to
