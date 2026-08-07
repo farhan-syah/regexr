@@ -272,12 +272,10 @@ impl Regex {
 
     /// Returns an iterator over all non-overlapping matches.
     ///
-    /// `.` and character classes match one whole codepoint, so their spans
-    /// cover complete characters. The remaining byte-level constructs are the
-    /// ASCII-mode negated Perl classes (`\W`, `\D`, `\S` without `(?u)`), whose
-    /// span can still be a single byte inside a multi-byte codepoint. The search
-    /// always resumes at the next codepoint boundary, so no match starts inside
-    /// a codepoint (see `nfa::is_utf8_boundary`).
+    /// `.`, character classes, and the Perl shorthand classes (including the
+    /// ASCII-mode negated forms `\W`, `\D`) all match whole codepoints, so
+    /// every span covers complete characters — no match can start or end
+    /// inside one.
     pub fn find_iter<'a>(&'a self, text: &'a str) -> Matches<'a> {
         Matches::new(self, text)
     }
@@ -351,10 +349,9 @@ impl Regex {
         match self.find(text) {
             None => std::borrow::Cow::Borrowed(text),
             Some(m) => {
-                // Assembled as bytes: `.` and character classes match whole
-                // codepoints, but an ASCII-mode negated Perl class (`\W`, `\D`,
-                // `\S` without `(?u)`) is still byte-level and can split a
-                // codepoint, leaving pieces that are not valid `&str` slices.
+                // Assembled as bytes for simplicity; every match span covers
+                // whole codepoints (see `Match::as_str`), so this is always
+                // valid UTF-8.
                 let bytes = text.as_bytes();
                 let mut result = Vec::with_capacity(text.len() + rep.len());
                 result.extend_from_slice(&bytes[..m.start()]);
@@ -415,19 +412,20 @@ impl<'t> Match<'t> {
 
     /// Returns the matched text.
     ///
-    /// `.` and character classes match one whole codepoint, so their spans are
-    /// always valid `&str` slices. The ASCII-mode negated Perl classes (`\W`,
-    /// `\D`, `\S` without `(?u)`) remain byte-level and can still split a
-    /// multi-byte codepoint; for such a span this returns `""`, while
-    /// [`Match::as_bytes`] always returns the exact span.
+    /// Every match-producing construct — `.`, character classes, and the
+    /// Perl shorthand classes including the ASCII-mode negated forms `\W`
+    /// and `\D` — consumes a whole codepoint, so a match span is always a
+    /// valid `&str` slice; this is total, never `""` for a non-empty span.
+    /// (`.get` is still used defensively rather than an indexing panic.)
     pub fn as_str(&self) -> &'t str {
         self.text.get(self.start..self.end).unwrap_or("")
     }
 
     /// Returns the matched bytes.
     ///
-    /// Unlike [`Match::as_str`] this is always the exact span the engine
-    /// matched, even when that span splits a multi-byte codepoint.
+    /// Byte-identical to slicing [`Match::as_str`]'s underlying text at
+    /// [`Match::range`]; provided for callers that want raw bytes without
+    /// the `&str` conversion.
     pub fn as_bytes(&self) -> &'t [u8] {
         self.text
             .as_bytes()
@@ -465,11 +463,10 @@ fn ceil_char_boundary(text: &str, i: usize) -> usize {
 }
 
 /// Converts assembled replacement output into a `String`, substituting U+FFFD
-/// for any invalid UTF-8. The output is only ever invalid when a byte-level
-/// match split a multi-byte codepoint, leaving orphaned continuation bytes that
-/// have no `str` representation. `.` and character classes match whole
-/// codepoints and so never cause this; the ASCII-mode negated Perl classes
-/// (`\W`, `\D`, `\S` without `(?u)`) still can.
+/// for any invalid UTF-8. Every match span covers whole codepoints (see
+/// `Match::as_str`), and the surrounding bytes are unmodified slices of the
+/// original `&str`, so this never actually falls back to the lossy path
+/// today; it is kept as a defensive guard rather than an unwrap.
 fn into_string_lossy(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
         Ok(s) => s,
@@ -534,18 +531,16 @@ impl<'a> Iterator for Matches<'a> {
                 // The search is resumed at an offset into the *original* text
                 // rather than run on a slice starting there, so `^`, `\b`/`\B` and
                 // lookbehind still see the real text to the left of the resume
-                // point. The offset is a byte offset and need not be a valid
-                // `&str` boundary: `.` and character classes end on codepoint
-                // boundaries, but an ASCII-mode negated Perl class (`\W`, `\D`,
-                // `\S` without `(?u)`) matches a single byte and can end inside
-                // a multi-byte codepoint.
+                // point.
                 match regex.inner.find_from(self.text.as_bytes(), *last_end) {
                     None => None,
                     Some((abs_start, abs_end)) => {
-                        // Resume at the next UTF-8 character boundary, so no match ever
-                        // starts inside a multi-byte codepoint (the engine-wide rule,
-                        // see `nfa::is_utf8_boundary`). For empty matches, step one byte
-                        // first so the iterator always makes forward progress.
+                        // Every match already ends on a codepoint boundary (the
+                        // engine-wide rule, see `nfa::is_utf8_boundary`), so
+                        // `ceil_char_boundary` is a no-op here in practice; it is
+                        // kept as a defensive snap-forward rather than relying on
+                        // that invariant unchecked. For empty matches, step one
+                        // byte first so the iterator always makes forward progress.
                         *last_end = if abs_start == abs_end {
                             ceil_char_boundary(self.text, abs_end + 1)
                         } else {

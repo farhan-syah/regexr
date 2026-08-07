@@ -225,6 +225,14 @@ impl HirTranslator {
     }
 
     /// Translates a Perl class in ASCII mode.
+    ///
+    /// A negated class (`\W`, `\D`) is negated over *characters*, not bytes:
+    /// `\W` means "a character other than `[A-Za-z0-9_]`", which must include
+    /// non-ASCII code points like `é` or `世`, matched whole. It is built the
+    /// same way as a negated ASCII class like `[^a]` (see `build_class_expr`)
+    /// via `build_ascii_or_non_ascii`, rather than a raw negated byte class,
+    /// which would match a single continuation byte instead of a full
+    /// codepoint.
     fn translate_perl_class_ascii(&self, kind: PerlClassKind) -> Result<HirExpr> {
         let (ranges, negated) = match kind {
             PerlClassKind::Digit => (vec![(b'0', b'9')], false),
@@ -260,6 +268,11 @@ impl HirTranslator {
                 true,
             ),
         };
+
+        if negated {
+            let surviving_ascii = merge_byte_ranges(complement_within_ascii(&ranges));
+            return Ok(self.build_ascii_or_non_ascii(surviving_ascii));
+        }
 
         Ok(HirExpr::Class(HirClass::new(ranges, negated)))
     }
@@ -576,20 +589,7 @@ impl HirTranslator {
         // PikeVM and on the DFA, where they run at full speed.
         if negated && byte_ranges.iter().all(|&(_, hi)| hi <= 0x7f) {
             let surviving_ascii = merge_byte_ranges(complement_within_ascii(&byte_ranges));
-            let non_ascii = any_non_ascii_character();
-
-            let mut alternatives = Vec::new();
-            if !surviving_ascii.is_empty() {
-                alternatives.push(HirExpr::Class(HirClass::new(surviving_ascii, false)));
-            }
-            if !non_ascii.is_empty() {
-                alternatives.push(self.build_utf8_trie(&non_ascii));
-            }
-            return match alternatives.len() {
-                0 => HirExpr::Class(HirClass::new(vec![], false)),
-                1 => alternatives.pop().unwrap(),
-                _ => HirExpr::Alt(alternatives),
-            };
+            return self.build_ascii_or_non_ascii(surviving_ascii);
         }
 
         // IMPORTANT: Multi-byte UTF-8 sequences must use CodepointClass to ensure
@@ -605,8 +605,17 @@ impl HirTranslator {
 
         let mut alternatives: Vec<HirExpr> = Vec::new();
 
-        // Add single-byte class if we have byte ranges
+        // Add single-byte class if we have byte ranges.
+        //
+        // `negated` is always false here: `push_codepoint_range` only ever puts
+        // bytes <= 0x7f into `byte_ranges`, so a negated class is answered by
+        // one of the two earlier returns. The assertion keeps that invariant
+        // visible from this function, since it is maintained elsewhere.
         if !byte_ranges.is_empty() {
+            debug_assert!(
+                !negated,
+                "a negated class must be expanded before reaching the byte-class branch"
+            );
             alternatives.push(HirExpr::Class(HirClass::new(byte_ranges, negated)));
         }
 
@@ -651,14 +660,32 @@ impl HirTranslator {
         } else {
             vec![(0x00, 0x09), (0x0b, 0x7f)]
         };
+        self.build_ascii_or_non_ascii(ascii)
+    }
+
+    /// Builds "one byte from `ascii_ranges`, or any whole non-ASCII
+    /// character" as a byte-level alternation.
+    ///
+    /// Shared shape behind every construct that is negated (or otherwise
+    /// open-ended) over characters but must still compile to a byte
+    /// automaton: `build_class_expr`'s negated-ASCII branch (`[^a]`),
+    /// `build_dot_expr` (`.`), and ASCII-mode negated Perl classes (`\W`,
+    /// `\D`) in `translate_perl_class_ascii`. The non-ASCII half is a trie of
+    /// complete UTF-8 sequences (see `any_non_ascii_character`), so a match
+    /// can never start or end in the middle of a codepoint.
+    fn build_ascii_or_non_ascii(&self, ascii_ranges: Vec<(u8, u8)>) -> HirExpr {
         let non_ascii = any_non_ascii_character();
 
-        let mut alternatives = vec![HirExpr::Class(HirClass::new(ascii, false))];
+        let mut alternatives = Vec::new();
+        if !ascii_ranges.is_empty() {
+            alternatives.push(HirExpr::Class(HirClass::new(ascii_ranges, false)));
+        }
         if !non_ascii.is_empty() {
             alternatives.push(self.build_utf8_trie(&non_ascii));
         }
         match alternatives.len() {
-            1 => alternatives.swap_remove(0),
+            0 => HirExpr::Class(HirClass::new(vec![], false)),
+            1 => alternatives.pop().unwrap(),
             _ => HirExpr::Alt(alternatives),
         }
     }

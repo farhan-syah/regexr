@@ -138,6 +138,90 @@ fn test_shorthand_non_digit_with_literal_prefix() {
     assert!(!re.is_match("a1b"));
 }
 
+// `\W`/`\D` are negated over *characters*, not bytes, even in ASCII mode: the
+// positive forms (`\w`, `\d`) stay ASCII-only, but their negations must still
+// match a whole non-ASCII code point (2-, 3-, and 4-byte UTF-8) as a single
+// match rather than splitting it into a continuation byte. See `[^a]`, which
+// already had this property.
+#[test]
+fn test_shorthand_not_word_matches_whole_multibyte_codepoints() {
+    let re = regex("\\W");
+
+    // 2-byte: é (U+00E9)
+    let m = re.find("é").unwrap();
+    assert_eq!(m.as_str(), "é");
+    assert_eq!(m.start(), 0);
+    assert_eq!(m.end(), 2);
+
+    // 3-byte: € (U+20AC)
+    let m = re.find("€").unwrap();
+    assert_eq!(m.as_str(), "€");
+    assert_eq!(m.end(), 3);
+
+    // 4-byte: 😀 (U+1F600)
+    let m = re.find("😀").unwrap();
+    assert_eq!(m.as_str(), "😀");
+    assert_eq!(m.end(), 4);
+}
+
+#[test]
+fn test_shorthand_not_digit_matches_whole_multibyte_codepoints() {
+    let re = regex("\\D");
+
+    // 2-byte: é
+    let m = re.find("é").unwrap();
+    assert_eq!(m.as_str(), "é");
+    assert_eq!(m.end(), 2);
+
+    // 3-byte: 世 (U+4E16)
+    let m = re.find("世").unwrap();
+    assert_eq!(m.as_str(), "世");
+    assert_eq!(m.end(), 3);
+
+    // 4-byte: 😀
+    let m = re.find("😀").unwrap();
+    assert_eq!(m.as_str(), "😀");
+    assert_eq!(m.end(), 4);
+}
+
+#[test]
+fn test_shorthand_not_word_anchored_around_multibyte() {
+    let re = regex("^\\W$");
+    let m = re.find("é").unwrap();
+    assert_eq!(m.as_str(), "é");
+}
+
+#[test]
+fn test_shorthand_not_word_between_literals_around_multibyte() {
+    let re = regex("X\\WY");
+    let m = re.find("XéY").unwrap();
+    assert_eq!(m.as_str(), "XéY");
+}
+
+#[test]
+fn test_shorthand_not_word_rejects_word_chars() {
+    let re = regex("\\W");
+    assert!(!re.is_match("a"));
+    assert!(!re.is_match("Z"));
+    assert!(!re.is_match("9"));
+    assert!(!re.is_match("_"));
+}
+
+#[test]
+fn test_shorthand_not_digit_rejects_digit() {
+    let re = regex("\\D");
+    assert!(!re.is_match("7"));
+}
+
+/// `\w`/`\d` stay ASCII-only (deliberately, unlike `\s`/`\S` which are
+/// Unicode by default) — they must not match non-ASCII word characters.
+#[test]
+fn test_shorthand_word_is_ascii_only() {
+    let re = regex("^\\w+$");
+    assert!(!re.is_match("é"));
+    assert!(re.is_match("abc"));
+}
+
 // =============================================================================
 // Quantifiers
 // =============================================================================
