@@ -129,7 +129,7 @@ pub type ByteSet = [u8; 256];
 
 /// Every byte a match can begin with, or `None` when that cannot be pinned down.
 ///
-/// This is the unbounded form of [`leading_byte_set`]: a search that tests one
+/// This is the unbounded form of `leading_byte_set`: a search that tests one
 /// byte against a table does not care how many bytes are in it, so `\d+` and
 /// `\w+` qualify where a `memchr`-style prefilter does not.
 ///
