@@ -699,6 +699,18 @@ fn complement_ranges(ranges: &[ClassRange]) -> Vec<ClassRange> {
     out
 }
 
+/// Pushes `start..=end` as a `ClassRange` if both bounds are valid scalar
+/// values (i.e. not surrogates). A non-scalar bound is skipped rather than
+/// panicking; callers of this helper only ever pass already-split,
+/// surrogate-free bounds, so the skip path is unreachable in practice, but
+/// it is here rather than an `unwrap` so a future bug degrades instead of
+/// crashing.
+fn push_scalar_range_checked(out: &mut Vec<ClassRange>, start: u32, end: u32) {
+    if let (Some(s), Some(e)) = (char::from_u32(start), char::from_u32(end)) {
+        out.push(ClassRange::new(s, e));
+    }
+}
+
 /// Push `start..=end` as `ClassRange`(s), splitting around the surrogate gap.
 fn push_scalar_range(out: &mut Vec<ClassRange>, start: u32, end: u32) {
     const SUR_LO: u32 = 0xD800;
@@ -707,22 +719,13 @@ fn push_scalar_range(out: &mut Vec<ClassRange>, start: u32, end: u32) {
         return;
     }
     if end < SUR_LO || start > SUR_HI {
-        out.push(ClassRange::new(
-            char::from_u32(start).unwrap(),
-            char::from_u32(end).unwrap(),
-        ));
+        push_scalar_range_checked(out, start, end);
     } else {
         if start < SUR_LO {
-            out.push(ClassRange::new(
-                char::from_u32(start).unwrap(),
-                char::from_u32(SUR_LO - 1).unwrap(),
-            ));
+            push_scalar_range_checked(out, start, SUR_LO - 1);
         }
         if end > SUR_HI {
-            out.push(ClassRange::new(
-                char::from_u32(SUR_HI + 1).unwrap(),
-                char::from_u32(end).unwrap(),
-            ));
+            push_scalar_range_checked(out, SUR_HI + 1, end);
         }
     }
 }
@@ -797,23 +800,28 @@ fn intervals_to_ranges(intervals: &[Interval]) -> Vec<ClassRange> {
 /// Intersection of two normalized interval sets: `[s, e]` for every
 /// overlapping pair, where `s = max(a.start, b.start)` and
 /// `e = min(a.end, b.end)`.
+///
+/// Two-pointer merge over both (sorted, disjoint) inputs: at each step only
+/// the interval with the smaller end can possibly overlap anything further
+/// along the *other* list, so advancing past whichever of `a[i]`/`b[j]` ends
+/// first is always safe and each pointer only ever moves forward — O(len(a)
+/// + len(b)) total instead of the O(len(a) * len(b)) nested-scan version.
 fn intersect_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
     let mut out = Vec::new();
-    for &(a_start, a_end) in a {
-        for &(b_start, b_end) in b {
-            if b_end < a_start {
-                continue;
-            }
-            if b_start > a_end {
-                // `b` is sorted ascending, so no later `b` interval can
-                // overlap this `a` interval either.
-                break;
-            }
-            let start = a_start.max(b_start);
-            let end = a_end.min(b_end);
-            if start <= end {
-                out.push((start, end));
-            }
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        let (a_start, a_end) = a[i];
+        let (b_start, b_end) = b[j];
+        let start = a_start.max(b_start);
+        let end = a_end.min(b_end);
+        if start <= end {
+            out.push((start, end));
+        }
+        if a_end < b_end {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
     out
@@ -821,17 +829,28 @@ fn intersect_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
 
 /// Difference (`a - b`) of two normalized interval sets: every part of `a`
 /// not covered by any interval of `b`.
+///
+/// Two-pointer sweep: `j` tracks the first `b` interval that could still
+/// matter and only ever advances, since both inputs are sorted and `cur`
+/// (the next uncovered position within the current `a` interval) is
+/// non-decreasing across the whole sweep — so no `b` interval is ever
+/// revisited once passed. Within one `a` interval, a local copy `k` of `j`
+/// walks forward over every `b` interval that overlaps it, emitting the gap
+/// before each one; a single `a` interval can this way be split into
+/// several output pieces when multiple `b` intervals punch holes in it.
 fn difference_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
     let mut out = Vec::new();
+    let mut j = 0usize;
     for &(a_start, a_end) in a {
         let mut cur = a_start;
-        for &(b_start, b_end) in b {
-            if b_end < cur {
-                continue;
-            }
-            if b_start > a_end {
-                break;
-            }
+        // Intervals of `b` that ended before this `a` interval starts are
+        // done for good (later `a` intervals only start later still).
+        while j < b.len() && b[j].1 < cur {
+            j += 1;
+        }
+        let mut k = j;
+        while cur <= a_end && k < b.len() && b[k].0 <= a_end {
+            let (b_start, b_end) = b[k];
             if b_start > cur {
                 out.push((cur, b_start - 1));
             }
@@ -840,10 +859,12 @@ fn difference_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
                 break;
             }
             cur = b_end + 1;
+            k += 1;
         }
         if cur <= a_end {
             out.push((cur, a_end));
         }
+        j = k;
     }
     out
 }
@@ -927,5 +948,109 @@ mod tests {
     fn word_matches_underscore() {
         let ranges = posix_class_ranges("word").unwrap();
         assert!(ranges.iter().any(|r| r.contains('_')));
+    }
+
+    /// Whether `ranges` (not assumed normalized) contains code point `cp`,
+    /// checked directly with `ClassRange::contains` rather than via any of
+    /// the interval machinery under test.
+    fn ranges_contain_cp(ranges: &[ClassRange], cp: u32) -> bool {
+        match char::from_u32(cp) {
+            Some(c) => ranges.iter().any(|r| r.contains(c)),
+            None => false,
+        }
+    }
+
+    /// Brute-force equivalence check: for every code point in `0..=0x2FF`
+    /// (ASCII, Latin-1 and the surrogate-free low range beyond it),
+    /// `intersect_ranges`, `difference_ranges`, and `symmetric_difference_ranges`
+    /// must each produce a set whose membership matches the naive boolean
+    /// combination of `a`'s and `b`'s membership directly. This is the real
+    /// gate on the two-pointer `intersect_intervals`/`difference_intervals`
+    /// rewrite: any off-by-one in the sweep shows up as a membership
+    /// mismatch somewhere in the window.
+    #[test]
+    fn set_ops_match_naive_membership_oracle() {
+        const WINDOW: std::ops::RangeInclusive<u32> = 0u32..=0x2FF;
+
+        let cases: &[(&str, Vec<ClassRange>, Vec<ClassRange>)] = &[
+            (
+                "disjoint",
+                vec![ClassRange::new('a', 'f')],
+                vec![ClassRange::new('x', 'z')],
+            ),
+            (
+                "b fully contains a",
+                vec![ClassRange::new('m', 'p')],
+                vec![ClassRange::new('a', 'z')],
+            ),
+            (
+                "a fully contains b",
+                vec![ClassRange::new('a', 'z')],
+                vec![ClassRange::new('m', 'p')],
+            ),
+            (
+                "partial overlap, a starts first",
+                vec![ClassRange::new('a', 'm')],
+                vec![ClassRange::new('g', 'z')],
+            ),
+            (
+                "partial overlap, b starts first",
+                vec![ClassRange::new('g', 'z')],
+                vec![ClassRange::new('a', 'm')],
+            ),
+            (
+                "identical sets",
+                vec![ClassRange::new('a', 'z'), ClassRange::new('0', '9')],
+                vec![ClassRange::new('a', 'z'), ClassRange::new('0', '9')],
+            ),
+            ("a empty", vec![], vec![ClassRange::new('a', 'z')]),
+            ("b empty", vec![ClassRange::new('a', 'z')], vec![]),
+            ("both empty", vec![], vec![]),
+            (
+                "adjacent but not overlapping",
+                vec![ClassRange::new('a', 'c')],
+                vec![ClassRange::new('d', 'f')],
+            ),
+            (
+                "multiple holes punched in one a interval",
+                vec![ClassRange::new('\0', '\u{FF}')],
+                vec![
+                    ClassRange::new('\u{10}', '\u{1F}'),
+                    ClassRange::new('\u{40}', '\u{5F}'),
+                    ClassRange::new('\u{90}', '\u{9F}'),
+                ],
+            ),
+        ];
+
+        for (label, a, b) in cases {
+            let inter = intersect_ranges(a, b);
+            let diff = difference_ranges(a, b);
+            let sym = symmetric_difference_ranges(a, b);
+
+            for cp in WINDOW {
+                let in_a = ranges_contain_cp(a, cp);
+                let in_b = ranges_contain_cp(b, cp);
+
+                let expect_inter = in_a && in_b;
+                let expect_diff = in_a && !in_b;
+                let expect_sym = in_a != in_b;
+
+                assert_eq!(
+                    ranges_contain_cp(&inter, cp),
+                    expect_inter,
+                    "{label}: intersect mismatch at U+{cp:04X}"
+                );
+                assert_eq!(
+                    ranges_contain_cp(&diff, cp),
+                    expect_diff,
+                    "{label}: difference mismatch at U+{cp:04X}"
+                );
+                assert_eq!(
+                    ranges_contain_cp(&sym, cp),
+                    expect_sym,
+                    "{label}: symmetric_difference mismatch at U+{cp:04X}"
+                );
+            }
+        }
     }
 }
