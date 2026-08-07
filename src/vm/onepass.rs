@@ -1,0 +1,528 @@
+//! One-pass capture engine.
+//!
+//! Most engines here report only match bounds, so `captures()` recovers the slot
+//! positions with a second pass of the PikeVM over the matched text. For a
+//! *deterministic* pattern that second pass is pure overhead: if, from any point
+//! in the automaton, at most one transition can consume a given byte, then the
+//! path through the NFA is forced by the input alone. There is nothing to
+//! simulate — the slots can be written during a single left-to-right scan with no
+//! thread set, no backtracking and no per-byte allocation.
+//!
+//! [`OnePass`] compiles exactly those patterns and refuses every other one, so a
+//! failed compilation simply leaves the caller on its existing PikeVM path.
+//!
+//! # Representation
+//!
+//! Because transitions out of a closure are disjoint, exactly one of them fires
+//! per byte and it leads to a single NFA state. A closure is therefore identified
+//! by the NFA state that generates it, and the machine is an ordinary DFA over
+//! those closures: a 256-entry byte table selects the transition in O(1), and
+//! each transition carries the capture actions found on the epsilon path that
+//! reaches it. Actions live in one flat arena addressed by `(start, len)` spans,
+//! so a transition is two `u32`s plus a target.
+//!
+//! # Agreement with the PikeVM
+//!
+//! The scan reproduces [`crate::vm::PikeVm`]'s decisions rather than
+//! approximating them:
+//!
+//! - closures are built by walking `state.epsilon` in order (index 0 = highest
+//!   priority, which is what encodes greedy vs non-greedy) with first-arrival
+//!   deduplication, matching `add_thread`'s DFS;
+//! - the walk stops at the first match state in that order, mirroring the
+//!   PikeVM's `limit`: threads at or after the matching one never advance, so
+//!   any transition found later is dead. A non-greedy exit therefore ends the
+//!   scan exactly where the VM would end it;
+//! - capture actions are applied with the same rules as the PikeVM's
+//!   `reconstruct_captures` (`pike/shared.rs`) — a start overwrites
+//!   the slot with `(pos, pos)` and an end extends an already-started slot — so a
+//!   group inside a repetition reports its last iteration.
+
+use crate::nfa::{ByteRange, Nfa, NfaInstruction, StateId};
+use std::collections::HashMap;
+
+/// Upper bound on distinct closures, so compiling a pathological NFA cannot blow
+/// up. A pattern past this stays on the PikeVM path.
+const MAX_CLOSURES: usize = 512;
+
+/// Byte-table entry meaning "no transition accepts this byte".
+const NO_TRANSITION: u8 = u8::MAX;
+
+/// Transitions a closure may hold, bounded by the byte table's index width.
+const MAX_TRANSITIONS: usize = NO_TRANSITION as usize;
+
+/// A capture slot write performed while passing through an epsilon path.
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    /// Open capture group `n` at the current position.
+    Start(u32),
+    /// Close capture group `n` at the current position.
+    End(u32),
+}
+
+/// A range of [`OnePass::actions`], applied in order.
+#[derive(Debug, Clone, Copy)]
+struct ActionSpan {
+    start: u32,
+    len: u32,
+}
+
+impl ActionSpan {
+    /// The empty span, for an epsilon path that writes no slots.
+    const EMPTY: Self = Self { start: 0, len: 0 };
+}
+
+/// One resolved transition: the closure to enter and the slots to write first.
+#[derive(Debug, Clone, Copy)]
+struct Transition {
+    target: u32,
+    actions: ActionSpan,
+}
+
+/// An epsilon-closure, compiled to a deterministic byte dispatch.
+#[derive(Debug)]
+struct Closure {
+    /// Byte value to index into `transitions`, or [`NO_TRANSITION`].
+    table: [u8; 256],
+    transitions: Vec<Transition>,
+    /// Slots written on the epsilon path to the match state, when this closure
+    /// reaches one. `Some` means a match may end here.
+    match_actions: Option<ActionSpan>,
+}
+
+/// A deterministic capture engine for one-pass patterns.
+#[derive(Debug)]
+pub struct OnePass {
+    /// Closure 0 is the start closure: the NFA's start state is interned first.
+    closures: Vec<Closure>,
+    /// Every capture action, addressed by an `ActionSpan`.
+    actions: Vec<Action>,
+    /// Number of capture slots, including slot 0 for the whole match.
+    slot_count: usize,
+}
+
+impl OnePass {
+    /// Compiles `nfa` if it is one-pass; returns `None` otherwise.
+    ///
+    /// The pattern is one-pass when, for every reachable closure, the byte ranges
+    /// of the transitions that can still advance are pairwise disjoint — a single
+    /// shared byte value is enough to reject. Rejected outright: backreferences,
+    /// lookaround, Unicode codepoint classes, any anchor or boundary assertion
+    /// (position-dependent, so not representable in a static transition table),
+    /// and any NFA needing more than `MAX_CLOSURES` closures.
+    pub fn compile(nfa: &Nfa) -> Option<Self> {
+        if nfa.has_backrefs || nfa.has_lookaround {
+            return None;
+        }
+
+        // Closure `i` is generated by `roots[i]`; `ids` maps back the other way so
+        // a transition target resolves to an existing closure.
+        let mut ids: HashMap<StateId, u32> = HashMap::new();
+        let mut roots: Vec<StateId> = Vec::new();
+        ids.insert(nfa.start, 0);
+        roots.push(nfa.start);
+
+        let mut closures: Vec<Closure> = Vec::new();
+        let mut actions: Vec<Action> = Vec::new();
+        let mut next = 0;
+
+        while next < roots.len() {
+            let Some(&root) = roots.get(next) else {
+                break;
+            };
+            next += 1;
+
+            let raw = expand_closure(nfa, root)?;
+            if raw.transitions.len() > MAX_TRANSITIONS {
+                return None;
+            }
+
+            let mut table = [NO_TRANSITION; 256];
+            let mut transitions = Vec::with_capacity(raw.transitions.len());
+            for (index, raw_transition) in raw.transitions.iter().enumerate() {
+                let range = raw_transition.range;
+                for byte in range.start..=range.end {
+                    let entry = table.get_mut(byte as usize)?;
+                    if *entry != NO_TRANSITION {
+                        // Two live transitions accept this byte: not one-pass.
+                        return None;
+                    }
+                    *entry = index as u8;
+                }
+                transitions.push(Transition {
+                    target: intern(&mut ids, &mut roots, raw_transition.target)?,
+                    actions: push_actions(&mut actions, &raw_transition.actions)?,
+                });
+            }
+
+            let match_actions = match raw.match_actions {
+                Some(ref path) => Some(push_actions(&mut actions, path)?),
+                None => None,
+            };
+
+            closures.push(Closure {
+                table,
+                transitions,
+                match_actions,
+            });
+        }
+
+        Some(Self {
+            closures,
+            actions,
+            slot_count: nfa.capture_count as usize + 1,
+        })
+    }
+
+    /// Capture slots for a match that begins exactly at `start`.
+    ///
+    /// Slot 0 is the whole match. Returns `None` if no match begins there. The
+    /// returned vector always has `capture_count + 1` entries, and a group the
+    /// match never entered stays `None`.
+    pub fn captures_at(&self, input: &[u8], start: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        if start > input.len() {
+            return None;
+        }
+
+        // Slots for the path currently being walked, and a snapshot taken at each
+        // position a match could end. The snapshot is what a later, longer match
+        // overwrites — the live slots keep advancing past it.
+        let mut slots = vec![None; self.slot_count];
+        let mut match_slots = vec![None; self.slot_count];
+        let mut match_end: Option<usize> = None;
+
+        let mut closure = self.closures.first()?;
+        let mut pos = start;
+        loop {
+            if let Some(span) = closure.match_actions {
+                match_slots.copy_from_slice(&slots);
+                self.apply(&mut match_slots, span, pos);
+                match_end = Some(pos);
+            }
+
+            let byte = match input.get(pos) {
+                Some(&byte) => byte,
+                None => break,
+            };
+            let index = match closure.table.get(byte as usize) {
+                Some(&index) if index != NO_TRANSITION => index as usize,
+                _ => break,
+            };
+            let Some(&transition) = closure.transitions.get(index) else {
+                break;
+            };
+            let Some(target) = self.closures.get(transition.target as usize) else {
+                break;
+            };
+
+            self.apply(&mut slots, transition.actions, pos);
+            closure = target;
+            pos += 1;
+        }
+
+        let end = match_end?;
+        if let Some(slot) = match_slots.first_mut() {
+            *slot = Some((start, end));
+        }
+        Some(match_slots)
+    }
+
+    /// Applies a span of capture actions at `pos`.
+    ///
+    /// The rules are `reconstruct_captures`': a start overwrites the slot, so the
+    /// last iteration of a repetition wins, and an end only extends a slot that
+    /// was already started.
+    #[inline]
+    fn apply(&self, slots: &mut [Option<(usize, usize)>], span: ActionSpan, pos: usize) {
+        let range = span.start as usize..span.start as usize + span.len as usize;
+        let Some(actions) = self.actions.get(range) else {
+            return;
+        };
+        for action in actions {
+            match *action {
+                Action::Start(index) => {
+                    if let Some(slot) = slots.get_mut(index as usize) {
+                        *slot = Some((pos, pos));
+                    }
+                }
+                Action::End(index) => {
+                    if let Some(slot) = slots.get_mut(index as usize) {
+                        if let Some((slot_start, _)) = *slot {
+                            *slot = Some((slot_start, pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A transition collected from an epsilon closure, before its target has been
+/// resolved to a closure index.
+struct RawTransition {
+    range: ByteRange,
+    target: StateId,
+    actions: Vec<Action>,
+}
+
+/// The result of walking one epsilon closure.
+struct RawClosure {
+    transitions: Vec<RawTransition>,
+    match_actions: Option<Vec<Action>>,
+}
+
+/// Walks the epsilon closure of `root`, collecting the transitions that can
+/// advance and the capture actions on the path to each.
+///
+/// The walk is the PikeVM's: a depth-first traversal in epsilon order (children
+/// pushed in reverse so the highest-priority one pops first) with first-arrival
+/// deduplication. It stops at the first match state, because the VM lets only
+/// threads *before* the matching one consume a byte — transitions found after it
+/// are unreachable, and stopping there is what makes a non-greedy exit end the
+/// scan.
+///
+/// Returns `None` when the closure contains a construct this engine does not
+/// model.
+fn expand_closure(nfa: &Nfa, root: StateId) -> Option<RawClosure> {
+    let mut visited = vec![false; nfa.states.len()];
+    let mut stack: Vec<(StateId, Vec<Action>)> = vec![(root, Vec::new())];
+    let mut transitions = Vec::new();
+
+    while let Some((state_id, mut path)) = stack.pop() {
+        let seen = visited.get_mut(state_id as usize)?;
+        if *seen {
+            continue;
+        }
+        *seen = true;
+
+        let state = nfa.get(state_id)?;
+        match state.instruction {
+            None | Some(NfaInstruction::NonGreedyExit) => {}
+            Some(NfaInstruction::CaptureStart(index)) => path.push(Action::Start(index)),
+            Some(NfaInstruction::CaptureEnd(index)) => path.push(Action::End(index)),
+            // Assertions depend on the position, and backreferences, lookaround
+            // and codepoint classes are not byte transitions at all.
+            Some(_) => return None,
+        }
+
+        if state.is_match {
+            return Some(RawClosure {
+                transitions,
+                match_actions: Some(path),
+            });
+        }
+
+        for &(range, target) in &state.transitions {
+            transitions.push(RawTransition {
+                range,
+                target,
+                actions: path.clone(),
+            });
+        }
+        for &next in state.epsilon.iter().rev() {
+            stack.push((next, path.clone()));
+        }
+    }
+
+    Some(RawClosure {
+        transitions,
+        match_actions: None,
+    })
+}
+
+/// Returns the closure index for `state`, queueing it for expansion when it is
+/// new. `None` once `MAX_CLOSURES` is reached.
+fn intern(
+    ids: &mut HashMap<StateId, u32>,
+    roots: &mut Vec<StateId>,
+    state: StateId,
+) -> Option<u32> {
+    if let Some(&index) = ids.get(&state) {
+        return Some(index);
+    }
+    if roots.len() >= MAX_CLOSURES {
+        return None;
+    }
+    let index = u32::try_from(roots.len()).ok()?;
+    ids.insert(state, index);
+    roots.push(state);
+    Some(index)
+}
+
+/// Appends `path` to the action arena and returns the span addressing it.
+fn push_actions(arena: &mut Vec<Action>, path: &[Action]) -> Option<ActionSpan> {
+    if path.is_empty() {
+        return Some(ActionSpan::EMPTY);
+    }
+    let start = u32::try_from(arena.len()).ok()?;
+    let len = u32::try_from(path.len()).ok()?;
+    arena.extend_from_slice(path);
+    Some(ActionSpan { start, len })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::{translate, CodepointClass};
+    use crate::nfa::{self, NfaState};
+    use crate::parser::parse;
+    use crate::vm::PikeVm;
+
+    fn build_nfa(pattern: &str) -> Nfa {
+        let ast = parse(pattern).unwrap();
+        let hir = translate(&ast).unwrap();
+        nfa::compile(&hir).unwrap()
+    }
+
+    fn compile(pattern: &str) -> Option<OnePass> {
+        OnePass::compile(&build_nfa(pattern))
+    }
+
+    /// Asserts that the one-pass slots equal the PikeVM's for every input, at the
+    /// start position the PikeVM itself reports.
+    fn assert_agrees_with_pike(pattern: &str, inputs: &[&str]) {
+        let nfa = build_nfa(pattern);
+        let one_pass = OnePass::compile(&nfa).expect("pattern should be one-pass");
+        let vm = PikeVm::new(nfa);
+
+        for input in inputs {
+            let bytes = input.as_bytes();
+            let expected = vm.captures(bytes);
+            let start = match expected.as_ref().and_then(|caps| caps[0]) {
+                Some((start, _)) => start,
+                None => {
+                    assert_eq!(
+                        one_pass.captures_at(bytes, 0),
+                        None,
+                        "pattern {pattern:?} input {input:?}: expected no match at 0"
+                    );
+                    continue;
+                }
+            };
+            assert_eq!(
+                one_pass.captures_at(bytes, start),
+                expected,
+                "pattern {pattern:?} input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compiles_deterministic_pattern() {
+        assert!(compile(r"(\d{4})-(\d{2})").is_some());
+        assert!(compile(r"(\w+)@(\w+)\.com").is_some());
+        assert!(compile(r"a(b)*c").is_some());
+    }
+
+    #[test]
+    fn test_rejects_overlapping_alternation() {
+        // Both branches accept 'a' from the start closure, so the byte alone does
+        // not decide the path.
+        assert!(compile("(a|ab)c").is_none());
+        assert!(compile("(ab|a)c").is_none());
+    }
+
+    #[test]
+    fn test_rejects_backreference() {
+        assert!(compile(r"(a+)\1").is_none());
+    }
+
+    #[test]
+    fn test_rejects_lookaround() {
+        assert!(compile(r"(a)(?=b)").is_none());
+        assert!(compile(r"(?<=a)(b)").is_none());
+    }
+
+    #[test]
+    fn test_rejects_anchors_and_boundaries() {
+        assert!(compile(r"^(a)").is_none());
+        assert!(compile(r"(a)$").is_none());
+        assert!(compile(r"\b(a)").is_none());
+        assert!(compile(r"\B(a)").is_none());
+    }
+
+    #[test]
+    fn test_rejects_codepoint_class() {
+        // Built directly: a codepoint class consumes a whole UTF-8 codepoint
+        // rather than a byte, so it has no place in a byte transition table.
+        let mut nfa = Nfa::new();
+        let mut start = NfaState::new();
+        start.instruction = Some(NfaInstruction::CodepointClass(
+            CodepointClass::new(vec![(0x100, 0x200)], false),
+            1,
+        ));
+        nfa.add_state(start);
+        nfa.add_state(NfaState::match_state());
+        nfa.start = 0;
+        nfa.matches = vec![1];
+
+        assert!(OnePass::compile(&nfa).is_none());
+    }
+
+    #[test]
+    fn test_rejects_when_closure_cap_exceeded() {
+        // A long chain of distinct positions needs one closure each.
+        let pattern = "a".repeat(MAX_CLOSURES + 16);
+        assert!(compile(&pattern).is_none());
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm() {
+        assert_agrees_with_pike(
+            r"(\d{4})-(\d{2})-(\d{2})",
+            &["2024-05-17", "x2024-05-17x", "2024-05"],
+        );
+        assert_agrees_with_pike(r"(\w+)@(\w+)", &["user@host", "@host", "user@"]);
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_nested_groups() {
+        assert_agrees_with_pike(r"((\d+)-(\d+))", &["12-34", "1-2", "abc"]);
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_group_in_repetition() {
+        // Group 1 must report its LAST iteration, like the PikeVM's
+        // reconstruct_captures.
+        assert_agrees_with_pike(r"(?:(\d)x)+", &["1x2x3x", "1x", "x"]);
+
+        let one_pass = compile(r"(?:(\d)x)+").unwrap();
+        let slots = one_pass.captures_at(b"1x2x3x", 0).unwrap();
+        assert_eq!(slots[0], Some((0, 6)));
+        assert_eq!(slots[1], Some((4, 5)));
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_optional_group() {
+        assert_agrees_with_pike(r"(a)?b", &["ab", "b"]);
+
+        let one_pass = compile(r"(a)?b").unwrap();
+        let slots = one_pass.captures_at(b"b", 0).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0], Some((0, 1)));
+        assert_eq!(slots[1], None, "unentered group stays None");
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_empty_leading_group() {
+        assert_agrees_with_pike(r"(a*)b", &["aab", "b"]);
+
+        let one_pass = compile(r"(a*)b").unwrap();
+        let slots = one_pass.captures_at(b"b", 0).unwrap();
+        assert_eq!(slots[1], Some((0, 0)), "group matched empty at 0");
+    }
+
+    #[test]
+    fn test_no_match_at_position() {
+        let one_pass = compile(r"(\d+)").unwrap();
+        assert_eq!(one_pass.captures_at(b"abc", 0), None);
+        assert_eq!(one_pass.captures_at(b"abc", 9), None);
+    }
+
+    #[test]
+    fn test_slot_count_matches_capture_count() {
+        let one_pass = compile(r"(a)(b)(c)").unwrap();
+        let slots = one_pass.captures_at(b"abc", 0).unwrap();
+        assert_eq!(slots.len(), 4);
+    }
+}

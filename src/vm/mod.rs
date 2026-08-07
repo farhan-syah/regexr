@@ -5,13 +5,18 @@
 //! - `shift_or/` - Shift-Or (Bitap) bit-parallel matcher
 //! - `backtracking/` - Backtracking VM for backreferences
 //! - `pike/` - PikeVM parallel NFA simulation
+//! - `onepass` - Deterministic single-scan capture engine
 
 pub mod backtracking;
 mod codepoint_class;
+mod onepass;
 pub mod pike;
 pub mod shift_or;
 
 pub use codepoint_class::*;
+
+// Re-export the one-pass capture engine
+pub use onepass::OnePass;
 
 // Re-export key types from pike module
 pub use pike::{PikeVm, PikeVmContext, PikeVmEngine};

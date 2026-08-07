@@ -13,7 +13,7 @@ use crate::nfa::tagged::TaggedNfaEngine;
 use crate::nfa::{self, Nfa};
 use crate::vm::backtracking::{BudgetExhausted, CaptureSlots};
 use crate::vm::{
-    BacktrackingVm, CodepointClassMatcher, PikeVm, PikeVmContext, ShiftOr, ShiftOrWide,
+    BacktrackingVm, CodepointClassMatcher, OnePass, PikeVm, PikeVmContext, ShiftOr, ShiftOrWide,
 };
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -34,6 +34,9 @@ pub struct CompiledRegex {
     /// Fallback NFA for captures when using Shift-Or or LazyDfa.
     /// Lazily compiled on first captures() call.
     capture_nfa: RwLock<Option<Nfa>>,
+    /// Deterministic capture engine, when the capture NFA is one-pass.
+    /// Replaces the PikeVM second pass with a single linear scan.
+    one_pass: Option<OnePass>,
     /// Cached PikeVM for capture extraction.
     /// Lazily initialized on first captures() call to avoid cloning NFA repeatedly.
     capture_vm: RwLock<Option<PikeVm>>,
@@ -551,8 +554,23 @@ impl CompiledRegex {
     /// extract (see the `capture_nfa` fields set during compilation). With no
     /// groups there is nothing for a second pass to do: the match bounds found in
     /// step 1 *are* the whole capture set, and slot 0 is returned directly.
+    ///
+    /// Step 2 is skipped entirely for a one-pass pattern: [`OnePass`] writes the
+    /// slots in a single deterministic scan from `match_start`, with no thread
+    /// set to simulate. It reports the same slots as the PikeVM or declines, in
+    /// which case the second pass below runs unchanged.
     fn captures_two_pass(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
         let (match_start, match_end) = self.find_from(input, from)?;
+
+        if let Some(ref one_pass) = self.one_pass {
+            if let Some(slots) = one_pass.captures_at(input, match_start) {
+                // The deterministic scan and the search engine must agree on the
+                // match bounds; if they somehow do not, defer to the PikeVM.
+                if slots.first().copied().flatten() == Some((match_start, match_end)) {
+                    return Some(slots);
+                }
+            }
+        }
 
         // Use cached PikeVM and context to avoid allocations
         self.get_or_init_capture_vm();
@@ -664,10 +682,13 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
         }
     };
 
+    let one_pass = capture_nfa.as_ref().and_then(OnePass::compile);
+
     Ok(CompiledRegex {
         inner,
         prefilter: Prefilter::None, // Can't extract literals from NFA
         capture_nfa: RwLock::new(capture_nfa),
+        one_pass,
         capture_vm: RwLock::new(None),
         capture_ctx: RwLock::new(None),
         backtracking_vm: None,
@@ -689,6 +710,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             )),
             prefilter: Prefilter::None,
             capture_nfa: RwLock::new(None),
+            one_pass: None,
             capture_vm: RwLock::new(None),
             capture_ctx: RwLock::new(None),
             backtracking_vm: None,
@@ -712,6 +734,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             inner: CompiledInner::TaggedNfaInterp(engine),
             prefilter,
             capture_nfa: RwLock::new(None),
+            one_pass: None,
             capture_vm: RwLock::new(None),
             capture_ctx: RwLock::new(None),
             backtracking_vm: None,
@@ -856,10 +879,13 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         None
     };
 
+    let one_pass = capture_nfa.as_ref().and_then(OnePass::compile);
+
     Ok(CompiledRegex {
         inner,
         prefilter,
         capture_nfa: RwLock::new(capture_nfa),
+        one_pass,
         capture_vm: RwLock::new(None),
         capture_ctx: RwLock::new(None),
         backtracking_vm,
@@ -888,6 +914,7 @@ pub fn compile_with_pikevm(hir: &Hir) -> Result<CompiledRegex> {
         inner: CompiledInner::PikeVm(PikeVm::new(nfa)),
         prefilter,
         capture_nfa: RwLock::new(None),
+        one_pass: None,
         capture_vm: RwLock::new(None),
         capture_ctx: RwLock::new(None),
         backtracking_vm: None,
@@ -915,6 +942,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             )),
             prefilter: Prefilter::None,
             capture_nfa: RwLock::new(None),
+            one_pass: None,
             capture_vm: RwLock::new(None),
             capture_ctx: RwLock::new(None),
             backtracking_vm: None,
@@ -961,6 +989,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -976,6 +1005,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaInterp(engine),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -997,6 +1027,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             inner: CompiledInner::TaggedNfaInterp(engine),
             prefilter,
             capture_nfa: RwLock::new(None),
+            one_pass: None,
             capture_vm: RwLock::new(None),
             capture_ctx: RwLock::new(None),
             backtracking_vm: None,
@@ -1015,6 +1046,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::Backtracking(jit_regex),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -1033,6 +1065,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -1060,6 +1093,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -1079,6 +1113,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaInterp(engine),
                     prefilter,
                     capture_nfa: RwLock::new(None),
+                    one_pass: None,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm: None,
@@ -1100,6 +1135,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             inner: CompiledInner::TaggedNfaInterp(engine),
             prefilter,
             capture_nfa: RwLock::new(None),
+            one_pass: None,
             capture_vm: RwLock::new(None),
             capture_ctx: RwLock::new(None),
             backtracking_vm: None,
@@ -1163,10 +1199,13 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                         None
                     };
 
+                    let one_pass = capture_nfa.as_ref().and_then(OnePass::compile);
+
                     return Ok(CompiledRegex {
                         inner: CompiledInner::JitShiftOr(jit_shift_or),
                         prefilter,
                         capture_nfa: RwLock::new(capture_nfa),
+                        one_pass,
                         capture_vm: RwLock::new(None),
                         capture_ctx: RwLock::new(None),
                         backtracking_vm,
@@ -1185,6 +1224,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         let prefilter = Prefilter::from_literals(&literals);
         let nfa = nfa::compile(hir)?;
         let capture_nfa = Some(nfa.clone());
+        let one_pass = capture_nfa.as_ref().and_then(OnePass::compile);
         let mut dfa = LazyDfa::new(nfa);
 
         // Only backreferences justify backtracking for captures; see
@@ -1201,6 +1241,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::Jit(jit_regex),
                     prefilter,
                     capture_nfa: RwLock::new(capture_nfa),
+                    one_pass,
                     capture_vm: RwLock::new(None),
                     capture_ctx: RwLock::new(None),
                     backtracking_vm,

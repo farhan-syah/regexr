@@ -91,6 +91,14 @@ const PATTERNS: &[&str] = &[
     r"(a|b){2,}",
     r"((a|b)|c)+",
     r"(a+|b+)+",
+    // Deterministic capture patterns — these take the one-pass capture engine,
+    // so they must agree group-for-group with an engine that does not have one.
+    r"(\d{4})-(\d{2})-(\d{2})",
+    r"(\w+)@(\w+)\.(\w+)",
+    r"(\d+)-(\d+)",
+    r"([a-z]+)([0-9]*)",
+    r"(a)(b)?(c)",
+    r"((a)(b))c",
     // Lookaround
     r"a(?=b)",
     r"a(?!b)",
@@ -163,6 +171,12 @@ const HAYSTACKS: &[&str] = &[
     "straße",
     "foobar",
     "xab",
+    "2024-01-15",
+    "user@site.com",
+    "12-34",
+    "abc123",
+    "ac",
+    "abc",
 ];
 
 /// Every supported pattern must report the same match span as PCRE2.

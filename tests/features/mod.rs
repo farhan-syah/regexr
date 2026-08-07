@@ -9,6 +9,7 @@
 //! - Grapheme clusters (`\X`)
 //! - Literal quoting (`\Q…\E`)
 //! - Named captures
+//! - One-pass (deterministic) capture extraction
 //! - Rejection of malformed patterns
 //! - Syntax validation
 
@@ -41,6 +42,7 @@ mod grapheme_cluster;
 mod inline_flags;
 mod lookaround;
 mod named_capture;
+mod onepass_captures;
 mod pattern_rejection;
 mod posix_class;
 mod quoting;
