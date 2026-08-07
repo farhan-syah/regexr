@@ -5,6 +5,7 @@
 //! to a flat bytecode representation first, then executes with minimal overhead.
 
 use crate::hir::{CodepointClass, Hir, HirAnchor, HirExpr};
+use crate::literal::ByteSet;
 use crate::nfa::{ByteClass, ByteRange};
 
 use super::super::shared::{
@@ -25,6 +26,13 @@ pub struct BacktrackingVm {
     cp_classes: Vec<CodepointClass>,
     /// How many progress registers [`Op::MarkPos`] can address.
     progress_regs: usize,
+    /// Bytes a match can begin with, when the pattern pins them down.
+    ///
+    /// Every start position costs a full attempt — the slot reset plus entering
+    /// the bytecode — so a search over text that mostly does not match spends
+    /// nearly all of it on positions the first element rejects outright. This
+    /// skips them with one indexed load.
+    first_bytes: Option<Box<ByteSet>>,
 }
 
 impl BacktrackingVm {
@@ -40,6 +48,7 @@ impl BacktrackingVm {
             byte_classes: compiler.byte_classes,
             cp_classes: compiler.cp_classes,
             progress_regs: compiler.progress_regs as usize,
+            first_bytes: crate::literal::first_byte_set(hir).map(Box::new),
         }
     }
 
@@ -74,7 +83,12 @@ impl BacktrackingVm {
         let mut budget = limit;
         let mut scratch = Scratch::new(self.progress_regs);
 
-        for pos in start..=input.len() {
+        let mut pos = start;
+        while pos <= input.len() {
+            pos = self.skip_to_viable_start(input, pos);
+            if pos > input.len() {
+                break;
+            }
             slots.fill(-1);
             if self.exec(input, pos, &mut slots, &mut budget, &mut scratch)? {
                 let s = slots[0];
@@ -83,6 +97,7 @@ impl BacktrackingVm {
                     return Ok(Some((s as usize, e as usize)));
                 }
             }
+            pos += 1;
         }
         Ok(None)
     }
@@ -113,13 +128,41 @@ impl BacktrackingVm {
         let mut budget = limit;
         let mut scratch = Scratch::new(self.progress_regs);
 
-        for start in from..=input.len() {
+        let mut start = from;
+        while start <= input.len() {
+            start = self.skip_to_viable_start(input, start);
+            if start > input.len() {
+                break;
+            }
             slots.fill(-1);
             if self.exec(input, start, &mut slots, &mut budget, &mut scratch)? {
                 return Ok(Some(self.extract_captures(&slots)));
             }
+            start += 1;
         }
         Ok(None)
+    }
+
+    /// Advances past every position whose byte no match can begin with.
+    ///
+    /// The end of the input is always viable: it reads no byte, and whether an
+    /// empty match belongs there is the attempt's decision.
+    #[inline]
+    fn skip_to_viable_start(&self, input: &[u8], from: usize) -> usize {
+        let Some(ref first_bytes) = self.first_bytes else {
+            return from;
+        };
+        let mut pos = from;
+        while let Some(&byte) = input.get(pos) {
+            if first_bytes
+                .get(byte as usize)
+                .is_none_or(|member| *member != 0)
+            {
+                break;
+            }
+            pos += 1;
+        }
+        pos
     }
 
     /// Extract captures from slots.

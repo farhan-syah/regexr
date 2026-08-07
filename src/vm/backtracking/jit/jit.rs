@@ -49,6 +49,59 @@ pub(super) const STACK_EXHAUSTED: i64 = -2;
 /// this is reported straight to the caller as [`BudgetExhausted`].
 pub(super) const BUDGET_EXHAUSTED: i64 = -3;
 
+/// Raw slot entries a search keeps on the stack before it has to allocate.
+///
+/// Iteration runs one search per match, so an allocation here is an allocation
+/// per match. Eight entries cover a pattern with three groups; past that the
+/// buffer spills to the heap.
+const INLINE_SLOTS: usize = 8;
+
+/// Picks the stack buffer when the pattern fits it, and allocates otherwise.
+fn slot_buffer<'a>(
+    len: usize,
+    inline: &'a mut [i64; INLINE_SLOTS],
+    spilled: &'a mut Vec<i64>,
+) -> &'a mut [i64] {
+    match inline.get_mut(..len) {
+        Some(slots) => slots,
+        None => {
+            *spilled = vec![-1; len];
+            spilled
+        }
+    }
+}
+
+/// Adds `offset` to every set slot, turning suffix-relative offsets absolute.
+fn shift_slots(slots: &mut [i64], offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    for slot in slots.iter_mut().filter(|slot| **slot >= 0) {
+        *slot += offset as i64;
+    }
+}
+
+/// Copies the interpreter's answer into a raw slot buffer, shifted by `offset`.
+/// Returns whether there was a match to copy.
+fn write_slots(slots: &mut [i64], caps: Option<&[Option<(usize, usize)>]>, offset: usize) -> bool {
+    slots.fill(-1);
+    let Some(caps) = caps else {
+        return false;
+    };
+    for (pair, group) in slots.chunks_exact_mut(2).zip(caps) {
+        let Some(&(start, end)) = group.as_ref() else {
+            continue;
+        };
+        if let Some(slot) = pair.first_mut() {
+            *slot = (start + offset) as i64;
+        }
+        if let Some(slot) = pair.get_mut(1) {
+            *slot = (end + offset) as i64;
+        }
+    }
+    true
+}
+
 /// A compiled backtracking regex.
 pub struct BacktrackingJit {
     /// Executable code buffer (kept alive for the function pointer).
@@ -82,37 +135,67 @@ impl BacktrackingJit {
         self.find(input).is_some()
     }
 
-    /// Runs the generated code over the whole of `input`.
+    /// Runs the generated code over the whole of `input`, leaving the raw slot
+    /// pairs in `slots`.
     ///
-    /// `Ok(Some(..))`/`Ok(None)` is a finished search; `Err(Retry)` means it ran
-    /// out of choice-point stack and the caller must ask the interpreter, and
+    /// `Ok(true)`/`Ok(false)` is a finished search; `Err(Retry)` means it ran out
+    /// of choice-point stack and the caller must ask the interpreter, and
     /// `Err(Budget)` means the caller's own limit stopped it.
-    fn run(&self, input: &[u8], limit: u64) -> std::result::Result<Option<CaptureSlots>, Halt> {
-        let num_slots = (self.capture_count as usize + 1) * 2;
-        let mut buf: Vec<i64> = vec![-1; num_slots];
-
+    fn run(&self, input: &[u8], limit: u64, slots: &mut [i64]) -> std::result::Result<bool, Halt> {
+        slots.fill(-1);
         let result =
-            unsafe { (self.match_fn)(input.as_ptr(), input.len(), buf.as_mut_ptr(), limit) };
+            unsafe { (self.match_fn)(input.as_ptr(), input.len(), slots.as_mut_ptr(), limit) };
 
-        if result == STACK_EXHAUSTED {
-            return Err(Halt::Retry);
+        match result {
+            STACK_EXHAUSTED => Err(Halt::Retry),
+            BUDGET_EXHAUSTED => Err(Halt::Budget),
+            negative if negative < 0 => Ok(false),
+            _ => Ok(true),
         }
-        if result == BUDGET_EXHAUSTED {
-            return Err(Halt::Budget);
+    }
+
+    /// Runs a search and leaves the raw slot pairs in `slots`, which must hold
+    /// [`Self::slot_len`] entries.
+    ///
+    /// Slots are already shifted to absolute input offsets. This is the shared
+    /// body of the capture and find entry points: `find` reads slot 0 straight
+    /// out of the buffer instead of building a vector it would throw away, which
+    /// matters because iteration calls it once per match.
+    fn search(
+        &self,
+        input: &[u8],
+        from: usize,
+        limit: u64,
+        slots: &mut [i64],
+    ) -> std::result::Result<bool, BudgetExhausted> {
+        if self.needs_left_context && from > 0 {
+            let caps = self.vm.try_captures_from(input, from, limit)?;
+            return Ok(write_slots(slots, caps.as_deref(), 0));
         }
-        if result < 0 {
-            return Ok(None);
-        }
-        let mut captures = Vec::with_capacity(self.capture_count as usize + 1);
-        for i in 0..=self.capture_count as usize {
-            let (start, end) = (buf[i * 2], buf[i * 2 + 1]);
-            if start >= 0 && end >= 0 {
-                captures.push(Some((start as usize, end as usize)));
-            } else {
-                captures.push(None);
+        let (haystack, offset) = if from == 0 {
+            (input, 0)
+        } else {
+            (&input[from..], from)
+        };
+        match self.run(haystack, limit, slots) {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                shift_slots(slots, offset);
+                Ok(true)
             }
+            // A full stack is not an answer, so the search continues on the
+            // interpreter, which grows its stack instead of capping it.
+            Err(Halt::Retry) => {
+                let caps = self.vm.try_captures_from(haystack, 0, limit)?;
+                Ok(write_slots(slots, caps.as_deref(), offset))
+            }
+            Err(Halt::Budget) => Err(BudgetExhausted),
         }
-        Ok(Some(captures))
+    }
+
+    /// Number of raw slot entries a search buffer must hold.
+    fn slot_len(&self) -> usize {
+        (self.capture_count as usize + 1) * 2
     }
 
     /// Finds the first match, returning (start, end).
@@ -141,26 +224,23 @@ impl BacktrackingJit {
         if from > input.len() {
             return Ok(None);
         }
-        if self.needs_left_context && from > 0 {
-            return self.vm.try_captures_from(input, from, limit);
+        let mut inline = [-1i64; INLINE_SLOTS];
+        let mut spilled = Vec::new();
+        let slots = slot_buffer(self.slot_len(), &mut inline, &mut spilled);
+        if !self.search(input, from, limit, slots)? {
+            return Ok(None);
         }
-        let (haystack, offset) = if from == 0 {
-            (input, 0)
-        } else {
-            (&input[from..], from)
-        };
-        let caps = match self.run(haystack, limit) {
-            Ok(caps) => caps,
-            // A full stack is not an answer, so the search continues on the
-            // interpreter, which grows its stack instead of capping it.
-            Err(Halt::Retry) => self.vm.try_captures_from(haystack, 0, limit)?,
-            Err(Halt::Budget) => return Err(BudgetExhausted),
-        };
-        Ok(caps.map(|caps| {
-            caps.into_iter()
-                .map(|slot| slot.map(|(s, e)| (s + offset, e + offset)))
-                .collect()
-        }))
+        Ok(Some(
+            slots
+                .chunks_exact(2)
+                .map(|pair| match (pair.first(), pair.get(1)) {
+                    (Some(&start), Some(&end)) if start >= 0 && end >= 0 => {
+                        Some((start as usize, end as usize))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        ))
     }
 
     /// Finds a match starting at or after the given position.
@@ -175,7 +255,24 @@ impl BacktrackingJit {
     /// run on the suffix slice, whose end — and so `$`/`\Z` — is the end of the
     /// input.
     pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
-        self.captures_from(input, from).and_then(|caps| caps[0])
+        if from > input.len() {
+            return None;
+        }
+        let mut inline = [-1i64; INLINE_SLOTS];
+        let mut spilled = Vec::new();
+        let slots = slot_buffer(self.slot_len(), &mut inline, &mut spilled);
+        if !self
+            .search(input, from, DEFAULT_BACKTRACK_LIMIT, slots)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        match (slots.first(), slots.get(1)) {
+            (Some(&start), Some(&end)) if start >= 0 && end >= 0 => {
+                Some((start as usize, end as usize))
+            }
+            _ => None,
+        }
     }
 
     /// Returns capture groups for the leftmost match starting at or after `from`.

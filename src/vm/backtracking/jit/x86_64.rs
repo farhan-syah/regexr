@@ -68,6 +68,8 @@ pub(super) struct BacktrackingCompiler {
     /// Current capture index being filled (used to update capture end on backtrack).
     /// None if not inside a capture.
     current_capture: Option<u32>,
+    /// Byte-set tables to emit as data once the code is complete.
+    byte_set_tables: Vec<(dynasmrt::DynamicLabel, crate::literal::ByteSet)>,
 }
 
 impl BacktrackingCompiler {
@@ -97,6 +99,7 @@ impl BacktrackingCompiler {
             budget_exhausted_label,
             capture_count: hir.props.capture_count,
             current_capture: None,
+            byte_set_tables: Vec::new(),
         })
     }
 
@@ -130,6 +133,9 @@ impl BacktrackingCompiler {
         // Emit epilogue (shared by success and no-match)
         self.emit_epilogue();
 
+        // Data, so it follows every reachable instruction.
+        self.emit_byte_set_tables();
+
         // Finalize the code
         let code = self
             .asm
@@ -152,6 +158,53 @@ impl BacktrackingCompiler {
             // Set by `compile_backtracking` when the pattern reads left context.
             needs_left_context: false,
         })
+    }
+
+    /// Advances the start position past every byte no match can begin with.
+    ///
+    /// Without this the outer loop pays a full attempt — the capture reset, the
+    /// stack reset and the first element's own test — at every position in the
+    /// input. A pattern whose first byte is constrained can reject most of them
+    /// with one table lookup instead, which is what makes a search over text
+    /// that mostly does not match cost a scan rather than an attempt per byte.
+    ///
+    /// Emitted only when the byte set is known and is not every byte; otherwise
+    /// nothing is emitted and the loop is unchanged.
+    fn emit_start_byte_skip(&mut self) {
+        let Some(set) = crate::literal::first_byte_set(&self.hir) else {
+            return;
+        };
+
+        let table = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; lea rax, [=>table]
+            ; scan:
+            // A start at the end of the input reads no byte; leave it to the
+            // attempt, which is where an empty match is decided.
+            ; cmp r13, rsi
+            ; jae >scanned
+            ; movzx ecx, BYTE [rdi + r13]
+            ; cmp BYTE [rax + rcx], 0
+            ; jne >scanned
+            ; inc r13
+            ; jmp <scan
+            ; scanned:
+        );
+        self.byte_set_tables.push((table, set));
+    }
+
+    /// Emits the byte-set tables read by [`Self::emit_start_byte_skip`].
+    ///
+    /// They are data, so they go after every instruction the function can reach.
+    fn emit_byte_set_tables(&mut self) {
+        for (label, set) in std::mem::take(&mut self.byte_set_tables) {
+            dynasm!(self.asm
+                ; .arch x64
+                ; =>label
+                ; .bytes set
+            );
+        }
     }
 
     /// Emits the function prologue.
@@ -232,6 +285,12 @@ impl BacktrackingCompiler {
         dynasm!(self.asm
             ; .arch x64
             ; =>self.next_start_label
+        );
+
+        self.emit_start_byte_skip();
+
+        dynasm!(self.asm
+            ; .arch x64
             // Reset captures for new attempt
             // Use rax = -1 for resetting
             ; mov rax, -1i32 as i64 as i32
