@@ -5,6 +5,18 @@
 
 use std::sync::OnceLock;
 
+/// Truncates to at most `target_size` bytes without splitting a character.
+fn truncate_to_chars(text: &mut String, target_size: usize) {
+    if text.len() <= target_size {
+        return;
+    }
+    let mut end = target_size;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
 /// Cached test data to avoid regeneration overhead
 static CACHED_DATA: OnceLock<TestDataCache> = OnceLock::new();
 
@@ -113,7 +125,7 @@ fn generate_email_data(target_size: usize) -> String {
         toggle = !toggle;
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -137,7 +149,7 @@ fn generate_url_data(target_size: usize) -> String {
         result.push_str(" for more information. ");
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -172,7 +184,7 @@ fn generate_log_data(target_size: usize) -> String {
         }
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -194,7 +206,7 @@ fn generate_json_data(target_size: usize) -> String {
     }
 
     result.push_str("]}");
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -211,7 +223,7 @@ fn generate_ip_data(target_size: usize) -> String {
         octet += 1;
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -237,7 +249,7 @@ fn generate_html_data(target_size: usize) -> String {
     }
 
     result.push_str("</body></html>");
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -258,7 +270,7 @@ fn generate_text_data(target_size: usize) -> String {
         result.push(' ');
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -281,7 +293,7 @@ fn generate_code_data(target_size: usize) -> String {
         result.push('\n');
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
 
@@ -309,6 +321,6 @@ pub fn generate_unicode_data(target_size: usize) -> String {
         result.push_str(" • ");
     }
 
-    result.truncate(target_size);
+    truncate_to_chars(&mut result, target_size);
     result
 }
