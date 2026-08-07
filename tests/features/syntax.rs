@@ -116,6 +116,28 @@ fn test_shorthand_whitespace() {
     assert_eq!(m.as_str(), " ");
 }
 
+#[test]
+fn test_shorthand_non_digit() {
+    let re = regex("\\D");
+    let m = re.find("a").unwrap();
+    assert_eq!(m.as_str(), "a");
+}
+
+#[test]
+fn test_shorthand_non_digit_plus() {
+    let re = regex("\\D+");
+    let m = re.find("123abc456").unwrap();
+    assert_eq!(m.as_str(), "abc");
+}
+
+#[test]
+fn test_shorthand_non_digit_with_literal_prefix() {
+    let re = regex("a\\Db");
+    let m = re.find("axb").unwrap();
+    assert_eq!(m.as_str(), "axb");
+    assert!(!re.is_match("a1b"));
+}
+
 // =============================================================================
 // Quantifiers
 // =============================================================================

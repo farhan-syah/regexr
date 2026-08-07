@@ -859,7 +859,7 @@ const CLASSES: &[Feature] = &[
     Feature {
         syntax: r"\d, \D",
         desc: "decimal digit class and its negation",
-        support: Support::No,
+        support: Support::Yes,
         covered_by: None,
         probes: &[
             Probe {

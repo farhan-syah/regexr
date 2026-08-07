@@ -85,9 +85,11 @@ pub fn extract_literals(hir: &Hir) -> Literals {
 fn starts_with_digit_class(expr: &HirExpr) -> bool {
     match expr {
         HirExpr::Class(class) => {
-            // Only return true if ALL ranges are within the digit range 0-9.
-            // This ensures we don't match \w which includes [A-Za-z0-9_].
-            !class.ranges.is_empty()
+            // Only return true if the class is non-negated and ALL ranges are
+            // within the digit range 0-9. This ensures we don't match \w
+            // (which includes [A-Za-z0-9_]) or \D (negated digit class).
+            !class.negated
+                && !class.ranges.is_empty()
                 && class
                     .ranges
                     .iter()
