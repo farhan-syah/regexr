@@ -103,20 +103,40 @@ fn the_expansion_limit_can_be_raised() {
 ///
 /// This is the property the number was chosen for; the number itself is free to
 /// move as long as this holds.
+///
+/// The claim is that *the expansion count* bounds compile time, so the check is
+/// against the same pattern at a tenth the expansion rather than against a wall
+/// clock: an absolute millisecond ceiling measures the machine as much as the
+/// engine, and an unoptimized test build on a loaded CI runner is an order of
+/// magnitude off a release build on an idle one. A ratio cancels that out. Near
+/// the limit, compilation is linear in expanded elements, so the honest number
+/// here is 10; the margin covers timing noise and the fixed per-compile cost the
+/// smaller pattern pays proportionally more of.
 #[test]
 fn the_largest_accepted_pattern_compiles_promptly() {
-    // Just inside the limit: 10 x 999 elements.
-    let pattern = r"(?:[a-z]{999}){10}";
-    let regex = regexr::Regex::new(pattern);
-    assert!(regex.is_ok(), "{pattern} should be within the limit");
+    /// Best of several runs: a scheduler preempting one run inflates that
+    /// sample, and only the minimum is a measurement of the compiler.
+    fn fastest_compile_ms(pattern: &str) -> f64 {
+        (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                let regex = regexr::Regex::new(pattern);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                assert!(regex.is_ok(), "{pattern} should be within the limit");
+                ms
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
 
-    let start = Instant::now();
-    let _ = regexr::Regex::new(pattern);
-    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    // Just inside the limit: 10 x 999 elements, against a tenth of it.
+    let full = fastest_compile_ms(r"(?:[a-z]{999}){10}");
+    let tenth = fastest_compile_ms(r"(?:[a-z]{999}){1}");
 
+    let ratio = full / tenth;
     assert!(
-        ms <= 1000.0,
-        "compiling the largest accepted pattern took {ms:.0} ms; the expansion \
-         limit is no longer bounding compile time"
+        ratio <= 40.0,
+        "compiling the largest accepted pattern took {full:.0} ms against \
+         {tenth:.0} ms for a tenth of the expansion ({ratio:.1}x for 10x the \
+         elements); the expansion limit is no longer bounding compile time"
     );
 }
