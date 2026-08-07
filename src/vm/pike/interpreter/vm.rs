@@ -555,17 +555,12 @@ impl PikeVm {
 
                 // Arc::clone is O(1) - just increments reference count
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                let mut found = false;
-                for lookback_start in 0..=pos {
-                    let slice = &input[lookback_start..pos];
-                    // Check if inner pattern matches the entire slice (anchored)
-                    if let Some((s, e)) = inner_vm.find(slice) {
-                        if s == 0 && e == slice.len() {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+                // A lookbehind `(?<=X)` requires X to end exactly at `pos`. Run the
+                // inner anchored at each candidate start against the FULL input, so
+                // an inner assertion (`\b`, `^`, another lookbehind) sees the bytes
+                // before that start — matching a detached slice would hide them.
+                let found = (0..=pos)
+                    .any(|lookback_start| inner_vm.match_at(input, lookback_start) == Some(pos));
 
                 // Cache the result
                 lookaround_cache.insert((state_id, pos), found);
@@ -588,16 +583,10 @@ impl PikeVm {
 
                 // Arc::clone is O(1) - just increments reference count
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                let mut found = false;
-                for lookback_start in 0..=pos {
-                    let slice = &input[lookback_start..pos];
-                    if let Some((s, e)) = inner_vm.find(slice) {
-                        if s == 0 && e == slice.len() {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+                // Same as the positive form: anchor the inner at each candidate
+                // start over the FULL input and require it to end exactly at `pos`.
+                let found = (0..=pos)
+                    .any(|lookback_start| inner_vm.match_at(input, lookback_start) == Some(pos));
 
                 // Cache the result (true = lookaround succeeded, i.e., inner did NOT match)
                 let result = !found;

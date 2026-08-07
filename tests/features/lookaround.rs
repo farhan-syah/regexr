@@ -195,3 +195,28 @@ fn negative_lookahead_nested_in_negative_lookahead_double_negates() {
     assert_eq!(re.find("xy").map(|m| m.as_str()), Some("x"));
     assert!(!re.is_match("xz"));
 }
+
+#[test]
+fn lookbehind_sees_the_bytes_before_its_own_start() {
+    // The inner `(?<=x)` has to look further left than the outer `(?<=ya)`
+    // begins. Matching the outer against a detached slice would hide the `x`.
+    let re = regex(r"a(?<=(?<=x)ya)");
+    assert_eq!(re.find("xya").map(|m| m.as_str()), Some("a"));
+    assert!(
+        !re.is_match("zya"),
+        "the inner (?<=x) must still be checked"
+    );
+}
+
+#[test]
+fn stacked_lookbehinds_are_all_checked() {
+    let re = regex(r"(?<=a)(?<=xa)b");
+    assert_eq!(re.find("xab").map(|m| m.as_str()), Some("b"));
+    assert!(!re.is_match("yab"));
+}
+
+#[test]
+fn word_boundary_inside_a_lookbehind_sees_real_context() {
+    let re = regex(r"(?<=\bfoo)bar");
+    assert_eq!(re.find("foobar").map(|m| m.as_str()), Some("bar"));
+}
