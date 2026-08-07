@@ -95,6 +95,52 @@ fn requesting_jit_never_downgrades_the_engine() {
         );
     }
 
+    // Nothing about the *results* changes when either of the next two
+    // regresses, so both assertions are on the selection itself.
+    //
+    // A pattern that is one repeated byte class is answered by a scan, not by
+    // the bit-parallel automaton — so JIT-compiling that automaton, or reaching
+    // for the DFA JIT, compiles the very thing the scan exists to replace.
+    // `\w+`, the tokenizer pattern, ran ~2x slower under `jit(true)` both ways.
+    // A *negated* class is not this shape: it lowers to an ASCII class beside a
+    // UTF-8 trie, which is not one byte per iteration.
+    const RUN_PATTERNS: &[&str] = &[r"\w+", r"\d+", r"[a-z]+", r"[0-9a-f]{2,}", r"\w{2,8}"];
+
+    for pattern in RUN_PATTERNS {
+        let plain = regexr::Regex::new(pattern).unwrap();
+        let jitted = regexr::RegexBuilder::new(pattern)
+            .jit(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            plain.engine_name(),
+            jitted.engine_name(),
+            "{pattern}: a repeated byte class must reach the same engine either way"
+        );
+    }
+
+    // A word boundary next to an effective prefilter is the DFA JIT's worst
+    // shape: the prefilter finds a literal, the boundary is what makes those
+    // candidates fail ("the" inside "their"), and the DFA JIT has no anchored
+    // entry, so a failed candidate becomes a scan of the rest of the input
+    // instead of a rejection. `\bthe\b` ran ~2.5x slower under `jit(true)` than
+    // under `Regex::new` until both paths agreed here.
+    const BOUNDARY_PATTERNS: &[&str] = &[r"\bthe\b", r"\bword\b", r"\bfoo\b\s"];
+
+    for pattern in BOUNDARY_PATTERNS {
+        let plain = regexr::Regex::new(pattern).unwrap();
+        let jitted = regexr::RegexBuilder::new(pattern)
+            .jit(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            plain.engine_name(),
+            jitted.engine_name(),
+            "{pattern}: a literal guarded by a word boundary must reach the same \
+             engine either way"
+        );
+    }
+
     // Whatever each path selects, they must agree on what they find.
     const PATTERNS: &[&str] = &[
         r#"(['"])[^'"]*\1"#,

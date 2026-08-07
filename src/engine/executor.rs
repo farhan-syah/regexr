@@ -1289,6 +1289,29 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         return compile_with_pikevm(hir);
     }
 
+    // One repeated byte class is answered by a scan in the interpreted ShiftOr,
+    // and no engine on this path beats it: JitShiftOr compiles the bit-parallel
+    // automaton the scan replaces, and the DFA JIT is slower still. `\w+` — the
+    // tokenizer pattern — is ~2x slower under either than interpreted.
+    if crate::vm::is_class_run_shape(hir) {
+        return compile_from_hir(hir);
+    }
+
+    // A word boundary plus an effective prefilter is the DFA JIT's worst shape,
+    // and the interpreted engines' best. The prefilter finds a literal, but the
+    // boundary is exactly what makes those candidates fail — "the" inside
+    // "their" — and the DFA JIT has no anchored entry point, so a failed
+    // candidate turns into a scan of everything after it rather than a rejection.
+    // The engines `compile_from_hir` picks verify one position and move on, which
+    // is why `\bthe\b` runs ~2.5x faster there. Selecting a worse engine than
+    // `Regex::new` is the one thing `jit(true)` must never do.
+    if hir.props.has_word_boundary && !hir.props.has_backrefs {
+        let literals = extract_literals(hir);
+        if Prefilter::from_literals(&literals).is_effective() {
+            return compile_from_hir(hir);
+        }
+    }
+
     // 3. Small patterns without effective prefilter → JitShiftOr
     // ShiftOr's bit-parallel algorithm is faster than DFA JIT for patterns with
     // many alternations and no common prefix (no effective prefilter).
@@ -1308,6 +1331,10 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             } else {
                 crate::vm::ShiftOr::from_hir(hir)
             };
+            // A pattern the interpreter answers with a class-run scan must not
+            // be JIT-compiled: the generated code runs the bit-parallel
+            // automaton, which is exactly what the scan replaces. `\w+` is 2x
+            // slower JIT-compiled than interpreted.
             if let Some(shift_or) = shift_or {
                 if let Some(jit_shift_or) = jit::JitShiftOr::compile(&shift_or) {
                     let capture_nfa = if hir.props.capture_count > 0 {

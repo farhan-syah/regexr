@@ -23,8 +23,8 @@ pub use pike::{PikeVm, PikeVmContext, PikeVmEngine};
 
 // Re-export key types from shift_or module
 pub use shift_or::{
-    is_shift_or_compatible, is_shift_or_wide_compatible, ShiftOr, ShiftOrEngine,
-    ShiftOrInterpreter, ShiftOrWide,
+    is_class_run_shape, is_shift_or_compatible, is_shift_or_wide_compatible, ShiftOr,
+    ShiftOrEngine, ShiftOrInterpreter, ShiftOrWide,
 };
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]

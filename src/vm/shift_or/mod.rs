@@ -29,7 +29,9 @@ pub mod jit;
 // Re-exports
 pub use engine::ShiftOrEngine;
 pub use interpreter::ShiftOrInterpreter;
-pub use shared::{is_shift_or_compatible, is_shift_or_wide_compatible, ShiftOr, ShiftOrWide};
+pub use shared::{
+    is_class_run_shape, is_shift_or_compatible, is_shift_or_wide_compatible, ShiftOr, ShiftOrWide,
+};
 
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use jit::JitShiftOr;

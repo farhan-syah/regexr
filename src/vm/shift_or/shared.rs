@@ -2,7 +2,7 @@
 //!
 //! Contains the ShiftOr data structure used by both interpreter and JIT.
 
-use crate::hir::Hir;
+use crate::hir::{Hir, HirExpr};
 use crate::nfa::{
     compile_glushkov, compile_glushkov_wide, BitSet256, GlushkovNfa, GlushkovWideNfa,
     MAX_POSITIONS, MAX_POSITIONS_WIDE,
@@ -55,6 +55,107 @@ pub struct ShiftOr {
     pub(crate) has_start_anchor: bool,
     /// Whether the pattern has an end anchor ($).
     pub(crate) has_end_anchor: bool,
+    /// Set when the whole pattern is one repeated byte class, which a scan
+    /// answers directly. See [`ClassRun`].
+    pub(crate) class_run: Option<ClassRun>,
+}
+
+/// A pattern that is nothing but a repeated byte class — `\w+`, `\d+`,
+/// `[a-z]{2,}`.
+///
+/// Shift-Or answers such a pattern with two bit-parallel passes per match: one
+/// to bound the search and one anchored at the start it settles on. Both are
+/// per-byte loops over a state word, and neither learns anything a membership
+/// test would not: the match is the maximal run of class members beginning at
+/// the first member at or after the resume point.
+///
+/// `\w+` is the tokenizer pattern, and the one shape where this costs the most —
+/// a word-dense haystack makes every byte part of some match, so the two passes
+/// run over the whole input.
+#[derive(Debug, Clone)]
+pub(crate) struct ClassRun {
+    /// `table[byte]` is non-zero for a member of the class.
+    table: Box<[u8; 256]>,
+    /// Shortest run that counts as a match; always at least one, because a
+    /// nullable pattern matches everywhere and is not this shape.
+    min: usize,
+    /// Longest run to take, for `{n,m}`.
+    max: Option<usize>,
+}
+
+/// Whether a pattern is one repeated byte class, which the interpreted
+/// [`ShiftOr`] answers with a scan.
+///
+/// Engine selection needs this before it has built anything, so that a JIT build
+/// does not compile the bit-parallel automaton the scan exists to replace.
+pub fn is_class_run_shape(hir: &Hir) -> bool {
+    ClassRun::from_hir(hir).is_some()
+}
+
+impl ClassRun {
+    /// Recognises the shape in an HIR, or returns `None`.
+    ///
+    /// Deliberately narrow: one greedy repetition of one byte class, no capture
+    /// to fill, no assertion to evaluate, and a minimum of at least one. A
+    /// negated Unicode class does not qualify — it lowers to an alternation of
+    /// an ASCII class and a UTF-8 trie, which is not one byte per iteration.
+    fn from_hir(hir: &Hir) -> Option<Self> {
+        if hir.props.capture_count > 0 {
+            return None;
+        }
+        let HirExpr::Repeat(repeat) = &hir.expr else {
+            return None;
+        };
+        let HirExpr::Class(class) = &repeat.expr else {
+            return None;
+        };
+        if !repeat.greedy || repeat.min == 0 {
+            return None;
+        }
+        Some(Self {
+            table: Box::new(crate::literal::byte_class_set(&class.ranges, class.negated)),
+            min: repeat.min as usize,
+            max: repeat.max.map(|max| max as usize),
+        })
+    }
+
+    #[inline]
+    fn contains(&self, byte: u8) -> bool {
+        self.table.get(byte as usize).is_some_and(|m| *m != 0)
+    }
+
+    /// The leftmost run of at least `min` members starting at or after `from`.
+    ///
+    /// A run shorter than the minimum is not a match, and no start inside it can
+    /// begin a longer one, so the search resumes past it rather than at the next
+    /// byte.
+    fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        let mut pos = from;
+        loop {
+            while !self.contains(*input.get(pos)?) {
+                pos += 1;
+            }
+            let start = pos;
+            let limit = self.max.map_or(input.len(), |max| {
+                input.len().min(start.saturating_add(max))
+            });
+            while pos < limit && input.get(pos).is_some_and(|&b| self.contains(b)) {
+                pos += 1;
+            }
+            if pos - start >= self.min {
+                return Some((start, pos));
+            }
+            // Resume past the whole run rather than one byte into it: a start
+            // inside a run that was already too short can only produce a shorter
+            // one. Rescanning from every position instead stays linear in the
+            // input — a rejected run is shorter than `min`, and `min` is bounded
+            // by Shift-Or's position limit — but it is still `min` times the
+            // work, for an answer that cannot change.
+            while input.get(pos).is_some_and(|&b| self.contains(b)) {
+                pos += 1;
+            }
+        }
+    }
 }
 
 /// How much input the per-start attempts in [`ShiftOr::find_end_anchored`] may
@@ -84,7 +185,9 @@ impl ShiftOr {
         // Build Glushkov NFA (epsilon-free)
         let glushkov = compile_glushkov(hir)?;
 
-        Self::from_glushkov_with_boundaries(&glushkov, false, false)
+        let mut matcher = Self::from_glushkov_with_boundaries(&glushkov, false, false)?;
+        matcher.class_run = ClassRun::from_hir(hir);
+        Some(matcher)
     }
 
     /// Tries to compile an HIR with anchors into a Shift-Or matcher.
@@ -156,7 +259,17 @@ impl ShiftOr {
             has_trailing_word_boundary,
             has_start_anchor,
             has_end_anchor,
+            class_run: None,
         })
+    }
+
+    /// Whether this pattern is answered by a class-run scan.
+    ///
+    /// The scan lives in the interpreter, so JIT-compiling the bit-parallel
+    /// automaton instead would be a downgrade.
+    #[inline]
+    pub fn has_class_run(&self) -> bool {
+        self.class_run.is_some()
     }
 
     /// Returns true if this pattern has word boundaries.
@@ -263,6 +376,10 @@ impl ShiftOr {
     pub fn find_at(&self, input: &[u8], pos: usize) -> Option<(usize, usize)> {
         if pos > input.len() {
             return None;
+        }
+
+        if let Some(ref run) = self.class_run {
+            return run.find_from(input, pos);
         }
 
         // For start anchor: can only match at position 0
