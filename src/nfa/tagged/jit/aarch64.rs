@@ -888,24 +888,48 @@ impl TaggedNfaJitCompiler {
         use dynasmrt::DynasmLabelApi;
         let steps = self.extract_pattern_steps();
         let steps = Self::combine_greedy_with_lookahead(steps);
-        if steps.is_empty() {
-            return self.compile_with_fallback(None);
-        }
-        // Soundness guards (mirror x86_64 / `StepExtractor::extract`): bail to the
-        // PikeVm (`compile_with_fallback(None)`) when linear step extraction is
-        // unfaithful for the pattern — when it dropped or duplicated a zero-width
-        // assertion (per-kind tally ≠ NFA), when the JIT's backtracking is
-        // unreliable for the shape (greedy+lookaround / adjacent greedy), or when
-        // the interpreter's own extractor cannot represent the pattern. These
+        // Soundness guards (mirror x86_64 / `StepExtractor::extract`): refuse to
+        // JIT when linear step extraction is unfaithful for the pattern — when no
+        // step program came out at all, when extraction dropped or duplicated a
+        // zero-width assertion (per-kind tally ≠ NFA), when the JIT's backtracking
+        // is unreliable for the shape (greedy+lookaround / adjacent greedy), or
+        // when the interpreter's own extractor cannot represent the pattern. These
         // shapes are off the tiktoken hot path; correctness takes priority.
+        //
+        // An `Err` rather than the `-2` fallback stub: the stub routes to the
+        // PikeVm, whose greedy+lookaround backtracking diverges here, while an
+        // `Err` sends the executor to the TaggedNfa interpreter, the correct
+        // reference engine for exactly these shapes.
+        if steps.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Jit("pattern not expressible as JIT steps".to_string()),
+                "",
+            ));
+        }
         if crate::nfa::tagged::count_assertions_in_steps(&steps)
             != crate::nfa::tagged::count_assertions_in_nfa(&self.nfa)
-            || crate::nfa::tagged::jit_must_defer(&steps)
-            || crate::nfa::tagged::StepExtractor::new(&self.nfa)
-                .extract()
-                .is_none()
         {
-            return self.compile_with_fallback(None);
+            return Err(Error::new(
+                ErrorKind::Jit("step extraction dropped or duplicated an assertion".to_string()),
+                "",
+            ));
+        }
+        if crate::nfa::tagged::jit_must_defer(&steps) {
+            return Err(Error::new(
+                ErrorKind::Jit(
+                    "greedy+lookaround/adjacent-greedy deferred to interpreter".to_string(),
+                ),
+                "",
+            ));
+        }
+        if crate::nfa::tagged::StepExtractor::new(&self.nfa)
+            .extract()
+            .is_none()
+        {
+            return Err(Error::new(
+                ErrorKind::Jit("interpreter cannot represent pattern as steps".to_string()),
+                "",
+            ));
         }
         for step in &steps {
             if let PatternStep::Alt(alts) = step {
