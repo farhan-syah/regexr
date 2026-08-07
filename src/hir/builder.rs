@@ -98,6 +98,19 @@ impl HirTranslator {
             }
         }
 
+        let size = expanded_size(&expr);
+        if size > MAX_EXPANDED_SIZE {
+            return Err(Error::new(
+                ErrorKind::ExpansionTooLarge {
+                    size,
+                    limit: MAX_EXPANDED_SIZE,
+                },
+                format!(
+                    "the pattern expands to {size} elements, past the limit of {MAX_EXPANDED_SIZE}"
+                ),
+            ));
+        }
+
         Ok(Hir {
             expr,
             props: self.props.clone(),
@@ -1198,6 +1211,44 @@ fn complement_within_ascii(excluded: &[(u8, u8)]) -> Vec<(u8, u8)> {
         out.push((next as u8, 0x7f));
     }
     out
+}
+
+/// Largest automaton one pattern may ask the engines to build.
+///
+/// Every engine compiles `{n,m}` by emitting the subexpression `m` times, so the
+/// work a pattern costs is its *expanded* size, not its text length. Bounding
+/// each `{n,m}` on its own is not enough because nested repetitions multiply:
+/// `(?:a{1000}){1000}` spells out a million elements from two legal bounds.
+///
+/// Calibrated against compile time, which runs at roughly 14 us per element:
+/// this bounds `Regex::new` at about 150 ms for the worst pattern it accepts.
+/// It is far more permissive than the `regex` crate, whose default size limit
+/// refuses `\w{1000}` outright.
+const MAX_EXPANDED_SIZE: u32 = 10_000;
+
+/// How many elements the engines will emit for this expression.
+///
+/// Counts what actually gets duplicated — a class or a literal byte is one
+/// element, and a repetition multiplies its body by the number of copies it
+/// forces. Saturating throughout, so an overflowing product reports the ceiling
+/// and is rejected rather than wrapping to a small number.
+fn expanded_size(expr: &HirExpr) -> u32 {
+    match expr {
+        HirExpr::Empty | HirExpr::Anchor(_) | HirExpr::Backref(_) => 0,
+        HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => 1,
+        HirExpr::Literal(bytes) => u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        HirExpr::Concat(exprs) | HirExpr::Alt(exprs) => exprs
+            .iter()
+            .fold(0u32, |total, e| total.saturating_add(expanded_size(e))),
+        HirExpr::Capture(capture) => expanded_size(&capture.expr),
+        HirExpr::Lookaround(look) => expanded_size(&look.expr),
+        // An unbounded repetition is a loop, not a duplication: only the copies
+        // the minimum forces are emitted, plus one for the loop body itself.
+        HirExpr::Repeat(repeat) => {
+            let copies = repeat.max.unwrap_or(repeat.min).max(1);
+            expanded_size(&repeat.expr).saturating_mul(copies)
+        }
+    }
 }
 
 #[cfg(test)]

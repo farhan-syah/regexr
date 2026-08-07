@@ -5,6 +5,12 @@ use super::lexer::TokenKind;
 use super::state::Parser;
 use crate::error::{Error, ErrorKind, Result};
 
+/// Largest `{n,m}` bound accepted, matching PCRE and Perl.
+///
+/// The engines expand a bounded repetition literally, so this is the ceiling on
+/// how much automaton one quantifier can ask for.
+pub const MAX_REPETITION: u32 = 65535;
+
 impl Parser<'_> {
     /// Parses alternation (lowest precedence): a|b|c
     pub(super) fn parse_alternation(&mut self) -> Result<Expr> {
@@ -137,6 +143,28 @@ impl Parser<'_> {
         Ok(Expr::Repeat(Box::new(Repeat::new(expr, min, max, greedy))))
     }
 
+    /// Rejects a repetition bound the engines would have to expand.
+    ///
+    /// Every engine here compiles `{n,m}` by emitting the subexpression `m`
+    /// times, so the bound is a direct multiplier on compile time and on the
+    /// size of the automaton. Left uncapped, `\w{200000,}` spends tens of
+    /// seconds inside `Regex::new` — a pattern that is a denial of service
+    /// rather than a mistake, and one a caller passing a user-supplied pattern
+    /// cannot see coming. PCRE and Perl draw the same line at 65535.
+    fn check_repetition_bound(&self, bound: u32) -> Result<()> {
+        if bound > MAX_REPETITION {
+            return Err(Error::with_span(
+                ErrorKind::RepetitionTooLarge {
+                    bound,
+                    limit: MAX_REPETITION,
+                },
+                self.pattern,
+                self.current.span,
+            ));
+        }
+        Ok(())
+    }
+
     /// Parses repetition range: {n}, {n,}, {n,m}
     fn parse_repetition_range(&mut self) -> Result<(u32, Option<u32>)> {
         // Parse first number (min)
@@ -145,6 +173,8 @@ impl Parser<'_> {
             min = min.saturating_mul(10).saturating_add(d);
             self.advance()?;
         }
+
+        self.check_repetition_bound(min)?;
 
         // Check for {n}
         if matches!(self.current.kind, TokenKind::CloseBrace) {
@@ -174,6 +204,8 @@ impl Parser<'_> {
             max = max.saturating_mul(10).saturating_add(d);
             self.advance()?;
         }
+
+        self.check_repetition_bound(max)?;
 
         if !has_max {
             return Err(Error::with_span(

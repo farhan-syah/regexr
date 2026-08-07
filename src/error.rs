@@ -79,6 +79,20 @@ pub enum ErrorKind {
     UnknownPosixClass(String),
     /// Invalid repetition syntax.
     InvalidRepetition,
+    /// The pattern expands to more elements than the engines will build.
+    ExpansionTooLarge {
+        /// Elements the pattern expands to.
+        size: u32,
+        /// The largest expansion accepted.
+        limit: u32,
+    },
+    /// A repetition bound past what the engines will expand.
+    RepetitionTooLarge {
+        /// The bound the pattern asked for.
+        bound: u32,
+        /// The largest bound accepted.
+        limit: u32,
+    },
     /// Repetition quantifier on nothing.
     RepetitionOnNothing,
     /// Invalid character class range (e.g., z-a).
@@ -228,6 +242,14 @@ impl fmt::Display for ErrorKind {
                 write!(f, "unknown POSIX class '[:{}:]'", name)
             }
             ErrorKind::InvalidRepetition => write!(f, "invalid repetition syntax"),
+            ErrorKind::ExpansionTooLarge { size, limit } => write!(
+                f,
+                "pattern expands to {size} elements, exceeding the limit of {limit}"
+            ),
+            ErrorKind::RepetitionTooLarge { bound, limit } => write!(
+                f,
+                "repetition count {bound} exceeds the limit of {limit}"
+            ),
             ErrorKind::RepetitionOnNothing => write!(f, "quantifier on nothing"),
             ErrorKind::InvalidClassRange { start, end } => {
                 write!(f, "invalid character class range '{}-{}'", start, end)
