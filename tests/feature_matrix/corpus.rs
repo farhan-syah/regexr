@@ -266,6 +266,10 @@ const QUANTIFIERS: &[Feature] = &[
             },
         ],
     },
+    // Deliberately unsupported: possessive quantifiers bound backtracking, and
+    // regexr's engines do not backtrack. Rejected with a diagnostic naming the
+    // construct rather than silently accepted as plain greedy, which is only
+    // usually equivalent.
     Feature {
         syntax: "*+, ++, ?+, {}+",
         desc: "possessive suffix on a quantifier, forbidding backtracking into it",
@@ -1624,6 +1628,9 @@ const GROUPING: &[Feature] = &[
             xmode: false,
         }],
     },
+    // Deliberately unsupported, for the same reason as possessive quantifiers:
+    // an atomic group only constrains a backtracking search. RE2 and the `regex`
+    // crate omit it on the same grounds.
     Feature {
         syntax: "(?>…)",
         desc: "atomic group, no backtracking once matched",

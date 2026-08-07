@@ -72,6 +72,15 @@ impl Parser<'_> {
                     }
                 }
 
+                // Atomic group (?>...): deliberately unsupported, since
+                // regexr's engines are linear-time and never backtrack, so
+                // there is nothing for an atomic group to bound.
+                TokenKind::GreaterThan => Err(Error::with_span(
+                    ErrorKind::AtomicGroup,
+                    self.pattern,
+                    start_span,
+                )),
+
                 // Lookahead (?=...) or (?!...)
                 TokenKind::Equals => {
                     self.advance()?;

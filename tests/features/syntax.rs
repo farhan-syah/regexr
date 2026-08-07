@@ -248,6 +248,37 @@ fn test_star() {
     assert!(re.is_match("aaa"));
 }
 
+// Lazy quantifiers (a*?, a+?, a??, a{2,3}?): the trailing `?` after a
+// quantifier selects non-greedy matching and must keep parsing successfully
+// — it is not a possessive suffix and must not be confused with one.
+#[test]
+fn test_lazy_star() {
+    let re = regex("a*?");
+    let m = re.find("aaa").unwrap();
+    assert_eq!(m.as_str(), "");
+}
+
+#[test]
+fn test_lazy_plus() {
+    let re = regex("a+?");
+    let m = re.find("aaa").unwrap();
+    assert_eq!(m.as_str(), "a");
+}
+
+#[test]
+fn test_lazy_optional() {
+    let re = regex("a??");
+    let m = re.find("aaa").unwrap();
+    assert_eq!(m.as_str(), "");
+}
+
+#[test]
+fn test_lazy_bounded_repeat() {
+    let re = regex("a{2,3}?");
+    let m = re.find("aaaa").unwrap();
+    assert_eq!(m.as_str(), "aa");
+}
+
 // =============================================================================
 // Anchors
 // =============================================================================
@@ -681,6 +712,40 @@ fn inline_comment_works_under_extended_mode() {
 fn inline_comment_works_under_extended_mode_with_surrounding_whitespace() {
     let re = regex("(?x) a (?#note) b");
     assert!(re.is_match("ab"));
+}
+
+// =============================================================================
+// Non-capturing groups (?:...)
+// =============================================================================
+// `(?:` shares the `TokenKind::Question` dispatch in `parse_group` with the
+// atomic-group `(?>` arm added alongside it; this pins that the two remain
+// distinguished.
+
+#[test]
+fn test_non_capturing_group() {
+    let re = regex("(?:ab)+c");
+    assert!(re.is_match("ababc"));
+    assert_eq!(re.captures("ababc").unwrap().len(), 1); // no capture groups
+}
+
+// =============================================================================
+// `+` as a literal, not a quantifier
+// =============================================================================
+// A `+` that is not immediately preceded by a quantifier (inside a character
+// class, or escaped) must remain an ordinary character — it must not be
+// mistaken for the possessive-quantifier suffix.
+
+#[test]
+fn test_literal_plus_in_class() {
+    let re = regex(r"[a+]+");
+    assert_eq!(re.find("a++a").unwrap().as_str(), "a++a");
+}
+
+#[test]
+fn test_escaped_literal_plus() {
+    let re = regex(r"a\+b");
+    assert!(re.is_match("a+b"));
+    assert!(!re.is_match("ab"));
 }
 
 // =============================================================================

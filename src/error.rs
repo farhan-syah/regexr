@@ -111,6 +111,14 @@ pub enum ErrorKind {
     UnknownGroupName(String),
     /// Nested quantifiers (e.g., a**).
     NestedQuantifier,
+    /// Possessive quantifier (e.g., `a*+`, `a++`, `a?+`, `a{n,m}+`). Not
+    /// supported: regexr's engines are linear-time and never backtrack
+    /// catastrophically, so possessive quantifiers — which exist to bound
+    /// backtracking — have nothing to bound here.
+    PossessiveQuantifier,
+    /// Atomic group (`(?>...)`). Not supported for the same reason as
+    /// possessive quantifiers: regexr does not backtrack.
+    AtomicGroup,
 
     // Compile errors
     /// Pattern too large.
@@ -241,6 +249,14 @@ impl fmt::Display for ErrorKind {
                 write!(f, "backreference to unknown group name '{}'", name)
             }
             ErrorKind::NestedQuantifier => write!(f, "nested quantifiers are not allowed"),
+            ErrorKind::PossessiveQuantifier => write!(
+                f,
+                "possessive quantifiers are not supported; regexr does not backtrack, so plain greedy is usually equivalent"
+            ),
+            ErrorKind::AtomicGroup => write!(
+                f,
+                "atomic groups `(?>…)` are not supported; regexr does not backtrack, so they are usually unnecessary"
+            ),
             ErrorKind::PatternTooLarge => write!(f, "pattern too large"),
             ErrorKind::TooManyCaptureGroups => write!(f, "too many capture groups"),
             ErrorKind::TooManyStates => write!(f, "too many NFA states"),

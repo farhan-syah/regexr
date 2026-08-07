@@ -103,11 +103,29 @@ impl Parser<'_> {
             true
         };
 
-        // Check for nested quantifier (*, +, {n} after a quantifier)
+        // Check for a possessive suffix (+ directly after a quantifier or its
+        // lazy `?` modifier): a*+, a++, a?+, a{n,m}+. This must be checked
+        // BEFORE the nested-quantifier check below, since a possessive `+`
+        // would otherwise be misreported as a nested quantifier. Note that
+        // greedy was just determined above: a leading `?` was already
+        // consumed as the lazy modifier, so `a*+` and `a*?+` both land here
+        // with `Plus` as the current token, while `a**` and `a*{2}` do not
+        // and correctly fall through to the nested-quantifier check.
+        if matches!(self.current.kind, TokenKind::Plus) {
+            let span = self.current.span;
+            return Err(Error::with_span(
+                ErrorKind::PossessiveQuantifier,
+                self.pattern,
+                span,
+            ));
+        }
+
+        // Check for nested quantifier (*, {n} after a quantifier). `+` is
+        // handled above as the possessive suffix, so it never reaches here.
         // Note: This comes AFTER handling non-greedy ?, so *? is allowed
         if matches!(
             self.current.kind,
-            TokenKind::Star | TokenKind::Plus | TokenKind::Question | TokenKind::OpenBrace
+            TokenKind::Star | TokenKind::Question | TokenKind::OpenBrace
         ) {
             return Err(Error::with_span(
                 ErrorKind::NestedQuantifier,

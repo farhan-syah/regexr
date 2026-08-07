@@ -74,6 +74,17 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"[a-z~~]",
     r"[&&a-z]",
     r"[a-z&&",
+    // Possessive quantifiers and atomic groups: deliberately unsupported,
+    // since regexr's engines are linear-time and never backtrack.
+    r"a*+",
+    r"a++",
+    r"a?+",
+    r"a{2,3}+",
+    r"(?>a*)b",
+    // Genuinely nested (not possessive) quantifiers: still rejected, and
+    // must keep reporting NestedQuantifier rather than PossessiveQuantifier.
+    r"a**",
+    r"a*{2}",
 ];
 
 #[test]
@@ -167,6 +178,52 @@ fn class_escape_error_names_the_offending_escape() {
         assert!(
             !err.contains(r"\?"),
             "diagnostic for {pattern} reports a placeholder instead of the escape: {err}"
+        );
+    }
+}
+
+/// Possessive quantifiers and atomic groups are deliberately unsupported
+/// (regexr's engines are linear-time and never backtrack, so there's nothing
+/// for either construct to bound). The point of this test is the *message*:
+/// a bare `is_err()` check would not catch a regression back to a misleading
+/// diagnostic (e.g. possessive `+` reported as "nested quantifiers", or an
+/// atomic group reported as generic "invalid group syntax").
+#[test]
+fn possessive_and_atomic_diagnostics_name_the_construct() {
+    let err = compile("a*+")
+        .expect_err("a*+ must be rejected")
+        .to_string();
+    assert!(
+        err.contains("possessive"),
+        "diagnostic for a*+ should mention possessive quantifiers: {err}"
+    );
+
+    let err = compile("(?>a*)b")
+        .expect_err("(?>a*)b must be rejected")
+        .to_string();
+    assert!(
+        err.contains("atomic"),
+        "diagnostic for (?>a*)b should mention atomic groups: {err}"
+    );
+}
+
+/// Genuinely nested quantifiers (`a**`, `a*{2}`) are a distinct construct
+/// from possessive quantifiers (`a*+`) and must keep reporting the
+/// nested-quantifier diagnostic, not be swept into the new possessive one by
+/// too broad a check.
+#[test]
+fn nested_quantifier_diagnostic_is_unaffected_by_possessive_detection() {
+    for pattern in [r"a**", r"a*{2}"] {
+        let err = compile(pattern)
+            .expect_err(&format!("{pattern} must be rejected"))
+            .to_string();
+        assert!(
+            err.contains("nested"),
+            "diagnostic for {pattern} should mention nested quantifiers: {err}"
+        );
+        assert!(
+            !err.contains("possessive"),
+            "diagnostic for {pattern} should not be misreported as possessive: {err}"
         );
     }
 }
