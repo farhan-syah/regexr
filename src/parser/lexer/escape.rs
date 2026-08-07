@@ -52,7 +52,8 @@ impl Lexer<'_> {
             // the UAX #29 boundary rules.
             'X' => EscapeKind::GraphemeCluster,
 
-            // Hex escape
+            // Hex escape: \xHH (exactly two digits) or \x{H..HHHHHH} (braced,
+            // 1-6 digits, same syntax and range as \u{...}).
             'x' => {
                 let ch = self.lex_hex_escape(start)?;
                 EscapeKind::Hex(ch)
@@ -62,6 +63,14 @@ impl Lexer<'_> {
             'u' => {
                 let ch = self.lex_unicode_escape(start)?;
                 EscapeKind::Unicode(ch)
+            }
+
+            // Control escape: \cX is the ASCII code of X with bit 0x40
+            // cleared (\cA is U+0001, \cZ is U+001A). A plain character
+            // escape, so it is also valid inside a character class.
+            'c' => {
+                let ch = self.lex_control_escape(start)?;
+                EscapeKind::Literal(ch)
             }
 
             // Unicode property
@@ -103,8 +112,15 @@ impl Lexer<'_> {
         Ok(TokenKind::Escape(escape))
     }
 
-    /// Lexes a hex escape (\xHH).
+    /// Lexes a hex escape: `\xHH` (exactly two digits) or the braced form
+    /// `\x{H..HHHHHH}` (1-6 digits), which shares its scanning with `\u{...}`
+    /// via [`Lexer::lex_braced_hex`] — same digit count, same rejection of
+    /// surrogates and out-of-range values through `char::from_u32`.
     fn lex_hex_escape(&mut self, start: usize) -> Result<char> {
+        if self.peek_char() == Some('{') {
+            return self.lex_braced_hex(start, ErrorKind::InvalidHexEscape);
+        }
+
         let mut value = 0u32;
 
         for _ in 0..2 {
@@ -138,58 +154,8 @@ impl Lexer<'_> {
 
     /// Lexes a unicode escape (\u{HHHH} or \uHHHH).
     fn lex_unicode_escape(&mut self, start: usize) -> Result<char> {
-        let braced = self.peek_char() == Some('{');
-
-        if braced {
-            self.next_char(); // consume '{'
-
-            let mut value = 0u32;
-            let mut count = 0;
-
-            loop {
-                match self.peek_char() {
-                    Some('}') => {
-                        self.next_char();
-                        break;
-                    }
-                    Some(c) if c.is_ascii_hexdigit() => {
-                        self.next_char();
-                        let digit = c.to_digit(16).unwrap();
-                        value = value * 16 + digit;
-                        count += 1;
-                        if count > 6 {
-                            return Err(Error::with_span(
-                                ErrorKind::InvalidUnicodeEscape,
-                                self.src,
-                                Span::new(start, self.pos),
-                            ));
-                        }
-                    }
-                    _ => {
-                        return Err(Error::with_span(
-                            ErrorKind::InvalidUnicodeEscape,
-                            self.src,
-                            Span::new(start, self.pos),
-                        ));
-                    }
-                }
-            }
-
-            if count == 0 {
-                return Err(Error::with_span(
-                    ErrorKind::InvalidUnicodeEscape,
-                    self.src,
-                    Span::new(start, self.pos),
-                ));
-            }
-
-            char::from_u32(value).ok_or_else(|| {
-                Error::with_span(
-                    ErrorKind::InvalidUnicodeEscape,
-                    self.src,
-                    Span::new(start, self.pos),
-                )
-            })
+        if self.peek_char() == Some('{') {
+            self.lex_braced_hex(start, ErrorKind::InvalidUnicodeEscape)
         } else {
             // \uHHHH format
             let mut value = 0u32;
@@ -222,6 +188,75 @@ impl Lexer<'_> {
                 )
             })
         }
+    }
+
+    /// Lexes a braced hex payload `{H..HHHHHH}` (1-6 hex digits), already
+    /// positioned just before the `{`. Shared by `\u{...}` and `\x{...}` — the
+    /// only difference between the two escapes is which `ErrorKind` a
+    /// malformed payload reports.
+    ///
+    /// Rejects an empty brace, a non-hex character before the closing brace,
+    /// more than 6 digits, an unterminated brace (EOF before `}`), and any
+    /// value that is not a valid Unicode scalar value — `char::from_u32`
+    /// rejects both values above U+10FFFF and the surrogate range
+    /// U+D800..=U+DFFF, so both escapes reject surrogates identically.
+    fn lex_braced_hex(&mut self, start: usize, err: ErrorKind) -> Result<char> {
+        self.next_char(); // consume '{'
+
+        let mut value = 0u32;
+        let mut count = 0;
+
+        loop {
+            match self.peek_char() {
+                Some('}') => {
+                    self.next_char();
+                    break;
+                }
+                Some(c) if c.is_ascii_hexdigit() => {
+                    self.next_char();
+                    let digit = c.to_digit(16).unwrap();
+                    value = value * 16 + digit;
+                    count += 1;
+                    if count > 6 {
+                        return Err(Error::with_span(err, self.src, Span::new(start, self.pos)));
+                    }
+                }
+                _ => {
+                    return Err(Error::with_span(err, self.src, Span::new(start, self.pos)));
+                }
+            }
+        }
+
+        if count == 0 {
+            return Err(Error::with_span(err, self.src, Span::new(start, self.pos)));
+        }
+
+        char::from_u32(value)
+            .ok_or_else(|| Error::with_span(err, self.src, Span::new(start, self.pos)))
+    }
+
+    /// Lexes a control escape (\cX): the ASCII code of `X` with bit 0x40
+    /// cleared, accepting either case (`\ca` == `\cA` == U+0001). Rejects `\c`
+    /// at end of pattern and `\c` followed by a non-letter.
+    fn lex_control_escape(&mut self, start: usize) -> Result<char> {
+        let (_, c) = self.next_char().ok_or_else(|| {
+            Error::with_span(
+                ErrorKind::InvalidControlEscape,
+                self.src,
+                Span::new(start, self.pos),
+            )
+        })?;
+
+        if !c.is_ascii_alphabetic() {
+            return Err(Error::with_span(
+                ErrorKind::InvalidControlEscape,
+                self.src,
+                Span::new(start, self.pos),
+            ));
+        }
+
+        let code = (c.to_ascii_uppercase() as u8) & 0x1F;
+        Ok(code as char)
     }
 
     /// Lexes a Unicode property escape.

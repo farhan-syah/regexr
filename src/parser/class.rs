@@ -391,6 +391,15 @@ impl Parser<'_> {
                         self.advance()?;
                         Ok(ClassItem::Char(c))
                     }
+                    // `\b` is the word-boundary assertion outside a class, but
+                    // that reading is meaningless inside one; PCRE and Perl
+                    // instead give it the C-string sense of "backspace"
+                    // (U+0008) here. Outside a class this arm is never
+                    // reached, so bare `\b` is untouched.
+                    EscapeKind::WordBoundary => {
+                        self.advance()?;
+                        Ok(ClassItem::Char('\u{8}'))
+                    }
                     // Unicode properties \p{...} and \P{...}
                     EscapeKind::UnicodeProperty(name) => {
                         let name = name.clone();

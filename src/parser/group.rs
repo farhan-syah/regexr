@@ -104,6 +104,12 @@ impl Parser<'_> {
                     })))
                 }
 
+                // Note: `(?#...)` inline comments never reach the parser as
+                // tokens — the lexer recognizes `(?#` as a unit at the point
+                // `(` is scanned (see `Lexer::next_token`) and consumes the
+                // whole construct itself, so it behaves identically in every
+                // mode, including extended (`x`) mode.
+
                 // Python-style named group (?P<name>...)
                 TokenKind::Literal('P') => {
                     self.advance()?;

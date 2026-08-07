@@ -62,6 +62,8 @@ pub enum ErrorKind {
     InvalidHexEscape,
     /// Invalid unicode escape.
     InvalidUnicodeEscape,
+    /// Invalid control escape (e.g. `\c` at end of pattern, or `\c1`).
+    InvalidControlEscape,
     /// Invalid Unicode property (e.g., \p{InvalidName}).
     InvalidUnicodeProperty,
     /// Unknown Unicode property name.
@@ -187,6 +189,7 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::InvalidHexEscape => write!(f, "invalid hex escape sequence"),
             ErrorKind::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
+            ErrorKind::InvalidControlEscape => write!(f, "invalid control escape sequence"),
             ErrorKind::InvalidUnicodeProperty => write!(f, "invalid unicode property syntax"),
             ErrorKind::UnknownUnicodeProperty(name) => {
                 write!(f, "unknown unicode property '{}'", name)

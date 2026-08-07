@@ -1,7 +1,7 @@
 //! The character scanner: turns pattern text into [`Token`]s.
 
 use super::token::{Token, TokenKind};
-use crate::error::{Result, Span};
+use crate::error::{Error, ErrorKind, Result, Span};
 
 /// The lexer for regex patterns.
 pub struct Lexer<'a> {
@@ -130,6 +130,30 @@ impl<'a> Lexer<'a> {
                 }
             }
 
+            // `(?#...)` is a whole-construct comment in every mode (PCRE,
+            // Perl, .NET), including extended (`x`) mode. It must be
+            // recognized as a unit right here, at the point `(` is scanned —
+            // otherwise, under `x`, `skip_extended_trivia` would see the `#`
+            // on the *next* token and misparse it as a line comment,
+            // destroying the construct before the parser ever sees it.
+            if c == '(' && self.class_depth == 0 {
+                let mut lookahead = self.chars.clone();
+                let is_comment = matches!(lookahead.next(), Some((_, '?')))
+                    && matches!(lookahead.next(), Some((_, '#')));
+                if is_comment {
+                    self.next_char(); // consume '?'
+                    self.next_char(); // consume '#'
+                    if self.skip_comment() {
+                        continue;
+                    }
+                    return Err(Error::with_span(
+                        ErrorKind::UnmatchedOpenParen,
+                        self.src,
+                        Span::new(start, self.pos),
+                    ));
+                }
+            }
+
             let kind = if self.class_depth > 0 {
                 self.lex_class_char(c, start)?
             } else {
@@ -228,6 +252,21 @@ impl<'a> Lexer<'a> {
         }
 
         ident
+    }
+
+    /// Skips a `(?#...)` inline comment body, already positioned just past
+    /// the `#`. Consumes raw characters — bypassing tokenization entirely, so
+    /// the comment can contain anything, including metacharacters — up to and
+    /// including the first `)`, which cannot be escaped inside the comment.
+    /// Returns `true` if the comment was terminated by `)`, `false` if the
+    /// pattern ended first.
+    fn skip_comment(&mut self) -> bool {
+        while let Some((_, c)) = self.next_char() {
+            if c == ')' {
+                return true;
+            }
+        }
+        false
     }
 
     /// Reads a number (for repetition bounds).

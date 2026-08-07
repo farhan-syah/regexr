@@ -43,6 +43,12 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"[[:bogus:]]",
     r"[[:alpha]",
     r"[[::]]",
+    r"\x{}",
+    r"\x{ZZ}",
+    r"\x{110000}",
+    r"\x{263A",
+    r"\c",
+    r"\c1",
 ];
 
 #[test]
@@ -119,9 +125,13 @@ fn leading_invalid_escape_reports_position_zero() {
 
 /// Anchors are not character-class members. Rejecting them is correct; naming
 /// them in the diagnostic is what makes the rejection actionable.
+///
+/// `\b` is deliberately excluded here: inside a class it denotes backspace
+/// (U+0008), matching PCRE/Perl, rather than being rejected like the other
+/// assertions. See `escape_sequences::backspace_inside_class_denotes_u0008`.
 #[test]
 fn class_escape_error_names_the_offending_escape() {
-    for (pattern, escape) in [(r"[\b]", r"\b"), (r"[\B]", r"\B"), (r"[\z]", r"\z")] {
+    for (pattern, escape) in [(r"[\B]", r"\B"), (r"[\z]", r"\z")] {
         let err = compile(pattern)
             .expect_err(&format!("{pattern} must be rejected"))
             .to_string();

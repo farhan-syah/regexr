@@ -88,16 +88,9 @@ const GENERAL: &[Feature] = &[
     Feature {
         syntax: "(?#comment)",
         desc: "inline comment group, ignored and non-consuming",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"a(?#this is ignored)b",
-            matches: Some("ab"),
-            rejects: None,
-            expect: Some("ab"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::syntax"),
+        probes: &[],
     },
     Feature {
         syntax: "[#comment]",
@@ -412,16 +405,9 @@ const ESCAPES: &[Feature] = &[
     Feature {
         syntax: r"\x{XX…}",
         desc: "braced hexadecimal escape of variable length",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"\x{1F600}",
-            matches: Some("\u{1f600}"),
-            rejects: Some("A"),
-            expect: Some("\u{1f600}"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::escape_sequences"),
+        probes: &[],
     },
     Feature {
         syntax: r"\uXXXX",
@@ -482,16 +468,9 @@ const ESCAPES: &[Feature] = &[
     Feature {
         syntax: r"\cC",
         desc: "control-character escape, letter XORed against 0x40",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"\cJ",
-            matches: Some("\n"),
-            rejects: Some("J"),
-            expect: Some("\n"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::escape_sequences"),
+        probes: &[],
     },
     Feature {
         syntax: r"\CC",
@@ -562,16 +541,9 @@ const ESCAPES_IN_SETS: &[Feature] = &[
     Feature {
         syntax: r"[\b]",
         desc: "backspace character escape inside a bracket expression",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"[\b]",
-            matches: Some("\u{8}"),
-            rejects: Some("b"),
-            expect: Some("\u{8}"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::escape_sequences"),
+        probes: &[],
     },
     Feature {
         syntax: r"[\e]",
@@ -690,16 +662,9 @@ const ESCAPES_IN_SETS: &[Feature] = &[
     Feature {
         syntax: r"[\x{XX…}]",
         desc: "braced hexadecimal escape inside a bracket expression",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"[\x{1F600}]",
-            matches: Some("\u{1f600}"),
-            rejects: Some("A"),
-            expect: Some("\u{1f600}"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::escape_sequences"),
+        probes: &[],
     },
     Feature {
         syntax: r"[\uXXXX]",
@@ -760,16 +725,9 @@ const ESCAPES_IN_SETS: &[Feature] = &[
     Feature {
         syntax: r"[\cC]",
         desc: "control-character escape inside a bracket expression",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: r"[\cJ]",
-            matches: Some("\n"),
-            rejects: Some("J"),
-            expect: Some("\n"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::escape_sequences"),
+        probes: &[],
     },
     Feature {
         syntax: r"[\CC]",

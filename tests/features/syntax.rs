@@ -638,6 +638,52 @@ fn test_unicode_dot_all() {
 }
 
 // =============================================================================
+// Inline comments (?#...)
+// =============================================================================
+// `(?#...)` is a group-syntax construct (like `(?:...)` or `(?i)`), not a
+// character escape, so it lives here rather than in escape_sequences.rs or
+// inline_flags.rs (which is scoped specifically to the `(?flags...)` group
+// syntax, not inline groups in general).
+
+#[test]
+fn inline_comment_is_discarded_and_produces_no_match_content() {
+    let re = regex("a(?#note)b");
+    assert!(re.is_match("ab"));
+    assert!(!re.is_match("a(?#note)b"));
+}
+
+#[test]
+fn inline_comment_runs_to_the_first_close_paren() {
+    // The comment body can contain arbitrary characters, including ones that
+    // would otherwise be metacharacters, because it is never tokenized. The
+    // comment ends at the first `)`, so the pattern effectively reduces to
+    // just "ab".
+    let re = regex(r"a(?#[.*+?\d)b");
+    assert!(re.is_match("ab"));
+    assert!(!re.is_match("a"));
+}
+
+#[test]
+fn unterminated_inline_comment_is_rejected() {
+    assert!(regexr::Regex::new("a(?#unterminated").is_err());
+}
+
+#[test]
+fn inline_comment_works_under_extended_mode() {
+    // `(?#...)` is a whole-construct comment in every mode, including
+    // extended (`x`) mode — it must not be swallowed by the `x`-mode `#`
+    // line-comment trivia skipper.
+    let re = regex("(?x)a(?#note)b");
+    assert!(re.is_match("ab"));
+}
+
+#[test]
+fn inline_comment_works_under_extended_mode_with_surrounding_whitespace() {
+    let re = regex("(?x) a (?#note) b");
+    assert!(re.is_match("ab"));
+}
+
+// =============================================================================
 // Nested character classes (set union) — Rust `regex`-crate / HF semantics
 // =============================================================================
 

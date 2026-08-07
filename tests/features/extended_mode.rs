@@ -30,6 +30,16 @@ fn extended_mode_comment_runs_to_end_of_pattern() {
 }
 
 #[test]
+fn extended_mode_line_comment_and_inline_comment_coexist() {
+    // `(?#...)` is a whole-construct comment recognized independently of
+    // extended mode, while a bare `#` is still the `x`-mode line-comment
+    // starter. Both forms can appear in the same pattern without either one
+    // interfering with the other.
+    let re = regex("(?x)a(?#note)b # trailing line comment");
+    assert!(re.is_match("ab"));
+}
+
+#[test]
 fn extended_mode_escaped_whitespace_is_literal() {
     let re = regex(r"(?x) a \  b");
     assert!(re.is_match("a b"));
