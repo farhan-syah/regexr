@@ -122,6 +122,73 @@ fn leading_byte_set(expr: &HirExpr) -> Option<Vec<u8>> {
 /// text is no better than scanning.
 const MAX_LEADING_BYTES: usize = 3;
 
+/// A set of byte values as a membership table: `set[byte]` is non-zero when the
+/// byte belongs. One entry per value rather than one bit, so a lookup is a
+/// single indexed load.
+pub type ByteSet = [u8; 256];
+
+/// Every byte a match can begin with, or `None` when that cannot be pinned down.
+///
+/// This is the unbounded form of [`leading_byte_set`]: a search that tests one
+/// byte against a table does not care how many bytes are in it, so `\d+` and
+/// `\w+` qualify where a `memchr`-style prefilter does not.
+///
+/// `None` means "no useful restriction" and every position stays viable. It is
+/// the answer whenever the first consuming element is not a single byte class —
+/// including a nullable one, since then the element after it decides the byte
+/// too, and a set that misses a viable start would skip real matches.
+pub fn first_byte_set(hir: &Hir) -> Option<ByteSet> {
+    let mut set = [0u8; 256];
+    if !add_first_bytes(&hir.expr, &mut set) {
+        return None;
+    }
+    // A set every byte belongs to restricts nothing, and testing it would be
+    // pure overhead on the search's hottest loop.
+    set.contains(&0).then_some(set)
+}
+
+/// Adds every byte `expr` can begin with to `set`. Returns false when the set
+/// cannot be determined, in which case `set` is meaningless.
+fn add_first_bytes(expr: &HirExpr, set: &mut ByteSet) -> bool {
+    match expr {
+        HirExpr::Class(class) => {
+            let mut members = [0u8; 256];
+            for &(lo, hi) in &class.ranges {
+                for byte in lo..=hi {
+                    if let Some(entry) = members.get_mut(byte as usize) {
+                        *entry = 1;
+                    }
+                }
+            }
+            for (entry, member) in set.iter_mut().zip(members) {
+                *entry |= if class.negated { 1 - member } else { member };
+            }
+            true
+        }
+        HirExpr::Literal(bytes) => match bytes.first() {
+            Some(&byte) => {
+                if let Some(entry) = set.get_mut(byte as usize) {
+                    *entry = 1;
+                }
+                true
+            }
+            None => false,
+        },
+        HirExpr::Concat(exprs) => match exprs.iter().find(|expr| !is_zero_width(expr)) {
+            Some(expr) => add_first_bytes(expr, set),
+            None => false,
+        },
+        HirExpr::Alt(branches) => {
+            !branches.is_empty() && branches.iter().all(|branch| add_first_bytes(branch, set))
+        }
+        HirExpr::Capture(capture) => add_first_bytes(&capture.expr, set),
+        // A repeat that can match nothing leaves the next element deciding the
+        // first byte, so its own set is not the whole answer.
+        HirExpr::Repeat(repeat) if repeat.min >= 1 => add_first_bytes(&repeat.expr, set),
+        _ => false,
+    }
+}
+
 /// Checks if an HIR expression starts with a pure digit character class.
 /// Returns true only if the class exclusively matches digits (0-9), not if it
 /// merely includes digits among other characters (like \w which includes letters).
