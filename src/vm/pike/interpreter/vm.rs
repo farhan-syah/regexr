@@ -216,7 +216,12 @@ impl PikeVm {
             self.seed_start_thread(ctx, from, capture_count);
         }
 
-        let mut matched: Option<Vec<Option<(usize, usize)>>> = None;
+        // The winning thread and the position it matched to, rather than its
+        // reconstructed captures. A match is re-established at every position a
+        // greedy run extends over, so reconstructing here would walk the capture
+        // list and allocate once per byte of the match; cloning the thread is an
+        // `Arc` bump. Reconstruction happens once, after the loop.
+        let mut matched: Option<(Thread, usize)> = None;
 
         // Buffer for the consuming successors scheduled at each position.
         let mut sched: Vec<(usize, Thread)> = Vec::new();
@@ -260,10 +265,7 @@ impl PikeVm {
                     .iter()
                     .position(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false));
                 if let Some(i) = match_idx {
-                    let thread = &ctx.current_threads[i];
-                    let mut caps = thread.reconstruct_captures();
-                    caps[0] = Some((thread.start, pos));
-                    matched = Some(caps);
+                    matched = Some((ctx.current_threads[i], pos));
                 }
                 // Only threads strictly higher priority than the match advance.
                 let limit = match_idx.unwrap_or(ctx.current_threads.len());
@@ -324,7 +326,11 @@ impl PikeVm {
             }
         }
 
-        matched
+        matched.map(|(thread, end)| {
+            let mut caps = thread.reconstruct_captures(&ctx.capture_arena);
+            caps[0] = Some((thread.start, end));
+            caps
+        })
     }
 
     /// Epsilon closure for one seed thread at `pos`, adding all reachable states
@@ -373,7 +379,7 @@ impl PikeVm {
                     input,
                     pos,
                     current_state_id,
-                    &mut ctx.lookaround_cache,
+                    ctx,
                 ) {
                     InstructionResult::Continue => {}
                     InstructionResult::Kill => continue,
@@ -393,7 +399,7 @@ impl PikeVm {
                 }
             }
 
-            ctx.current_threads.push(thread.clone());
+            ctx.current_threads.push(thread);
 
             // Reverse-order push so epsilon[0] (highest priority) is popped first.
             for &next_id in state.epsilon.iter().rev() {
@@ -419,15 +425,15 @@ impl PikeVm {
         input: &[u8],
         pos: usize,
         state_id: StateId,
-        lookaround_cache: &mut std::collections::HashMap<(StateId, usize), bool>,
+        ctx: &mut PikeVmContext,
     ) -> InstructionResult {
         match instruction {
             NfaInstruction::CaptureStart(idx) => {
-                thread.record_capture_start(*idx, pos);
+                thread.record_capture_start(&mut ctx.capture_arena, *idx, pos);
                 InstructionResult::Continue
             }
             NfaInstruction::CaptureEnd(idx) => {
-                thread.record_capture_end(*idx, pos);
+                thread.record_capture_end(&mut ctx.capture_arena, *idx, pos);
                 InstructionResult::Continue
             }
             NfaInstruction::StartOfText => {
@@ -473,7 +479,7 @@ impl PikeVm {
                 }
             }
             NfaInstruction::Backref(idx) => {
-                if let Some((cap_start, cap_end)) = thread.get_capture(*idx) {
+                if let Some((cap_start, cap_end)) = thread.get_capture(&ctx.capture_arena, *idx) {
                     let cap_len = cap_end - cap_start;
 
                     // Empty capture - just continue (no text to match)
@@ -497,7 +503,7 @@ impl PikeVm {
             }
             NfaInstruction::PositiveLookahead(inner_nfa) => {
                 // Check memoization cache first
-                if let Some(&cached_result) = lookaround_cache.get(&(state_id, pos)) {
+                if let Some(&cached_result) = ctx.lookaround_cache.get(&(state_id, pos)) {
                     return if cached_result {
                         InstructionResult::Continue
                     } else {
@@ -512,7 +518,7 @@ impl PikeVm {
                 let matched = inner_vm.match_at(input, pos).is_some();
 
                 // Cache the result
-                lookaround_cache.insert((state_id, pos), matched);
+                ctx.lookaround_cache.insert((state_id, pos), matched);
 
                 if matched {
                     InstructionResult::Continue
@@ -522,7 +528,7 @@ impl PikeVm {
             }
             NfaInstruction::NegativeLookahead(inner_nfa) => {
                 // Check memoization cache first
-                if let Some(&cached_result) = lookaround_cache.get(&(state_id, pos)) {
+                if let Some(&cached_result) = ctx.lookaround_cache.get(&(state_id, pos)) {
                     return if cached_result {
                         InstructionResult::Continue
                     } else {
@@ -535,7 +541,7 @@ impl PikeVm {
                 let matched = inner_vm.match_at(input, pos).is_none();
 
                 // Cache the result (true = lookaround succeeded, i.e., inner did NOT match)
-                lookaround_cache.insert((state_id, pos), matched);
+                ctx.lookaround_cache.insert((state_id, pos), matched);
 
                 if matched {
                     InstructionResult::Continue
@@ -545,7 +551,7 @@ impl PikeVm {
             }
             NfaInstruction::PositiveLookbehind(inner_nfa) => {
                 // Check memoization cache first
-                if let Some(&cached_result) = lookaround_cache.get(&(state_id, pos)) {
+                if let Some(&cached_result) = ctx.lookaround_cache.get(&(state_id, pos)) {
                     return if cached_result {
                         InstructionResult::Continue
                     } else {
@@ -563,7 +569,7 @@ impl PikeVm {
                     .any(|lookback_start| inner_vm.match_at(input, lookback_start) == Some(pos));
 
                 // Cache the result
-                lookaround_cache.insert((state_id, pos), found);
+                ctx.lookaround_cache.insert((state_id, pos), found);
 
                 if found {
                     InstructionResult::Continue
@@ -573,7 +579,7 @@ impl PikeVm {
             }
             NfaInstruction::NegativeLookbehind(inner_nfa) => {
                 // Check memoization cache first
-                if let Some(&cached_result) = lookaround_cache.get(&(state_id, pos)) {
+                if let Some(&cached_result) = ctx.lookaround_cache.get(&(state_id, pos)) {
                     return if cached_result {
                         InstructionResult::Continue
                     } else {
@@ -590,7 +596,7 @@ impl PikeVm {
 
                 // Cache the result (true = lookaround succeeded, i.e., inner did NOT match)
                 let result = !found;
-                lookaround_cache.insert((state_id, pos), result);
+                ctx.lookaround_cache.insert((state_id, pos), result);
 
                 if result {
                     InstructionResult::Continue

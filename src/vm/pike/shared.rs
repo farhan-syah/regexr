@@ -2,20 +2,16 @@
 //!
 //! Contains thread management structures and utilities used by the interpreter.
 //!
-//! # Copy-On-Write Captures
+//! # Shared capture histories
 //!
-//! Thread captures use a linked-list based Copy-On-Write (COW) strategy to avoid
-//! expensive Vec cloning on every thread fork. Instead of storing a full Vec of
-//! captures in each thread, we store:
-//! - A reference-counted pointer to the parent thread's capture history
-//! - The specific capture action this thread took (if any)
-//!
-//! This makes thread creation O(1) instead of O(G) where G is the number of capture groups.
-//! The full capture Vec is only reconstructed when a match is found.
+//! A thread does not carry a capture vector. It carries an index into the run's
+//! [`CaptureArena`], naming the most recent capture action on its path; each
+//! node links to the previous one. Forking a thread copies that index, so thread
+//! creation is O(1) with no allocation and no reference counting, and the full
+//! capture `Vec` is built only once a match is final.
 
 use crate::nfa::StateId;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
 
 /// Thread scheduled for a future input position.
 ///
@@ -80,6 +76,8 @@ pub struct PikeVmContext {
     /// Value: whether the lookaround matched
     /// This avoids re-executing the same lookaround at the same position.
     pub lookaround_cache: HashMap<(StateId, usize), bool>,
+    /// Capture history for the run in progress. Threads index into this.
+    pub capture_arena: CaptureArena,
 }
 
 impl PikeVmContext {
@@ -97,6 +95,7 @@ impl PikeVmContext {
             seq_counter: 0,
             epsilon_stack: Vec::with_capacity(32),
             lookaround_cache: HashMap::new(),
+            capture_arena: Vec::with_capacity(64),
         }
     }
 
@@ -113,6 +112,8 @@ impl PikeVmContext {
         self.seq_counter = 0;
         // Clear lookaround cache for new match attempt
         self.lookaround_cache.clear();
+        // Keeps the capacity, so a repeated captures() call does not allocate.
+        self.capture_arena.clear();
     }
 
     /// Ensure visited array is large enough for the given state count.
@@ -134,56 +135,38 @@ pub enum CaptureAction {
     End(u32, usize),
 }
 
-/// A node in the capture history linked list.
-/// Uses Rc for O(1) thread forking - just increment reference count.
+/// A node in the capture history list.
+///
+/// Nodes live in a per-run arena ([`CaptureArena`]) and refer to their parent by
+/// index, so forking a thread copies one `u32` — no allocation, no reference
+/// counting. Threads share history simply by naming the same node.
 #[derive(Debug, Clone)]
 pub struct CaptureNode {
     /// The capture action at this node
     pub action: CaptureAction,
-    /// Link to parent node (previous capture action)
-    pub parent: Option<Arc<CaptureNode>>,
+    /// Index of the previous action in the arena, if any.
+    pub parent: Option<u32>,
 }
 
-impl CaptureNode {
-    /// Create a new capture node with the given action and parent.
-    #[inline]
-    pub fn new(action: CaptureAction, parent: Option<Arc<CaptureNode>>) -> Arc<Self> {
-        Arc::new(Self { action, parent })
-    }
-}
-
-/// Frees the history iteratively.
+/// Arena holding one run's capture history.
 ///
-/// The list is one node per capture action, so a thread that goes round a
-/// capturing loop once per input byte owns a list as long as the input. The
-/// derived drop would recurse once per node and overflow the stack on a long
-/// match; this walks the chain instead, releasing each node whose last owner it
-/// is and stopping at the first one another thread still shares.
-impl Drop for CaptureNode {
-    fn drop(&mut self) {
-        let mut next = self.parent.take();
-        while let Some(node) = next {
-            match Arc::try_unwrap(node) {
-                Ok(mut node) => next = node.parent.take(),
-                // Still shared; whoever holds it last frees the rest.
-                Err(_) => break,
-            }
-        }
-    }
-}
+/// Append-only for the length of a run, so an index stays valid once handed
+/// out. Cleared by [`PikeVmContext::reset`] and its capacity reused, which is
+/// what keeps a repeated `captures()` call off the allocator entirely.
+pub type CaptureArena = Vec<CaptureNode>;
 
 /// A thread in the PikeVM.
 ///
-/// Uses Copy-On-Write (COW) captures via a linked list to avoid expensive
-/// Vec cloning on every thread fork. Thread creation is O(1) - just increment
-/// an Rc counter. The full capture Vec is reconstructed only when a match is found.
-#[derive(Debug, Clone)]
+/// Capture history is shared structurally: a thread names the head of a list
+/// held in the run's [`CaptureArena`], so forking copies a `u32` rather than a
+/// capture vector. The full capture `Vec` is built only once a match is final.
+#[derive(Debug, Clone, Copy)]
 pub struct Thread {
     /// Current NFA state.
     pub state: StateId,
-    /// Head of the capture history linked list.
-    /// None means no captures have been recorded yet.
-    pub capture_head: Option<Arc<CaptureNode>>,
+    /// Index of this thread's most recent capture action in the arena.
+    /// `None` means no captures have been recorded yet.
+    pub capture_head: Option<u32>,
     /// Number of capture groups (needed for reconstruction).
     pub capture_count: usize,
     /// Input position where this thread's match attempt began — capture slot 0's
@@ -204,45 +187,56 @@ impl Thread {
         }
     }
 
-    /// Clone this thread with a new state. O(1) operation - just increments Rc counter.
+    /// Copies this thread with a new state. O(1): the capture history is an
+    /// index, so nothing is allocated and no refcount is touched.
     #[inline]
     pub fn clone_with_state(&self, state: StateId) -> Self {
-        Self {
-            state,
-            capture_head: self.capture_head.clone(), // Rc::clone is O(1)
-            capture_count: self.capture_count,
-            start: self.start,
-        }
+        Self { state, ..*self }
     }
 
-    /// Record a capture start event. O(1) operation.
+    /// Records a capture start event. O(1) amortised — one arena push.
     #[inline]
-    pub fn record_capture_start(&mut self, group_idx: u32, pos: usize) {
-        let node = CaptureNode::new(
-            CaptureAction::Start(group_idx, pos),
-            self.capture_head.take(),
-        );
-        self.capture_head = Some(node);
+    pub fn record_capture_start(&mut self, arena: &mut CaptureArena, group_idx: u32, pos: usize) {
+        self.push_action(arena, CaptureAction::Start(group_idx, pos));
     }
 
-    /// Record a capture end event. O(1) operation.
+    /// Records a capture end event. O(1) amortised — one arena push.
     #[inline]
-    pub fn record_capture_end(&mut self, group_idx: u32, pos: usize) {
-        let node = CaptureNode::new(CaptureAction::End(group_idx, pos), self.capture_head.take());
-        self.capture_head = Some(node);
+    pub fn record_capture_end(&mut self, arena: &mut CaptureArena, group_idx: u32, pos: usize) {
+        self.push_action(arena, CaptureAction::End(group_idx, pos));
     }
 
-    /// Reconstruct the full capture Vec from the linked list.
-    /// Called only when a match is found. O(depth) where depth is number of capture actions.
-    pub fn reconstruct_captures(&self) -> Vec<Option<(usize, usize)>> {
+    /// Appends an action to the arena and points this thread at it.
+    ///
+    /// An arena longer than `u32::MAX` would make the index ambiguous; the
+    /// action is dropped rather than corrupting the history, which can only
+    /// lose captures on an input far past any practical size.
+    #[inline]
+    fn push_action(&mut self, arena: &mut CaptureArena, action: CaptureAction) {
+        let Ok(index) = u32::try_from(arena.len()) else {
+            return;
+        };
+        arena.push(CaptureNode {
+            action,
+            parent: self.capture_head,
+        });
+        self.capture_head = Some(index);
+    }
+
+    /// Reconstructs the full capture Vec from the arena.
+    /// Called only once a match is final. O(depth) in the number of actions.
+    pub fn reconstruct_captures(&self, arena: &CaptureArena) -> Vec<Option<(usize, usize)>> {
         let mut captures = vec![None; self.capture_count + 1];
 
-        // Walk the linked list backwards to collect all actions
+        // Walk the history backwards to collect all actions
         let mut actions = Vec::new();
-        let mut current = self.capture_head.as_ref();
-        while let Some(node) = current {
+        let mut current = self.capture_head;
+        while let Some(index) = current {
+            let Some(node) = arena.get(index as usize) else {
+                break;
+            };
             actions.push(&node.action);
-            current = node.parent.as_ref();
+            current = node.parent;
         }
 
         // Process actions in reverse order (oldest first) to build final capture state
@@ -274,13 +268,16 @@ impl Thread {
     /// Get a capture group value by walking the linked list.
     /// Used for backref matching - more efficient than full reconstruction.
     /// Returns None if capture group is not set or incomplete.
-    pub fn get_capture(&self, group_idx: u32) -> Option<(usize, usize)> {
+    pub fn get_capture(&self, arena: &CaptureArena, group_idx: u32) -> Option<(usize, usize)> {
         let mut start: Option<usize> = None;
         let mut end: Option<usize> = None;
 
         // Walk backwards to find the most recent start and end for this group
-        let mut current = self.capture_head.as_ref();
-        while let Some(node) = current {
+        let mut current = self.capture_head;
+        while let Some(index) = current {
+            let Some(node) = arena.get(index as usize) else {
+                break;
+            };
             match &node.action {
                 CaptureAction::Start(idx, pos) if *idx == group_idx && start.is_none() => {
                     start = Some(*pos);
@@ -294,7 +291,7 @@ impl Thread {
             if start.is_some() && end.is_some() {
                 break;
             }
-            current = node.parent.as_ref();
+            current = node.parent;
         }
 
         match (start, end) {

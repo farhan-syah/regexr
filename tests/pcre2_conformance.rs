@@ -214,6 +214,56 @@ fn match_spans_agree_with_pcre2() {
     );
 }
 
+/// Every capture group must report the same span as PCRE2, not just group 0.
+///
+/// The full-match comparison above misses a whole class of bug: a match can end
+/// in the right place while a group inside it is wrong.
+#[test]
+fn capture_groups_agree_with_pcre2() {
+    let mut divergences = Vec::new();
+    let mut compared = 0usize;
+
+    for pattern in PATTERNS {
+        if INTENTIONAL_DIVERGENCE.iter().any(|(p, _)| p == pattern) {
+            continue;
+        }
+        let (Ok(ours), Ok(theirs)) = (
+            Regex::new(pattern),
+            Pcre2Builder::new().utf(true).ucp(false).build(pattern),
+        ) else {
+            continue;
+        };
+
+        for haystack in HAYSTACKS {
+            let Some(ours_caps) = ours.captures(haystack) else {
+                continue;
+            };
+            let Ok(Some(their_caps)) = theirs.captures(haystack.as_bytes()) else {
+                continue;
+            };
+
+            for group in 0..ours_caps.len() {
+                let a = ours_caps.get(group).map(|m| (m.start(), m.end()));
+                let b = their_caps.get(group).map(|m| (m.start(), m.end()));
+                compared += 1;
+                if a != b {
+                    divergences.push(format!(
+                        "  {pattern:?} on {haystack:?} group {group}: regexr={a:?} pcre2={b:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(compared > 0, "no capture group was compared");
+    assert!(
+        divergences.is_empty(),
+        "{} of {compared} capture-group comparisons disagree with PCRE2:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+}
+
 /// Every entry in the exclusion list must still be a real divergence.
 ///
 /// Without this, a fixed difference would sit in the list forever, quietly
