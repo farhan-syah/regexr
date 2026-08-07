@@ -181,10 +181,17 @@ impl LiteralExtractor {
                 // Track whether we've seen all literals so far
                 let mut all_literals_so_far = matches!(&exprs[start_idx], HirExpr::Literal(_));
 
-                // Only extend prefixes with subsequent literals if there's no
-                // nullable suffix. A nullable suffix means the prefix might not
-                // consume all of what we extracted.
-                if !result.has_nullable_suffix {
+                // Only extend prefixes with subsequent literals if the first
+                // element was extracted in full and has no nullable suffix.
+                //
+                // `complete` is the load-bearing half: an incomplete extraction
+                // means text this element can match was NOT captured in the
+                // prefix, so a later literal does not follow what we have.
+                // `((a)(b))c` extracts "a" from the outer group and stops at the
+                // un-extracted `(b)`; splicing "c" on would claim the pattern
+                // starts with "ac", which it never does, and the prefilter would
+                // then find no candidates and report no match at all.
+                if result.complete && !result.has_nullable_suffix {
                     // Try to extend prefixes with subsequent literals
                     for expr in &exprs[start_idx + 1..] {
                         // Skip anchors (zero-width, don't affect literals)

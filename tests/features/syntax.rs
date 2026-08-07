@@ -826,3 +826,26 @@ fn test_unquantified_alternation_still_matches_one_branch() {
     );
     assert_eq!(regex(r"(a|b)").find("ab").map(|m| m.as_str()), Some("a"));
 }
+
+#[test]
+fn test_nested_sibling_groups_followed_by_a_literal() {
+    // The literal prefilter must not splice a later literal onto a prefix it
+    // only extracted part of: `((a)(b))c` starts with "ab", never "ac", and
+    // claiming otherwise made the prefilter find no candidates and report no
+    // match at all.
+    let re = regex(r"((a)(b))c");
+    assert_eq!(re.find("abc").map(|m| m.as_str()), Some("abc"));
+    assert_eq!(re.find("xabc").map(|m| m.as_str()), Some("abc"));
+    assert!(!re.is_match("acc"));
+
+    let caps = regex(r"((a)(b))c").captures("abc").expect("should match");
+    assert_eq!(caps.get(1).map(|m| m.as_str()), Some("ab"));
+    assert_eq!(caps.get(2).map(|m| m.as_str()), Some("a"));
+    assert_eq!(caps.get(3).map(|m| m.as_str()), Some("b"));
+
+    // Deeper nesting and a longer tail exercise the same extension path.
+    assert_eq!(
+        regex(r"((a)(b)(e))cd").find("abecd").map(|m| m.as_str()),
+        Some("abecd")
+    );
+}
