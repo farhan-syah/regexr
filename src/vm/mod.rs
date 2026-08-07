@@ -18,6 +18,9 @@ pub use codepoint_class::*;
 // Re-export the one-pass capture engine
 pub use onepass::OnePass;
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub use onepass::jit::OnePassJit;
+
 // Re-export key types from pike module
 pub use pike::{PikeVm, PikeVmContext, PikeVmEngine};
 

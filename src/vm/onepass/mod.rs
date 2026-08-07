@@ -52,6 +52,11 @@
 //! guards hold sets the limit, and a transition after that limit is dead — the
 //! same rule the PikeVM applies, resolved per position instead of once.
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub mod jit;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod x86_64;
+
 use crate::nfa::{
     at_end_or_before_final_newline, is_word_boundary, ByteRange, Nfa, NfaInstruction, StateId,
 };
@@ -241,6 +246,10 @@ pub struct OnePass {
     guards: Vec<Guard>,
     /// Number of capture slots, including slot 0 for the whole match.
     slot_count: usize,
+    /// The same machine compiled to native code, when the target and the
+    /// pattern allow it. See [`jit::OnePassJit`].
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit: Option<jit::OnePassJit>,
 }
 
 impl OnePass {
@@ -321,12 +330,24 @@ impl OnePass {
             });
         }
 
-        Some(Self {
+        let one_pass = Self {
             closures,
             actions,
             guards,
             slot_count: nfa.capture_count as usize + 1,
-        })
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: None,
+        };
+
+        // Compiled from the finished tables, so the emitter reads exactly what
+        // the interpreter would have walked.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let one_pass = Self {
+            jit: jit::OnePassJit::compile(&one_pass),
+            ..one_pass
+        };
+
+        Some(one_pass)
     }
 
     /// Capture slots for a match that begins exactly at `start`.
@@ -361,6 +382,11 @@ impl OnePass {
     ) -> bool {
         if start > input.len() || slots.len() != self.slot_count {
             return false;
+        }
+
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(ref jit) = self.jit {
+            return jit.captures_at_into(input, start, match_slots);
         }
         // `slots` holds the path currently being walked; `match_slots` is the
         // snapshot taken at each position a match could end, which a later,
