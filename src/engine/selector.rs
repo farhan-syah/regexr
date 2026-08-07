@@ -116,6 +116,25 @@ pub fn needs_boundary_aware_empty_match(hir: &Hir) -> bool {
     hir.props.has_word_boundary && crate::hir::matches_empty(&hir.expr)
 }
 
+/// Whether an alternation appears anywhere in the expression, disjoint or not.
+///
+/// [`hir_has_alternation`] answers a *semantic* question — can branch priority
+/// change the answer — and deliberately says no for branches that start on
+/// disjoint bytes. This answers a cost question instead, and those branches
+/// count: what makes an alternation expensive is that several positions are live
+/// at once, which is true however the branches begin.
+pub fn hir_contains_alternation(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Alt(branches) => {
+            branches.len() >= 2 || branches.iter().any(hir_contains_alternation)
+        }
+        HirExpr::Concat(exprs) => exprs.iter().any(hir_contains_alternation),
+        HirExpr::Repeat(repeat) => hir_contains_alternation(&repeat.expr),
+        HirExpr::Capture(capture) => hir_contains_alternation(&capture.expr),
+        _ => false,
+    }
+}
+
 /// Recursively checks whether an HIR expression contains a user alternation
 /// (`a|b`). A DFA/Shift-Or matcher returns at its first/longest accepting state
 /// and therefore cannot honour ALTERNATION BRANCH PRIORITY: `ab|a` on "ab" must
@@ -226,6 +245,23 @@ pub fn select_engine_from_hir(hir: &Hir) -> EngineType {
     // express (see `hir_has_alternation`). Route them to the ordered PikeVM.
     if hir_has_alternation(&hir.expr) {
         return EngineType::PikeVm;
+    }
+
+    // An alternation that survived the check above is one no engine can get
+    // wrong, because at most one branch is ever viable. It is still the shape
+    // Shift-Or handles worst: its step is not a shift but a walk over the live
+    // positions, unioning a follow set per position, and an alternation is
+    // precisely what keeps several live at once. A DFA spends one table lookup
+    // per byte however many positions the pattern has.
+    //
+    // Negated classes lower to an alternation (an ASCII class beside a UTF-8
+    // trie), so this covers `[^>]+` and `[^\s<>]+` as well as a written-out one.
+    //
+    // Measured against the `regex` crate over nine benchmark patterns plus four
+    // class shapes, comparing ratios rather than times because the two runs sit
+    // on different machine loads: eight improved and none got worse.
+    if hir_contains_alternation(&hir.expr) {
+        return EngineType::LazyDfa;
     }
 
     // Small patterns (≤64 character positions) use Shift-Or
