@@ -303,6 +303,12 @@ impl LiteralExtractor {
                     // For example, a+b can match "ab" or "aab", so we shouldn't
                     // extend the prefix "a" with "b".
                     result.has_nullable_suffix = true;
+                    // The literals are a prefix, never the whole match: one more
+                    // iteration can always follow. Leaving `complete` set would
+                    // license a full-match prefilter to report just the literal
+                    // and skip the engine, so `(a|b)+` on "abab" would answer
+                    // "a" rather than "abab".
+                    result.complete = false;
                     result
                 } else {
                     // Zero-or-more means no required prefix

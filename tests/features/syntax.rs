@@ -777,3 +777,52 @@ fn test_negated_nested_class_complement() {
     let text = "abc123";
     assert_eq!(re.find(text).unwrap().as_str(), "abc");
 }
+
+// =============================================================================
+// Quantified alternation
+//
+// A literal prefilter may only report a match directly when the literals are
+// the WHOLE match. Under a quantifier they are just the first iteration, so the
+// engine has to run: `(a|b)+` over "abab" is "abab", not "a".
+// =============================================================================
+
+#[test]
+fn test_quantified_alternation_consumes_every_iteration() {
+    assert_eq!(
+        regex(r"(a|b)+").find("abab").map(|m| m.as_str()),
+        Some("abab")
+    );
+    assert_eq!(
+        regex(r"(?:a|b)+").find("abab").map(|m| m.as_str()),
+        Some("abab")
+    );
+    assert_eq!(
+        regex(r"(ab|cd)+").find("abab").map(|m| m.as_str()),
+        Some("abab")
+    );
+    assert_eq!(
+        regex(r"(foo|bar)+").find("foobarfoo").map(|m| m.as_str()),
+        Some("foobarfoo")
+    );
+}
+
+#[test]
+fn test_bounded_alternation_repeat_respects_its_minimum() {
+    let re = regex(r"(a|b){2,}");
+    assert_eq!(re.find("abab").map(|m| m.as_str()), Some("abab"));
+    // One iteration is below the minimum, so a single character must not match.
+    assert!(!re.is_match("a"));
+}
+
+#[test]
+fn test_unquantified_alternation_still_matches_one_branch() {
+    assert_eq!(
+        regex(r"foo|bar").find("bar").map(|m| m.as_str()),
+        Some("bar")
+    );
+    assert_eq!(
+        regex(r"(cat|dog)").find("dog").map(|m| m.as_str()),
+        Some("dog")
+    );
+    assert_eq!(regex(r"(a|b)").find("ab").map(|m| m.as_str()), Some("a"));
+}
