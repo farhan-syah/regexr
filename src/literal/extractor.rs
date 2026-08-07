@@ -98,7 +98,7 @@ fn starts_with_digit_class(expr: &HirExpr) -> bool {
         HirExpr::Concat(exprs) => {
             // Skip anchors and find first non-anchor
             for e in exprs {
-                if matches!(e, HirExpr::Anchor(_)) {
+                if is_zero_width(e) {
                     continue;
                 }
                 return starts_with_digit_class(e);
@@ -110,6 +110,12 @@ fn starts_with_digit_class(expr: &HirExpr) -> bool {
         HirExpr::Capture(cap) => starts_with_digit_class(&cap.expr),
         _ => false,
     }
+}
+
+/// Whether an element consumes no input, so the element after it still decides
+/// the first byte. Anchors and lookarounds both qualify.
+fn is_zero_width(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::Anchor(_) | HirExpr::Lookaround(_))
 }
 
 /// Result of extracting prefixes from an expression.
@@ -167,7 +173,7 @@ impl LiteralExtractor {
 
                 // Skip leading anchors to find the first literal-producing expression
                 let mut start_idx = 0;
-                while start_idx < exprs.len() && matches!(&exprs[start_idx], HirExpr::Anchor(_)) {
+                while start_idx < exprs.len() && is_zero_width(&exprs[start_idx]) {
                     start_idx += 1;
                 }
 
@@ -194,8 +200,8 @@ impl LiteralExtractor {
                 if result.complete && !result.has_nullable_suffix {
                     // Try to extend prefixes with subsequent literals
                     for expr in &exprs[start_idx + 1..] {
-                        // Skip anchors (zero-width, don't affect literals)
-                        if matches!(expr, HirExpr::Anchor(_)) {
+                        // Zero-width elements don't affect literals
+                        if is_zero_width(expr) {
                             continue;
                         }
                         if let HirExpr::Literal(bytes) = expr {
@@ -412,6 +418,29 @@ pub fn required_literal(hir: &Hir) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    fn literals(pattern: &str) -> Literals {
+        let ast = crate::parser::parse(pattern).unwrap();
+        let hir = crate::hir::translate(&ast).unwrap();
+        extract_literals(&hir)
+    }
+
+    /// A leading lookaround consumes nothing, so the element after it still
+    /// decides the first byte. Losing that costs the prefilter and nothing else,
+    /// so no match-level test can see it — `(?<!\$)\d+` silently went from a
+    /// memchr scan to visiting every position.
+    #[test]
+    fn test_leading_lookaround_does_not_hide_the_prefilter() {
+        assert!(literals(r"(?<!\$)\d+").starts_with_digit);
+        assert!(literals(r"(?<=\$)\d+").starts_with_digit);
+        assert!(literals(r"(?!x)\d+").starts_with_digit);
+        assert_eq!(literals(r"(?<!a)bcd").prefixes, vec![b"bcd".to_vec()]);
+        assert_eq!(literals(r"(?=x)abc").prefixes, vec![b"abc".to_vec()]);
+
+        // Still candidate-only: a lookaround means the literal alone cannot
+        // decide a match.
+        assert!(!literals(r"(?<!a)bcd").prefix_complete);
+    }
 
     fn required(pattern: &str) -> Option<Vec<u8>> {
         let ast = crate::parser::parse(pattern).unwrap();

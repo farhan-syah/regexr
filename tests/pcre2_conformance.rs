@@ -127,6 +127,14 @@ const PATTERNS: &[&str] = &[
     r"a(?=bc)\w",
     r"\w+(?=ing\b)|zzz",
     r"(?<=a+)b",
+    // A leading zero-width element must not hide the prefilter behind it: these
+    // still start with a digit / literal, and the wrong answer is silently
+    // reporting no match.
+    r"(?<!\$)\d+",
+    r"(?<=\$)\d+",
+    r"(?!x)\d+",
+    r"(?<!a)bcd",
+    r"a(?=b)bc",
     // Escapes
     r"\x41",
     r"\x{263A}",
@@ -183,6 +191,11 @@ const HAYSTACKS: &[&str] = &[
     "ing",
     "zzz nothing",
     "zzz",
+    "$100 and 200",
+    "price 42",
+    "a1 $2 b3",
+    "abcd",
+    "xbcd",
     "no matches at all here",
     "category",
     "a\nc",
