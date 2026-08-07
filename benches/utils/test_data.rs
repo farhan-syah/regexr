@@ -1,4 +1,7 @@
 //! Test data generators for realistic benchmarking scenarios.
+//!
+//! Sample lists are cycled by a counter. Indexing by `result.len()` settles into
+//! a short cycle and silently drops entries.
 
 use std::sync::OnceLock;
 
@@ -97,13 +100,15 @@ fn generate_email_data(target_size: usize) -> String {
 
     let mut result = String::with_capacity(target_size);
     let mut toggle = true;
+    let mut index = 0usize;
 
     while result.len() < target_size {
         if toggle {
-            result.push_str(valid_emails[result.len() % valid_emails.len()]);
+            result.push_str(valid_emails[index % valid_emails.len()]);
         } else {
-            result.push_str(invalid_emails[result.len() % invalid_emails.len()]);
+            result.push_str(invalid_emails[index % invalid_emails.len()]);
         }
+        index += 1;
         result.push_str(" some filler text to pad the data ");
         toggle = !toggle;
     }
@@ -123,9 +128,12 @@ fn generate_url_data(target_size: usize) -> String {
 
     let mut result = String::with_capacity(target_size);
 
-    while result.len() < target_size {
+    for index in 0.. {
+        if result.len() >= target_size {
+            break;
+        }
         result.push_str("Check out this link: ");
-        result.push_str(urls[result.len() % urls.len()]);
+        result.push_str(urls[index % urls.len()]);
         result.push_str(" for more information. ");
     }
 
@@ -146,15 +154,17 @@ fn generate_log_data(target_size: usize) -> String {
     let mut result = String::with_capacity(target_size);
     let mut day = 1;
     let mut hour = 0;
+    let mut index = 0usize;
 
     while result.len() < target_size {
         result.push_str(&format!(
             "2024-01-{:02} {:02}:30:45 [{}] {}\n",
             day,
             hour,
-            levels[result.len() % levels.len()],
-            messages[result.len() % messages.len()]
+            levels[index % levels.len()],
+            messages[index % messages.len()]
         ));
+        index += 1;
 
         hour = (hour + 1) % 24;
         if hour == 0 {
@@ -218,8 +228,11 @@ fn generate_html_data(target_size: usize) -> String {
     let mut result = String::with_capacity(target_size);
     result.push_str("<!DOCTYPE html><html><body>");
 
-    while result.len() < target_size - 100 {
-        result.push_str(tags[result.len() % tags.len()]);
+    for index in 0.. {
+        if result.len() >= target_size.saturating_sub(100) {
+            break;
+        }
+        result.push_str(tags[index % tags.len()]);
         result.push_str(" Some text content between tags. ");
     }
 
@@ -237,8 +250,11 @@ fn generate_text_data(target_size: usize) -> String {
 
     let mut result = String::with_capacity(target_size);
 
-    while result.len() < target_size {
-        result.push_str(words[result.len() % words.len()]);
+    for index in 0.. {
+        if result.len() >= target_size {
+            break;
+        }
+        result.push_str(words[index % words.len()]);
         result.push(' ');
     }
 
@@ -257,8 +273,11 @@ fn generate_code_data(target_size: usize) -> String {
 
     let mut result = String::with_capacity(target_size);
 
-    while result.len() < target_size {
-        result.push_str(code_snippets[result.len() % code_snippets.len()]);
+    for index in 0.. {
+        if result.len() >= target_size {
+            break;
+        }
+        result.push_str(code_snippets[index % code_snippets.len()]);
         result.push('\n');
     }
 
@@ -282,8 +301,11 @@ pub fn generate_unicode_data(target_size: usize) -> String {
 
     let mut result = String::with_capacity(target_size);
 
-    while result.len() < target_size {
-        result.push_str(texts[result.len() % texts.len()]);
+    for index in 0.. {
+        if result.len() >= target_size {
+            break;
+        }
+        result.push_str(texts[index % texts.len()]);
         result.push_str(" • ");
     }
 
