@@ -205,6 +205,12 @@ pub fn select_engine_from_hir(hir: &Hir) -> EngineType {
     // CodepointClass does codepoint-level matching (UTF-8 decode + range check)
     // instead of byte-level DFA transitions. LazyDFA cannot handle these -
     // only PikeVM and TaggedNFA support CodepointClass instructions.
+    //
+    // The tagged NFA also handles them and is much faster on a simple class like
+    // `\p{L}+`, but its step interpreter backtracks: `\X{4}` (a grapheme cluster,
+    // which lowers to codepoint classes) does not terminate in reasonable time
+    // there. The PikeVM's linear bound is not worth trading for that, so the
+    // tagged NFA stays opt-in via `RegexBuilder::jit`.
     if hir_uses_codepoint_class(&hir.expr) {
         return EngineType::PikeVm;
     }

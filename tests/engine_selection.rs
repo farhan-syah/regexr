@@ -77,8 +77,8 @@ fn small_unicode_classes_match_whole_characters() {
 /// since `jit` is not a default feature — that path used to send backreference
 /// patterns to the PikeVM. The PikeVM does handle backreferences, but a
 /// backreference defeats its per-position state deduplication, so it restarts at
-/// every start position and ran ~4.6x slower than the backtracking engine that
-/// `Regex::new` picks. Asking for more speed produced less.
+/// every start position, well behind the backtracking engine `Regex::new`
+/// picks. Asking for more speed produced less.
 #[test]
 fn requesting_jit_never_downgrades_the_engine() {
     const BACKREF_PATTERNS: &[&str] = &[r#"(['"])[^'"]*\1"#, r"(\w+)\s+\1", r"(a)\1"];

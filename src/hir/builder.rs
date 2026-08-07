@@ -1407,8 +1407,8 @@ mod tests {
     ///
     /// It routes a pattern away from the DFA and Shift-Or engines, so setting it
     /// for a class that lowered to a small byte trie is a large, silent
-    /// slowdown — `\s+` once took the TaggedNfa path at ~28x the cost of
-    /// Shift-Or purely because of this flag.
+    /// slowdown: `\s+` was taking the TaggedNfa path rather than Shift-Or purely
+    /// because of this flag.
     #[test]
     fn test_small_perl_classes_are_not_large_unicode() {
         for pattern in [r"\s", r"\S", r"\s+", r"\S+", r"\h", r"\H"] {
