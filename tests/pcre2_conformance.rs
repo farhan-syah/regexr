@@ -142,6 +142,18 @@ const PATTERNS: &[&str] = &[
     r"[abc]+",
     r"[ab]x",
     r"[^ab]x",
+    // Nullable patterns, where the iteration rule for empty matches decides the
+    // whole sequence rather than any single span.
+    r"a*",
+    r"b*",
+    r"a?",
+    r"\d*",
+    r"\w*",
+    r"a*b*",
+    r"(a)*",
+    r"a|",
+    r"\b\w*",
+    r"a*\B",
     // Escapes
     r"\x41",
     r"\x{263A}",

@@ -243,8 +243,9 @@ fn test_not_word_boundary_with_optional_body() {
     assert_eq!(spans, vec![(1, 1), (4, 4)]);
 }
 
-/// A star can match empty, so `\b\w*` yields the word plus the empty match at
-/// the boundary that closes it.
+/// `\b\w*` matches each word. The empty match the star also allows at the
+/// closing boundary is where the previous match ended, so iteration drops it —
+/// the same sequence PCRE2 and the `regex` crate report.
 #[test]
 fn test_word_boundary_with_star() {
     let re = regex(r"\b\w*");
@@ -252,7 +253,7 @@ fn test_word_boundary_with_star() {
         .find_iter("ab cd")
         .map(|m| (m.start(), m.end()))
         .collect();
-    assert_eq!(spans, vec![(0, 2), (2, 2), (3, 5), (5, 5)]);
+    assert_eq!(spans, vec![(0, 2), (3, 5)]);
 }
 
 /// `\B` leading a nullable body, where the only matches are empty ones. The
@@ -273,7 +274,9 @@ fn test_trailing_not_word_boundary_after_star() {
         .find_iter("aa bb")
         .map(|m| (m.start(), m.end()))
         .collect();
-    assert_eq!(spans, vec![(0, 1), (1, 1), (4, 4)]);
+    // The empty match at 1 sits where the non-empty match ended, so it is
+    // dropped; the one at 4 follows an empty match and is kept.
+    assert_eq!(spans, vec![(0, 1), (4, 4)]);
 }
 
 /// The empty match must not land inside a multi-byte codepoint: in "中a中" the

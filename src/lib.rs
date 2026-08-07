@@ -375,6 +375,7 @@ impl Regex {
             } else {
                 text.len() + 1
             },
+            skip_empty_at: None,
         }
     }
 
@@ -527,7 +528,14 @@ enum MatchesInner<'a> {
     /// Fast path: use TeddyFull prefilter iterator directly.
     TeddyFull(literal::FullMatchIter<'a, 'a>),
     /// Generic path: call find() repeatedly.
-    Generic { regex: &'a Regex, last_end: usize },
+    Generic {
+        regex: &'a Regex,
+        last_end: usize,
+        /// End of the previous match when it was non-empty. An empty match at
+        /// that exact position is the same position reported twice, and every
+        /// other engine drops it.
+        skip_empty_at: Option<usize>,
+    },
     /// A required literal is absent, so no match exists anywhere.
     Empty,
 }
@@ -542,7 +550,11 @@ impl<'a> Matches<'a> {
             MatchesInner::TeddyFull(regex.inner.find_full_matches(text.as_bytes()))
         } else {
             // Generic path
-            MatchesInner::Generic { regex, last_end: 0 }
+            MatchesInner::Generic {
+                regex,
+                last_end: 0,
+                skip_empty_at: None,
+            }
         };
         Matches { inner, text }
     }
@@ -562,36 +574,50 @@ impl<'a> Iterator for Matches<'a> {
                     end,
                 })
             }
-            MatchesInner::Generic { regex, last_end } => {
-                if *last_end > self.text.len() {
-                    return None;
-                }
-
-                // The search is resumed at an offset into the *original* text
-                // rather than run on a slice starting there, so `^`, `\b`/`\B` and
-                // lookbehind still see the real text to the left of the resume
-                // point.
-                match regex.inner.find_from(self.text.as_bytes(), *last_end) {
-                    None => None,
-                    Some((abs_start, abs_end)) => {
-                        // Every match already ends on a codepoint boundary (the
-                        // engine-wide rule, see `nfa::is_utf8_boundary`), so
-                        // `ceil_char_boundary` is a no-op here in practice; it is
-                        // kept as a defensive snap-forward rather than relying on
-                        // that invariant unchecked. For empty matches, step one
-                        // byte first so the iterator always makes forward progress.
-                        *last_end = if abs_start == abs_end {
-                            ceil_char_boundary(self.text, abs_end + 1)
-                        } else {
-                            ceil_char_boundary(self.text, abs_end)
-                        };
-
-                        Some(Match {
-                            text: self.text,
-                            start: abs_start,
-                            end: abs_end,
-                        })
+            MatchesInner::Generic {
+                regex,
+                last_end,
+                skip_empty_at,
+            } => {
+                loop {
+                    if *last_end > self.text.len() {
+                        return None;
                     }
+
+                    // The search is resumed at an offset into the *original* text
+                    // rather than run on a slice starting there, so `^`, `\b`/`\B`
+                    // and lookbehind still see the real text to the left of the
+                    // resume point.
+                    let (abs_start, abs_end) =
+                        regex.inner.find_from(self.text.as_bytes(), *last_end)?;
+
+                    // Every match already ends on a codepoint boundary (the
+                    // engine-wide rule, see `nfa::is_utf8_boundary`), so
+                    // `ceil_char_boundary` is a no-op here in practice; it is
+                    // kept as a defensive snap-forward rather than relying on
+                    // that invariant unchecked. For empty matches, step one
+                    // byte first so the iterator always makes forward progress.
+                    let empty = abs_start == abs_end;
+                    *last_end = if empty {
+                        ceil_char_boundary(self.text, abs_end + 1)
+                    } else {
+                        ceil_char_boundary(self.text, abs_end)
+                    };
+
+                    // An empty match where the previous, non-empty one ended is
+                    // that position reported a second time. `a*` on "aa" is one
+                    // match of "aa", not that plus an empty match at 2.
+                    if empty && *skip_empty_at == Some(abs_start) {
+                        *skip_empty_at = None;
+                        continue;
+                    }
+                    *skip_empty_at = (!empty).then_some(abs_end);
+
+                    return Some(Match {
+                        text: self.text,
+                        start: abs_start,
+                        end: abs_end,
+                    });
                 }
             }
         }
@@ -604,42 +630,49 @@ pub struct CapturesIter<'r, 't> {
     regex: &'r Regex,
     text: &'t str,
     last_end: usize,
+    /// See `MatchesInner::Generic::skip_empty_at`.
+    skip_empty_at: Option<usize>,
 }
 
 impl<'r, 't> Iterator for CapturesIter<'r, 't> {
     type Item = Captures<'t>;
 
     fn next(&mut self) -> Option<Captures<'t>> {
-        if self.last_end > self.text.len() {
-            return None;
-        }
-
-        // Resumed at an offset into the original text, for the same reason as
-        // `Matches::next`; the slots come back as absolute offsets.
-        match self
-            .regex
-            .inner
-            .captures_from(self.text.as_bytes(), self.last_end)
-        {
-            None => None,
-            Some(slots) => {
-                // Get the full match bounds (slot 0)
-                let (start, end) = slots.first().and_then(|s| *s)?;
-
-                // Resume at the next UTF-8 character boundary, ensuring progress on
-                // empty matches by stepping one byte first (see `Matches::next`).
-                self.last_end = if start == end {
-                    ceil_char_boundary(self.text, end + 1)
-                } else {
-                    ceil_char_boundary(self.text, end)
-                };
-
-                Some(Captures {
-                    text: self.text,
-                    slots,
-                    named_groups: Arc::clone(&self.regex.named_groups),
-                })
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
             }
+
+            // Resumed at an offset into the original text, for the same reason as
+            // `Matches::next`; the slots come back as absolute offsets.
+            let slots = self
+                .regex
+                .inner
+                .captures_from(self.text.as_bytes(), self.last_end)?;
+            let (start, end) = slots.first().and_then(|s| *s)?;
+
+            // Resume at the next UTF-8 character boundary, ensuring progress on
+            // empty matches by stepping one byte first (see `Matches::next`).
+            let empty = start == end;
+            self.last_end = if empty {
+                ceil_char_boundary(self.text, end + 1)
+            } else {
+                ceil_char_boundary(self.text, end)
+            };
+
+            // Same suppression as `Matches::next`, so the two iterators report
+            // the same match sequence.
+            if empty && self.skip_empty_at == Some(start) {
+                self.skip_empty_at = None;
+                continue;
+            }
+            self.skip_empty_at = (!empty).then_some(end);
+
+            return Some(Captures {
+                text: self.text,
+                slots,
+                named_groups: Arc::clone(&self.regex.named_groups),
+            });
         }
     }
 }

@@ -22,6 +22,7 @@ fn reference_ranges(pattern: &str, text: &str) -> Option<Vec<(usize, usize)>> {
 
     let mut out = Vec::new();
     let mut last_end = 0usize;
+    let mut skip_empty_at: Option<usize> = None;
     while last_end <= bytes.len() {
         // Running out of matches ends the iteration; it does not discard the
         // ones already found. Propagating the `None` out of this function
@@ -32,12 +33,21 @@ fn reference_ranges(pattern: &str, text: &str) -> Option<Vec<(usize, usize)>> {
         else {
             break;
         };
-        out.push((start, end));
-        last_end = if start == end {
+        let empty = start == end;
+        last_end = if empty {
             ceil_char_boundary(text, end + 1)
         } else {
             ceil_char_boundary(text, end)
         };
+        // An empty match where the previous non-empty one ended is that position
+        // reported twice; PCRE2 and the `regex` crate both drop it, and so does
+        // `Matches::next`.
+        if empty && skip_empty_at == Some(start) {
+            skip_empty_at = None;
+            continue;
+        }
+        skip_empty_at = (!empty).then_some(end);
+        out.push((start, end));
         if out.len() > 64 {
             break;
         }

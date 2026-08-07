@@ -268,13 +268,11 @@ fn nullable_loop_followed_by_literal_terminates() {
 fn iteration_over_nullable_loop_terminates() {
     bounded("iteration_over_nullable_loop_terminates", || {
         for (label, re) in builds(r"(a*)*") {
+            // The empty match at 1 is where the non-empty match ended, so
+            // iteration drops it; the one at 2 follows an empty match and stays.
             assert_eq!(
                 iterated_spans(&re, "ab"),
-                vec![
-                    vec![span(0, 1), span(0, 1)],
-                    vec![span(1, 1), span(1, 1)],
-                    vec![span(2, 2), span(2, 2)],
-                ],
+                vec![vec![span(0, 1), span(0, 1)], vec![span(2, 2), span(2, 2)],],
                 "{label}"
             );
         }

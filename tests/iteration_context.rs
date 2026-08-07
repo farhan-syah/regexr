@@ -257,8 +257,9 @@ fn plain_ascii_iteration_unchanged() {
 #[test]
 fn empty_matches_still_make_progress() {
     for (label, re) in builds(r"a*") {
-        // One empty match per position, plus the non-empty run at 0.
-        assert_eq!(ranges(&re, "aab"), vec![(0, 2), (2, 2), (3, 3)], "{label}");
+        // The run at 0, then an empty match per remaining position. The empty
+        // match at 2 is dropped: it is where the non-empty match ended.
+        assert_eq!(ranges(&re, "aab"), vec![(0, 2), (3, 3)], "{label}");
     }
 }
 
