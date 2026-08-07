@@ -972,6 +972,20 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         return compile_with_pikevm(hir);
     }
 
+    // A multiline anchor guarding an empty match (`\s*(?m)$`) has the same
+    // problem in the DFA JIT: the empty match at a line end is only valid
+    // because of the byte that follows, which the JIT has already committed to
+    // by the time it decides to accept — it reports the final match and drops
+    // the interior ones. The interpreted DFA resolves the anchor positionally
+    // and gets this right, so hand the pattern back to the ordinary selection
+    // rather than to the PikeVM.
+    if hir.props.has_multiline_anchors
+        && crate::hir::matches_empty(&hir.expr)
+        && !hir.props.has_backrefs
+    {
+        return compile_from_hir(hir);
+    }
+
     // 1. Complex Unicode patterns with large unicode classes → TaggedNfa JIT
     // These patterns use CodepointClass instructions which DFA cannot handle.
     // Route them to TaggedNfa JIT which supports CodepointClass.
@@ -1142,10 +1156,28 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         });
     }
 
-    // For backrefs without JIT, fall back to PikeVM
+    // Backreferences without the JIT go to the same `BacktrackingVm` that
+    // `compile_from_hir` picks, NOT the PikeVM.
+    //
+    // The PikeVM does handle backreferences, but only as a last resort: a
+    // backreference breaks its per-position state deduplication (two threads in
+    // one state are no longer interchangeable when their captures differ), so it
+    // restarts the whole simulation at every start position — quadratic where
+    // the backtracking engine is not. Selecting it here made `jit(true)` on a
+    // build without the JIT feature *slower* than plain `Regex::new`, which
+    // inverts what the flag means.
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     if hir.props.has_backrefs {
-        return compile_with_pikevm(hir);
+        let literals = extract_literals(hir);
+        return Ok(CompiledRegex {
+            inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
+            prefilter: Prefilter::from_literals(&literals),
+            capture_nfa: RwLock::new(None),
+            one_pass: None,
+            capture_vm: RwLock::new(None),
+            capture_ctx: RwLock::new(None),
+            backtracking_vm: None,
+        });
     }
 
     // Alternations require leftmost-first branch priority. The DFA JIT and

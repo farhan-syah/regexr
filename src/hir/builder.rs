@@ -336,15 +336,11 @@ impl HirTranslator {
             PerlClassKind::NotHorizontalWhitespace => (HORIZONTAL_WHITESPACE, true),
         };
 
-        // Unicode Perl classes can have many code points, causing DFA state explosion.
-        // Mark large classes to fall back to PikeVM.
-        // Negated classes (\D, \W, \S) cover almost all of Unicode, so always mark as large.
-        let total_codepoints: u32 = ranges.iter().map(|(s, e)| e - s + 1).sum();
-        let has_large_range = ranges.iter().any(|(s, e)| e - s > 500);
-        if negated || total_codepoints > 1000 || has_large_range {
-            self.props.has_large_unicode_class = true;
-        }
-
+        // `has_large_unicode_class` is set by the two builders that actually emit
+        // a `UnicodeCpClass` (and by `translate_unicode_property` where it emits
+        // one directly). Pre-judging it from the code-point count would flag `\s`
+        // and `\S`, which now lower to small byte tries — and the flag routes a
+        // pattern away from the DFA and Shift-Or engines.
         self.translate_ranges_to_hir(ranges, negated)
     }
 
@@ -360,12 +356,6 @@ impl HirTranslator {
         byte_ranges.sort_by_key(|r| r.0);
         let merged_bytes = merge_byte_ranges(byte_ranges);
         let optimized_seqs = optimize_sequences(utf8_sequences);
-
-        // Any multi-byte UTF-8 sequences cause slow DFA materialization.
-        // Mark as large unicode class to skip DFA JIT.
-        if !optimized_seqs.is_empty() {
-            self.props.has_large_unicode_class = true;
-        }
 
         Ok(self.build_class_expr(merged_bytes, optimized_seqs, negated))
     }
@@ -1411,6 +1401,28 @@ mod tests {
         assert_eq!(hir.props.named_groups.len(), 2);
         assert_eq!(hir.props.named_groups.get("a"), Some(&1));
         assert_eq!(hir.props.named_groups.get("b"), Some(&2));
+    }
+
+    /// The flag must track whether a code-point node was actually emitted.
+    ///
+    /// It routes a pattern away from the DFA and Shift-Or engines, so setting it
+    /// for a class that lowered to a small byte trie is a large, silent
+    /// slowdown — `\s+` once took the TaggedNfa path at ~28x the cost of
+    /// Shift-Or purely because of this flag.
+    #[test]
+    fn test_small_perl_classes_are_not_large_unicode() {
+        for pattern in [r"\s", r"\S", r"\s+", r"\S+", r"\h", r"\H"] {
+            let ast = parse(pattern).unwrap();
+            let hir = HirTranslator::new().translate(&ast).unwrap();
+            assert!(
+                !hir.props.has_large_unicode_class,
+                "{pattern} lowers to a byte trie and must not be flagged large"
+            );
+            assert!(
+                !contains_codepoint_class(&hir.expr),
+                "{pattern} should contain no code-point node"
+            );
+        }
     }
 
     #[test]
