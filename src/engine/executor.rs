@@ -234,17 +234,35 @@ impl CompiledRegex {
         }
     }
 
-    /// Whether the engine's own unanchored search already covers every start
-    /// position in one pass over the input.
+    /// Whether the engine has no way to test one start position in isolation.
     ///
-    /// Such an engine gains nothing from being handed candidates one at a time —
-    /// each call would redo the whole scan — so the prefilter is used only to
-    /// skip to the first candidate, and the engine takes it from there. The
-    /// PikeVM seeds a start thread at every position into one priority queue and
-    /// so qualifies; the DFA and Shift-Or engines scan per start and do not.
+    /// For these, `find_at_pos` is the *same* unanchored search as
+    /// `find_engine_from` — it scans to the end of the input rather than
+    /// answering about `pos` alone. Handing them candidates one at a time is
+    /// then not just wasteful but quadratic: each of k candidates rescans the
+    /// remaining n bytes. `a+b` over 100 KB of text with no match took 146 ms
+    /// under the DFA JIT against 0.03 ms interpreted, purely from this.
+    ///
+    /// The prefilter still pays: it skips to the first candidate, and the single
+    /// scan from there finds the leftmost match. That is sound because a
+    /// prefilter never rules out a real match start.
+    ///
+    /// The engines with a genuine anchored primitive — Shift-Or's
+    /// `try_match_at`, the DFA families' `find_at` — are driven candidate by
+    /// candidate as before.
     #[inline]
     fn engine_searches_single_pass(&self) -> bool {
-        matches!(self.inner, CompiledInner::PikeVm(_))
+        match &self.inner {
+            CompiledInner::PikeVm(_)
+            | CompiledInner::BacktrackingVm(_)
+            | CompiledInner::TaggedNfaInterp(_)
+            | CompiledInner::CodepointClass(_) => true,
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            CompiledInner::Jit(_)
+            | CompiledInner::TaggedNfaJit(_)
+            | CompiledInner::Backtracking(_) => true,
+            _ => false,
+        }
     }
 
     /// Returns true if this regex uses a TeddyFull prefilter.
