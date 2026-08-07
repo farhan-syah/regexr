@@ -155,12 +155,16 @@ fn generate_url_data(target_size: usize) -> String {
 
 fn generate_log_data(target_size: usize) -> String {
     let levels = ["INFO", "WARNING", "ERROR", "CRITICAL", "DEBUG"];
+    // The level names appear here in lower case as well as in the `[LEVEL]`
+    // field, because the log-severity benchmark searches for them that way. With
+    // only the upper-case field to match, that benchmark found nothing at all and
+    // was timing a rejection scan rather than a search.
     let messages = [
         "Request processed successfully",
-        "Connection timeout after 30s",
-        "Database query failed",
+        "Connection timeout after 30s: warning issued to the caller",
+        "Database query failed with a fatal error while committing",
         "User authentication successful",
-        "Cache miss for key: user_123",
+        "Cache miss for key: user_123, critical path fell back to disk",
     ];
 
     let mut result = String::with_capacity(target_size);
