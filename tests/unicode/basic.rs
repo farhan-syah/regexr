@@ -55,3 +55,42 @@ fn test_unicode_character_class_emoji() {
     assert!(re.is_match("😁"));
     assert!(!re.is_match("abc"));
 }
+
+// =============================================================================
+// Latin-1 class members inside a concatenation
+//
+// A standalone single-class pattern like `[é]` takes a different code path
+// (`CompiledInner::CodepointClass`) than a class nested inside a
+// concatenation, which goes through `HirExpr::Concat`. These tests exercise
+// the latter, where a Latin-1 codepoint (U+0080-U+00FF) must be compiled to
+// its UTF-8 byte sequence rather than truncated to a single raw byte.
+// =============================================================================
+
+#[test]
+fn test_latin1_class_in_concat() {
+    let re = regex("X[é]Y");
+    let m = re.find("XéY").unwrap();
+    assert_eq!(m.as_str(), "XéY");
+    assert!(!re.is_match("XeY"));
+}
+
+#[test]
+fn test_latin1_class_plus() {
+    let re = regex("[é]+");
+    let m = re.find("héllo").unwrap();
+    assert_eq!(m.as_str(), "é");
+}
+
+#[test]
+fn test_latin1_class_in_noncapturing_group() {
+    let re = regex("(?:[é])");
+    assert!(re.is_match("é"));
+    assert!(!re.is_match("e"));
+}
+
+#[test]
+fn test_latin1_class_range_in_concat() {
+    let re = regex("X[à-ÿ]+Y");
+    let m = re.find("XàéîöYtail").unwrap();
+    assert_eq!(m.as_str(), "XàéîöY");
+}

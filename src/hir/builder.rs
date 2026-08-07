@@ -302,28 +302,7 @@ impl HirTranslator {
         let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
 
         for &(start, end) in ranges {
-            if start <= 127 && end <= 127 {
-                byte_ranges.push((start as u8, end as u8));
-            } else if start <= 127 {
-                byte_ranges.push((start as u8, 127));
-                let sequences = compile_utf8_range(128, end);
-                for seq in sequences {
-                    if seq.len() == 1 {
-                        byte_ranges.push(seq.ranges[0]);
-                    } else {
-                        utf8_sequences.push(seq);
-                    }
-                }
-            } else {
-                let sequences = compile_utf8_range(start, end);
-                for seq in sequences {
-                    if seq.len() == 1 {
-                        byte_ranges.push(seq.ranges[0]);
-                    } else {
-                        utf8_sequences.push(seq);
-                    }
-                }
-            }
+            push_codepoint_range(start, end, &mut byte_ranges, &mut utf8_sequences);
         }
 
         byte_ranges.sort_by_key(|r| r.0);
@@ -373,35 +352,7 @@ impl HirTranslator {
         let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
 
         for &(start, end) in ranges {
-            // Only ASCII code points (0-127) can be treated as single bytes.
-            // Code points 128-255 require 2-byte UTF-8 encoding (C2 80 to C3 BF).
-            if start <= 127 && end <= 127 {
-                // Pure ASCII range - single bytes
-                byte_ranges.push((start as u8, end as u8));
-            } else if start <= 127 {
-                // Range starts in ASCII but extends beyond
-                // Add ASCII portion as single bytes
-                byte_ranges.push((start as u8, 127));
-                // Use UTF-8 automata for the rest
-                let sequences = compile_utf8_range(128, end);
-                for seq in sequences {
-                    if seq.len() == 1 {
-                        byte_ranges.push(seq.ranges[0]);
-                    } else {
-                        utf8_sequences.push(seq);
-                    }
-                }
-            } else {
-                // Entirely non-ASCII - use UTF-8 automata
-                let sequences = compile_utf8_range(start, end);
-                for seq in sequences {
-                    if seq.len() == 1 {
-                        byte_ranges.push(seq.ranges[0]);
-                    } else {
-                        utf8_sequences.push(seq);
-                    }
-                }
-            }
+            push_codepoint_range(start, end, &mut byte_ranges, &mut utf8_sequences);
         }
 
         // Sort and merge byte ranges
@@ -519,9 +470,10 @@ impl HirTranslator {
 
     /// Translates a character class to HIR.
     ///
-    /// For simple byte-range classes (code points 0-255), returns an `HirExpr::Class`.
-    /// For Unicode classes with multi-byte UTF-8 sequences, returns an alternation
-    /// of concatenations representing the valid byte sequences.
+    /// For simple ASCII-only classes (code points 0-127), returns an `HirExpr::Class`.
+    /// For Unicode classes with multi-byte UTF-8 sequences (any code point at or
+    /// above U+0080), returns an alternation of concatenations representing the
+    /// valid byte sequences.
     fn translate_class(&mut self, class: &Class) -> Result<HirExpr> {
         let mut byte_ranges: Vec<(u8, u8)> = Vec::new();
         let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
@@ -596,28 +548,12 @@ impl HirTranslator {
         byte_ranges: &mut Vec<(u8, u8)>,
         utf8_sequences: &mut Vec<Utf8Sequence>,
     ) {
-        let start_cp = range.start as u32;
-        let end_cp = range.end as u32;
-
-        // Special case: if both endpoints are in 0-255, treat as literal bytes
-        // This preserves backward compatibility for patterns like [\x00-\xff]
-        if start_cp <= 255 && end_cp <= 255 {
-            byte_ranges.push((start_cp as u8, end_cp as u8));
-            return;
-        }
-
-        // Use UTF-8 automata for the full range
-        let sequences = compile_utf8_range(start_cp, end_cp);
-
-        for seq in sequences {
-            if seq.len() == 1 {
-                // Single-byte sequence goes into byte_ranges
-                byte_ranges.push(seq.ranges[0]);
-            } else {
-                // Multi-byte sequence
-                utf8_sequences.push(seq);
-            }
-        }
+        push_codepoint_range(
+            range.start as u32,
+            range.end as u32,
+            byte_ranges,
+            utf8_sequences,
+        );
     }
 
     /// Builds the final HIR expression for a character class.
@@ -805,7 +741,9 @@ impl HirTranslator {
         // Convert byte ranges and UTF-8 sequences back to code point ranges
         let mut code_point_ranges = Vec::new();
 
-        // Add code points from byte ranges (these are in 0-255)
+        // Add code points from byte ranges (always ASCII, 0-127: code points
+        // 128 and above are routed through utf8_sequences instead, never
+        // pushed into byte_ranges directly)
         for (start, end) in byte_ranges {
             code_point_ranges.push((start as u32, end as u32));
         }
@@ -976,6 +914,41 @@ fn merge_codepoint_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
+/// Splits a codepoint range into single ASCII bytes and/or UTF-8 sequences.
+///
+/// Codepoints are ASCII bytes only up to U+007F; a byte value equals its
+/// codepoint only in that range. Anything at or above U+0080 must go through
+/// `compile_utf8_range` so it is encoded as UTF-8 instead of being truncated
+/// to a raw byte (e.g. U+00E9 'é' is the two bytes 0xC3 0xA9, not the single
+/// byte 0xE9). Single-byte results from `compile_utf8_range` (pure ASCII)
+/// are folded into `byte_ranges` alongside the direct ASCII portion.
+fn push_codepoint_range(
+    start_cp: u32,
+    end_cp: u32,
+    byte_ranges: &mut Vec<(u8, u8)>,
+    utf8_sequences: &mut Vec<Utf8Sequence>,
+) {
+    if start_cp <= 127 && end_cp <= 127 {
+        byte_ranges.push((start_cp as u8, end_cp as u8));
+        return;
+    }
+
+    let utf8_start = if start_cp <= 127 {
+        byte_ranges.push((start_cp as u8, 127));
+        128
+    } else {
+        start_cp
+    };
+
+    for seq in compile_utf8_range(utf8_start, end_cp) {
+        if seq.len() == 1 {
+            byte_ranges.push(seq.ranges[0]);
+        } else {
+            utf8_sequences.push(seq);
+        }
+    }
+}
+
 /// "Any non-ASCII character", as UTF-8 byte sequences.
 ///
 /// Three shapes rather than an exact enumeration of the scalar-value ranges.
@@ -1042,26 +1015,34 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_full_byte_range() {
-        // [\x00-\xff] should match all 256 byte values
+    fn test_translate_full_codepoint_range() {
+        // [\x00-\xff] should match codepoints U+0000-U+00FF. Anything at or
+        // above U+0080 is encoded as multi-byte UTF-8 (not a raw byte), so
+        // this now compiles to a UnicodeCpClass over codepoints rather than
+        // a plain byte Class.
         let ast = parse("[\\x00-\\xff]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
-        if let HirExpr::Class(cls) = hir.expr {
-            assert_eq!(cls.ranges, vec![(0, 255)]);
+        if let HirExpr::UnicodeCpClass(cpclass) = hir.expr {
+            assert_eq!(cpclass.ranges, vec![(0, 255)]);
+            assert!(!cpclass.negated);
         } else {
-            panic!("Expected Class");
+            panic!("Expected UnicodeCpClass, got {:?}", hir.expr);
         }
     }
 
     #[test]
-    fn test_translate_high_byte_range() {
-        // [\x80-\xff] should match bytes 128-255
+    fn test_translate_high_codepoint_range() {
+        // [\x80-\xff] should match codepoints U+0080-U+00FF. These are all
+        // above the ASCII cutoff, so they are encoded as 2-byte UTF-8
+        // sequences (0xC2 0x80 .. 0xC3 0xBF) and represented as a
+        // UnicodeCpClass over codepoints, not raw bytes 128-255.
         let ast = parse("[\\x80-\\xff]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
-        if let HirExpr::Class(cls) = hir.expr {
-            assert_eq!(cls.ranges, vec![(0x80, 0xff)]);
+        if let HirExpr::UnicodeCpClass(cpclass) = hir.expr {
+            assert_eq!(cpclass.ranges, vec![(0x80, 0xff)]);
+            assert!(!cpclass.negated);
         } else {
-            panic!("Expected Class");
+            panic!("Expected UnicodeCpClass, got {:?}", hir.expr);
         }
     }
 

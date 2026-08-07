@@ -2143,7 +2143,7 @@ const MISCELLANEOUS: &[Feature] = &[
     Feature {
         syntax: "[Unicode]",
         desc: "bracket expression containing literal non-ASCII characters and ranges",
-        support: Support::No,
+        support: Support::Yes,
         covered_by: None,
         probes: &[
             Probe {

@@ -234,18 +234,21 @@ fn test_binary_input() {
 }
 
 #[test]
-fn test_all_bytes() {
-    // Test that all byte values work correctly
-    // This test creates a DFA state with 256 valid transitions,
-    // which will use dense transition optimization
-    let jit = jit_compile("[\\x00-\\xff]");
+fn test_full_ascii_range_dense_transitions() {
+    // The widest single-byte class the language can express: 128 transitions
+    // out of one DFA state, which is what exercises the dense transition
+    // table. A class reaching above U+007F compiles to UTF-8 sequences rather
+    // than bytes, and engine selection sends those to the PikeVm, so they are
+    // deliberately not a DFA-JIT case.
+    let jit = jit_compile("[\\x00-\\x7f]");
 
-    for byte in 0..=255u8 {
-        assert!(jit.is_full_match(&[byte]), "Failed for byte {}", byte);
+    for byte in 0..=0x7fu8 {
+        assert!(jit.is_full_match(&[byte]), "Failed for byte {byte:#x}");
     }
+    assert!(!jit.is_full_match(&[0x80]));
 
     assert!(!jit.is_full_match(&[]));
-    assert!(!jit.is_full_match(&[0, 0])); // Should only full-match single byte
+    assert!(!jit.is_full_match(&[0, 0])); // Should only full-match one byte
     assert!(jit.is_match(&[0, 0])); // But is_match finds a match
 }
 
