@@ -78,6 +78,24 @@ pub(crate) struct AssertionTally {
     backref: usize,
 }
 
+/// Whether an NFA contains any lookaround assertion.
+///
+/// Used to keep the linear step extractor away from nested assertions, which it
+/// cannot model.
+fn nfa_has_lookaround(nfa: &Nfa) -> bool {
+    nfa.states.iter().any(|s| {
+        matches!(
+            s.instruction,
+            Some(
+                NfaInstruction::PositiveLookahead(_)
+                    | NfaInstruction::NegativeLookahead(_)
+                    | NfaInstruction::PositiveLookbehind(_)
+                    | NfaInstruction::NegativeLookbehind(_)
+            )
+        )
+    })
+}
+
 /// Tallies zero-width assertions present in an NFA's own states. Inner
 /// lookaround NFAs are held behind `Arc` and are not part of `nfa.states`, so
 /// each top-level assertion is counted exactly once.
@@ -662,6 +680,16 @@ impl<'a> StepExtractor<'a> {
     }
 
     fn extract_lookaround_steps(&self, inner_nfa: &Nfa) -> Vec<PatternStep> {
+        // A nested assertion cannot be modelled by this linear walk: the loop
+        // breaks on the match state before reading that state's instruction, so
+        // a trailing inner assertion would be dropped and the resulting empty
+        // step list read as "assertion satisfied" — turning an unsupported
+        // pattern into a wrong match. Refuse instead, so the caller falls back
+        // to the PikeVm, which evaluates nested lookaround correctly.
+        if nfa_has_lookaround(inner_nfa) {
+            return Vec::new();
+        }
+
         let mut visited = vec![false; inner_nfa.states.len()];
         let mut steps = Vec::new();
         let mut current = inner_nfa.start;
@@ -828,6 +856,12 @@ impl<'a> StepExtractor<'a> {
     /// because check_lookbehind uses fixed-length matching.
     /// Patterns with repetitions in lookbehind will return empty, causing fallback to PikeVM.
     fn extract_lookbehind_steps(&self, inner_nfa: &Nfa) -> Vec<PatternStep> {
+        // Same reason as `extract_lookaround_steps`: refuse a nested assertion
+        // rather than silently dropping it.
+        if nfa_has_lookaround(inner_nfa) {
+            return Vec::new();
+        }
+
         let mut visited = vec![false; inner_nfa.states.len()];
         let mut steps = Vec::new();
         let mut current = inner_nfa.start;

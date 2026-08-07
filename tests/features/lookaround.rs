@@ -153,3 +153,45 @@ fn test_lookbehind_variable_length() {
         assert!(re.is_match("aaab"));
     }
 }
+
+// =============================================================================
+// Nested lookarounds
+//
+// An assertion inside another assertion. The inner one must be evaluated, not
+// dropped: a dropped assertion reads as trivially satisfied, which makes the
+// outer assertion match text it has to reject. Expectations here were checked
+// against PCRE2.
+// =============================================================================
+
+#[test]
+fn negative_lookahead_nested_in_positive_lookahead_is_honoured() {
+    // `(?=a(?!b))` demands an `a` that is NOT followed by `b`.
+    let re = regex(r"(?=a(?!b))a.");
+    assert!(
+        !re.is_match("ab"),
+        "the nested (?!b) must reject an `a` followed by `b`"
+    );
+    assert_eq!(re.find("ac").map(|m| m.as_str()), Some("ac"));
+}
+
+#[test]
+fn positive_lookahead_nests_in_positive_lookahead() {
+    let re = regex(r"a(?=b(?=c))bc");
+    assert_eq!(re.find("abc").map(|m| m.as_str()), Some("abc"));
+    assert!(!re.is_match("abd"));
+}
+
+#[test]
+fn lookahead_nested_at_the_start_of_a_lookahead() {
+    let re = regex(r"(?=(?=a)a)a");
+    assert_eq!(re.find("a").map(|m| m.as_str()), Some("a"));
+    assert!(!re.is_match("b"));
+}
+
+#[test]
+fn negative_lookahead_nested_in_negative_lookahead_double_negates() {
+    // `(?!(?!y))` succeeds where `(?=y)` would.
+    let re = regex(r"x(?!(?!y))");
+    assert_eq!(re.find("xy").map(|m| m.as_str()), Some("x"));
+    assert!(!re.is_match("xz"));
+}

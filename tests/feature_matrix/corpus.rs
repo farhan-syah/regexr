@@ -1617,16 +1617,9 @@ const GROUPING: &[Feature] = &[
     Feature {
         syntax: "(?=…(?=…))",
         desc: "a lookahead nested inside another lookahead",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: "foo(?=bar(?=baz))",
-            matches: Some("foobarbaz"),
-            rejects: Some("foobarqux"),
-            expect: Some("foo"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::lookaround"),
+        probes: &[],
     },
     // Deliberately unsupported, for the same reason as possessive quantifiers:
     // an atomic group only constrains a backtracking search. RE2 and the `regex`
