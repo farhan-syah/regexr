@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.3.0] - 2026-08-08
+
+### Added
+
+- POSIX bracket expressions, `\x{...}`, `\cX`, `[\b]`, `(?#…)`, `(?'name'…)`, named backreferences, `\h`/`\H`, `\R`, `\N`, and the class set operators `&&`, `--`, `~~`.
+- A one-pass capture engine, JIT-compiled on x86-64 and AArch64 under the `jit` feature.
+- `RegexBuilder::size_limit`, which sets how large a pattern may expand to.
+
+### Fixed
+
+- `.` and the negated Perl classes match one whole codepoint, not one byte.
+- A class encodes codepoints above U+007F as UTF-8 rather than raw bytes.
+- Nested lookaround matched wrongly in both directions; lookbehind now sees the full input.
+- `(a|b)+` reported only its first iteration.
+- An empty match at the previous match's end is no longer reported twice. Affects every nullable pattern (`a*`, `\d*`, `\b\w*`).
+- `RegexBuilder::jit(true)` no longer selects a slower engine than `Regex::new`.
+- A prefilter no longer makes an engine without an anchored match quadratic in the input.
+
+### Changed
+
+- Possessive quantifiers (`a*+`) and atomic groups (`(?>…)`) are rejected.
+- A pattern is refused past 65535 for a single `{n,m}` bound, or 10000 expanded elements; raise it with `RegexBuilder::size_limit`.
+
 ## [0.2.2] - 2026-08-07
 
 ### Fixed
