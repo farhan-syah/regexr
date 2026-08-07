@@ -23,6 +23,15 @@ pub struct Parser<'a> {
     pub(super) capture_count: u32,
     /// Current flags.
     pub(super) flags: Flags,
+    /// Name -> capture index, populated as named groups are parsed. Backed
+    /// by a single left-to-right pass, so it only ever holds names already
+    /// seen: a named backreference (`\k<name>`, `(?P=name)`, ...) resolves
+    /// against whatever this map holds at the point it's encountered — i.e.
+    /// only a name defined earlier in the pattern is visible. A duplicate
+    /// name simply overwrites its earlier entry, matching how
+    /// `HirProps::named_groups` (built later from the same left-to-right AST
+    /// walk) resolves duplicates too.
+    pub(super) named_groups: std::collections::HashMap<String, u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -43,6 +52,7 @@ impl<'a> Parser<'a> {
             next_capture: 1,
             capture_count: 0,
             flags: Flags::default(),
+            named_groups: std::collections::HashMap::new(),
         })
     }
 

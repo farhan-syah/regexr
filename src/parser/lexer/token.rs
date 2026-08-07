@@ -118,6 +118,10 @@ pub enum EscapeKind {
     Unicode(char),
     /// \1, \2, etc. - backreference.
     Backref(u32),
+    /// \k<name>, \k{name}, or \k'name' - named backreference. Carries the raw
+    /// name; resolving it to a capture index happens in the parser, which is
+    /// the only place that knows which names have been defined.
+    NamedBackref(String),
     /// \X - one extended grapheme cluster (UAX #29).
     GraphemeCluster,
     /// \p{PropertyName} - Unicode property.

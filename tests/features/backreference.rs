@@ -84,6 +84,62 @@ fn test_backref_captures() {
 }
 
 #[test]
+fn test_named_backref_angle_bracket() {
+    let re = regex(r"(?<w>a)\k<w>");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+}
+
+#[test]
+fn test_named_backref_brace() {
+    let re = regex(r"(?<w>a)\k{w}");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+}
+
+#[test]
+fn test_named_backref_quote() {
+    let re = regex(r"(?<w>a)\k'w'");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+}
+
+#[test]
+fn test_named_backref_python_style() {
+    let re = regex(r"(?P<w>a)(?P=w)");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+}
+
+/// The four spellings, and the three named-group spellings, all interoperate
+/// — a backreference written in one spelling can refer to a group opened
+/// with any other.
+#[test]
+fn test_named_backref_spellings_interoperate() {
+    let re = regex(r"(?'w'a)\k<w>");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+
+    let re = regex(r"(?P<w>a)\k{w}");
+    assert!(re.is_match("aa"));
+    assert!(!re.is_match("ab"));
+}
+
+#[test]
+fn test_named_backref_usable_via_capture_api() {
+    let re = regex(r"(?<w>a)\k<w>");
+    let caps = re.captures("aa").unwrap();
+    assert_eq!(caps.name("w").unwrap().as_str(), "a");
+    assert_eq!(&caps[1], "a");
+}
+
+#[test]
+fn test_named_backref_unknown_name_rejected() {
+    assert!(Regex::new(r"\k<nosuch>").is_err());
+    assert!(Regex::new(r"(?P=nosuch)").is_err());
+}
+
+#[test]
 fn test_backref_invalid_group() {
     let result = Regex::new(r"\1");
     assert!(result.is_err());

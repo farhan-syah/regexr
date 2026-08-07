@@ -49,6 +49,19 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"\x{263A",
     r"\c",
     r"\c1",
+    // Named backreferences: undefined name, empty name, unterminated,
+    // missing/unrecognized delimiter, and mismatched delimiter pairs.
+    r"\k<nosuch>",
+    r"\k<>",
+    r"\k<w",
+    r"\k",
+    r"\kX",
+    r"\k<w}",
+    r"\k{w>",
+    // (?P=name): undefined name, empty name, unterminated.
+    r"(?P=nosuch)",
+    r"(?P=)",
+    r"(?P=w",
 ];
 
 #[test]

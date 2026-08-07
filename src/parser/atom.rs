@@ -90,6 +90,7 @@ impl Parser<'_> {
 
     /// Parses an escape sequence.
     fn parse_escape(&mut self, esc: EscapeKind) -> Result<Expr> {
+        let span = self.current.span;
         self.advance()?;
 
         match esc {
@@ -118,6 +119,18 @@ impl Parser<'_> {
             }
 
             EscapeKind::Backref(n) => Ok(Expr::Backref(n)),
+
+            // Resolved to a plain numeric backreference at parse time, so
+            // every engine that already handles `\1` handles this for free —
+            // no by-name backreference node, no runtime name lookup.
+            EscapeKind::NamedBackref(name) => match self.named_groups.get(&name) {
+                Some(&index) => Ok(Expr::Backref(index)),
+                None => Err(Error::with_span(
+                    ErrorKind::UnknownGroupName(name),
+                    self.pattern,
+                    span,
+                )),
+            },
 
             EscapeKind::GraphemeCluster => Ok(Expr::GraphemeCluster),
 

@@ -92,6 +92,14 @@ pub enum ErrorKind {
     InvalidBackref(usize),
     /// Backreference to non-existent group.
     BackrefNotFound(usize),
+    /// Malformed named-backreference syntax: `\k` at end of pattern, `\k`
+    /// followed by a delimiter other than `<`, `{`, or `'`, an empty name
+    /// (`\k<>`), or an unterminated form (`\k<name`).
+    InvalidNamedBackref,
+    /// A named backreference (`\k<name>`, `\k{name}`, `\k'name'`, or
+    /// `(?P=name)`) refers to a name that was never defined as a capture
+    /// group.
+    UnknownGroupName(String),
     /// Nested quantifiers (e.g., a**).
     NestedQuantifier,
 
@@ -208,6 +216,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidBackref(n) => write!(f, "invalid backreference '\\{}'", n),
             ErrorKind::BackrefNotFound(n) => {
                 write!(f, "backreference '\\{}' references non-existent group", n)
+            }
+            ErrorKind::InvalidNamedBackref => write!(f, "invalid named backreference syntax"),
+            ErrorKind::UnknownGroupName(name) => {
+                write!(f, "backreference to unknown group name '{}'", name)
             }
             ErrorKind::NestedQuantifier => write!(f, "nested quantifiers are not allowed"),
             ErrorKind::PatternTooLarge => write!(f, "pattern too large"),

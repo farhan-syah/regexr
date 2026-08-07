@@ -56,26 +56,14 @@ impl Parser<'_> {
                         _ => {
                             // (?<name>...) named group
                             // The first character of the name is in self.current
-                            let first_char = match &self.current.kind {
-                                TokenKind::Literal(c) => *c,
-                                _ => {
-                                    return Err(Error::with_span(
-                                        ErrorKind::InvalidGroup,
-                                        self.pattern,
-                                        self.current.span,
-                                    ));
-                                }
-                            };
-                            // Read the rest of the identifier
-                            let rest = self.lexer.read_ident_rest();
-                            let name = format!("{}{}", first_char, rest);
-                            self.current = self.lexer.next_token()?;
+                            let name = self.parse_group_name()?;
                             self.expect(TokenKind::GreaterThan)?;
                             let expr = self.parse_alternation()?;
                             self.expect_close_paren(start_span)?;
                             let index = self.next_capture;
                             self.next_capture += 1;
                             self.capture_count += 1;
+                            self.named_groups.insert(name.clone(), index);
                             Ok(Expr::Group(Box::new(Group {
                                 expr,
                                 kind: GroupKind::NamedCapturing { name, index },
@@ -110,13 +98,70 @@ impl Parser<'_> {
                 // whole construct itself, so it behaves identically in every
                 // mode, including extended (`x`) mode.
 
-                // Python-style named group (?P<name>...)
+                // Python-style named group (?P<name>...), or a named
+                // backreference to one, (?P=name).
                 TokenKind::Literal('P') => {
                     self.advance()?;
-                    self.expect(TokenKind::LessThan)?;
-                    // The first character of the name is now in self.current
-                    let first_char = match &self.current.kind {
-                        TokenKind::Literal(c) => *c,
+                    match &self.current.kind {
+                        TokenKind::LessThan => {
+                            self.advance()?;
+                            // The first character of the name is now in self.current
+                            let name = self.parse_group_name()?;
+                            self.expect(TokenKind::GreaterThan)?;
+                            let expr = self.parse_alternation()?;
+                            self.expect_close_paren(start_span)?;
+                            let index = self.next_capture;
+                            self.next_capture += 1;
+                            self.capture_count += 1;
+                            self.named_groups.insert(name.clone(), index);
+                            Ok(Expr::Group(Box::new(Group {
+                                expr,
+                                kind: GroupKind::NamedCapturing { name, index },
+                            })))
+                        }
+                        TokenKind::Equals => {
+                            // (?P=name) - named backreference, Python style.
+                            self.advance()?;
+                            let name_span = self.current.span;
+                            let name = self.parse_group_name()?;
+                            self.expect(TokenKind::CloseParen)?;
+                            match self.named_groups.get(&name) {
+                                Some(&index) => Ok(Expr::Backref(index)),
+                                None => Err(Error::with_span(
+                                    ErrorKind::UnknownGroupName(name),
+                                    self.pattern,
+                                    name_span,
+                                )),
+                            }
+                        }
+                        _ => Err(Error::with_span(
+                            ErrorKind::InvalidGroup,
+                            self.pattern,
+                            self.current.span,
+                        )),
+                    }
+                }
+
+                // Quote-delimited named group (?'name'...), equivalent to
+                // (?<name>...) and (?P<name>...).
+                TokenKind::Literal('\'') => {
+                    self.advance()?;
+                    // An immediate closing quote means an empty name, which
+                    // `parse_group_name` cannot detect on its own: `'` lexes
+                    // to the same `Literal` token kind as any other name
+                    // character, so it would otherwise be read as content.
+                    if matches!(self.current.kind, TokenKind::Literal('\'')) {
+                        return Err(Error::with_span(
+                            ErrorKind::InvalidGroup,
+                            self.pattern,
+                            self.current.span,
+                        ));
+                    }
+                    let name = self.parse_group_name()?;
+                    match self.current.kind {
+                        TokenKind::Literal('\'') => {
+                            self.advance()?;
+                        }
                         _ => {
                             return Err(Error::with_span(
                                 ErrorKind::InvalidGroup,
@@ -124,17 +169,13 @@ impl Parser<'_> {
                                 self.current.span,
                             ));
                         }
-                    };
-                    // Read the rest of the identifier
-                    let rest = self.lexer.read_ident_rest();
-                    let name = format!("{}{}", first_char, rest);
-                    self.current = self.lexer.next_token()?;
-                    self.expect(TokenKind::GreaterThan)?;
+                    }
                     let expr = self.parse_alternation()?;
                     self.expect_close_paren(start_span)?;
                     let index = self.next_capture;
                     self.next_capture += 1;
                     self.capture_count += 1;
+                    self.named_groups.insert(name.clone(), index);
                     Ok(Expr::Group(Box::new(Group {
                         expr,
                         kind: GroupKind::NamedCapturing { name, index },
@@ -201,6 +242,32 @@ impl Parser<'_> {
                 kind: GroupKind::Capturing(index),
             })))
         }
+    }
+
+    /// Parses a group name from the token stream: `self.current` must
+    /// already hold the name's first character (lexed as a `Literal`), and
+    /// the rest is read straight off the lexer's raw character stream via
+    /// `read_ident_rest`. Shared by every named-group spelling —
+    /// `(?<name>...)`, `(?P<name>...)`, `(?'name'...)` — and by the
+    /// `(?P=name)` backreference, so the name syntax (and its malformed-name
+    /// error) is identical across all of them. Does not consume the
+    /// construct's closing delimiter; callers check that themselves, since
+    /// it differs per spelling (`>`, `'`, or `)`).
+    fn parse_group_name(&mut self) -> Result<String> {
+        let first_char = match &self.current.kind {
+            TokenKind::Literal(c) => *c,
+            _ => {
+                return Err(Error::with_span(
+                    ErrorKind::InvalidGroup,
+                    self.pattern,
+                    self.current.span,
+                ));
+            }
+        };
+        let rest = self.lexer.read_ident_rest();
+        let name = format!("{}{}", first_char, rest);
+        self.current = self.lexer.next_token()?;
+        Ok(name)
     }
 
     /// Expects a closing parenthesis.

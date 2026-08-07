@@ -46,6 +46,29 @@ fn test_named_capture_mixed() {
 }
 
 #[test]
+fn test_named_capture_quote_delimited() {
+    let re = regex(r"(?'word'\w+)");
+    let caps = re.captures("hello world").unwrap();
+    assert_eq!(&caps["word"], "hello");
+    assert_eq!(caps.name("word").unwrap().as_str(), "hello");
+}
+
+#[test]
+fn test_named_capture_quote_delimited_same_index_as_angle_bracket() {
+    // All three spellings must be fully equivalent: same capture index, same
+    // entry in the named-group map, usable by `Captures::name`.
+    let angle = Regex::new(r"(a)(?<w>b)").unwrap();
+    let quote = Regex::new(r"(a)(?'w'b)").unwrap();
+    let python = Regex::new(r"(a)(?P<w>b)").unwrap();
+
+    for re in [&angle, &quote, &python] {
+        let caps = re.captures("ab").unwrap();
+        assert_eq!(&caps["w"], "b");
+        assert_eq!(&caps[2], "b");
+    }
+}
+
+#[test]
 fn test_capture_names() {
     let re = Regex::new(r"(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})").unwrap();
     let names: Vec<_> = re.capture_names().collect();

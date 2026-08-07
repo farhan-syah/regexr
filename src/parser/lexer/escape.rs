@@ -91,6 +91,12 @@ impl Lexer<'_> {
                 EscapeKind::Backref(n)
             }
 
+            // Named backreference: \k<name>, \k{name}, or \k'name'.
+            'k' => {
+                let name = self.lex_named_backref(start)?;
+                EscapeKind::NamedBackref(name)
+            }
+
             // Escaping any non-alphanumeric ASCII character yields that
             // character. Patterns written for other engines rely on this far
             // beyond the metacharacters that strictly need it — `\ `, `\"`,
@@ -349,6 +355,58 @@ impl Lexer<'_> {
             (Some((_, ':')), Some((_, ']'))) => Ok(TokenKind::PosixClass { name, negated }),
             _ => Err(Error::with_span(
                 ErrorKind::InvalidPosixClass,
+                self.src,
+                Span::new(start, self.pos),
+            )),
+        }
+    }
+
+    /// Lexes a named backreference: `\k<name>`, `\k{name}`, or `\k'name'`,
+    /// already positioned just past the `k`. Returns the raw name; the
+    /// parser resolves it to a capture index, since only the parser tracks
+    /// which names have been defined.
+    ///
+    /// The name itself uses the same shape as a `(?<name>...)` group name —
+    /// an arbitrary first character followed by `read_ident_rest`'s
+    /// alphanumeric/underscore run, shared with every named-group spelling
+    /// (see `Parser::parse_group_name`) — except the first character may not
+    /// be a digit, matching how a leading digit lexes to `Digit` rather than
+    /// `Literal` for the group-name spellings and so is rejected there too.
+    ///
+    /// Rejects: no delimiter or an unrecognized one, an empty name, an
+    /// unterminated form (EOF before the closing delimiter), and a
+    /// mismatched delimiter pair (e.g. `\k<name}`).
+    fn lex_named_backref(&mut self, start: usize) -> Result<String> {
+        let close = match self.next_char() {
+            Some((_, '<')) => '>',
+            Some((_, '{')) => '}',
+            Some((_, '\'')) => '\'',
+            _ => {
+                return Err(Error::with_span(
+                    ErrorKind::InvalidNamedBackref,
+                    self.src,
+                    Span::new(start, self.pos),
+                ));
+            }
+        };
+
+        let first = match self.next_char() {
+            Some((_, c)) if c != close && !c.is_ascii_digit() => c,
+            _ => {
+                return Err(Error::with_span(
+                    ErrorKind::InvalidNamedBackref,
+                    self.src,
+                    Span::new(start, self.pos),
+                ));
+            }
+        };
+        let rest = self.read_ident_rest();
+        let name = format!("{first}{rest}");
+
+        match self.next_char() {
+            Some((_, c)) if c == close => Ok(name),
+            _ => Err(Error::with_span(
+                ErrorKind::InvalidNamedBackref,
                 self.src,
                 Span::new(start, self.pos),
             )),
