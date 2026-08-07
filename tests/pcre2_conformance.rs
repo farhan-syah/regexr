@@ -120,6 +120,12 @@ const PATTERNS: &[&str] = &[
     r"a(?=b(?=c))bc",
     r"(?<=a)(?<=xa)b",
     r"(?<=\bfoo)bar",
+    // A positive lookahead carrying a literal drives the required-literal
+    // rejection filter; it must not change which match is reported.
+    r"\w+(?=ing\b)",
+    r"(\w+)(?=ing\b)",
+    r"a(?=bc)\w",
+    r"\w+(?=ing\b)|zzz",
     r"(?<=a+)b",
     // Escapes
     r"\x41",
@@ -172,6 +178,12 @@ const HAYSTACKS: &[&str] = &[
     "A",
     "\u{1}",
     "foobarbaz",
+    "running and singing",
+    "sing",
+    "ing",
+    "zzz nothing",
+    "zzz",
+    "no matches at all here",
     "category",
     "a\nc",
     "a\nb",

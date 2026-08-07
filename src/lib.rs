@@ -149,11 +149,16 @@ impl RegexBuilder {
 
         Ok(Regex {
             inner,
+            required_literal: required_literal_finder(&hir_result),
             pattern: self.pattern,
             named_groups,
             backtrack_limit: self.backtrack_limit,
         })
     }
+}
+
+fn required_literal_finder(hir: &hir::Hir) -> Option<memchr::memmem::Finder<'static>> {
+    literal::required_literal(hir).map(|l| memchr::memmem::Finder::new(&l).into_owned())
 }
 
 /// Escapes all regex metacharacters in `text` so that the returned pattern
@@ -221,6 +226,9 @@ pub fn escape(text: &str) -> String {
 #[derive(Debug)]
 pub struct Regex {
     inner: CompiledRegex,
+    /// A literal every match must contain; absent from the haystack means no
+    /// match exists. Rejection only — never decides which match is reported.
+    required_literal: Option<memchr::memmem::Finder<'static>>,
     pattern: String,
     /// Named capture groups: maps name to index.
     named_groups: Arc<HashMap<String, u32>>,
@@ -242,6 +250,7 @@ impl Regex {
 
         Ok(Regex {
             inner,
+            required_literal: required_literal_finder(&hir),
             pattern: pattern.to_string(),
             named_groups,
             backtrack_limit: vm::backtracking::DEFAULT_BACKTRACK_LIMIT,
@@ -260,14 +269,25 @@ impl Regex {
 
     /// Returns true if the regex matches anywhere in the text.
     pub fn is_match(&self, text: &str) -> bool {
-        self.inner.is_match(text.as_bytes())
+        self.can_match(text) && self.inner.is_match(text.as_bytes())
     }
 
     /// Returns the first match in the text.
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
+        if !self.can_match(text) {
+            return None;
+        }
         self.inner
             .find(text.as_bytes())
             .map(|(start, end)| Match { text, start, end })
+    }
+
+    /// Whether a required literal (if any) is present at all.
+    pub(crate) fn can_match(&self, text: &str) -> bool {
+        match self.required_literal {
+            Some(ref finder) => finder.find(text.as_bytes()).is_some(),
+            None => true,
+        }
     }
 
     /// Returns an iterator over all non-overlapping matches.
@@ -282,6 +302,9 @@ impl Regex {
 
     /// Returns the capture groups for the first match.
     pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
+        if !self.can_match(text) {
+            return None;
+        }
         self.inner.captures(text.as_bytes()).map(|slots| Captures {
             text,
             slots,
@@ -306,6 +329,9 @@ impl Regex {
     /// [`error::ErrorKind::MatchLimitExceeded`] if a backreference search ran
     /// past [`RegexBuilder::backtrack_limit`]. No other pattern can fail here.
     pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>> {
+        if !self.can_match(text) {
+            return Ok(None);
+        }
         self.inner
             .try_find_from(text.as_bytes(), 0, self.backtrack_limit)
             .map(|found| found.map(|(start, end)| Match { text, start, end }))
@@ -319,6 +345,9 @@ impl Regex {
     /// [`error::ErrorKind::MatchLimitExceeded`] if a backreference search ran
     /// past [`RegexBuilder::backtrack_limit`]. No other pattern can fail here.
     pub fn try_captures<'t>(&self, text: &'t str) -> Result<Option<Captures<'t>>> {
+        if !self.can_match(text) {
+            return Ok(None);
+        }
         self.inner
             .try_captures_from(text.as_bytes(), 0, self.backtrack_limit)
             .map(|found| {
@@ -340,7 +369,12 @@ impl Regex {
         CapturesIter {
             regex: self,
             text,
-            last_end: 0,
+            // Past the end, so a required literal that is absent yields nothing.
+            last_end: if self.can_match(text) {
+                0
+            } else {
+                text.len() + 1
+            },
         }
     }
 
@@ -494,12 +528,16 @@ enum MatchesInner<'a> {
     TeddyFull(literal::FullMatchIter<'a, 'a>),
     /// Generic path: call find() repeatedly.
     Generic { regex: &'a Regex, last_end: usize },
+    /// A required literal is absent, so no match exists anywhere.
+    Empty,
 }
 
 impl<'a> Matches<'a> {
     /// Creates a new matches iterator.
     fn new(regex: &'a Regex, text: &'a str) -> Self {
-        let inner = if regex.inner.is_full_match_prefilter() {
+        let inner = if !regex.can_match(text) {
+            MatchesInner::Empty
+        } else if regex.inner.is_full_match_prefilter() {
             // Fast path: use Teddy iterator directly
             MatchesInner::TeddyFull(regex.inner.find_full_matches(text.as_bytes()))
         } else {
@@ -515,6 +553,7 @@ impl<'a> Iterator for Matches<'a> {
 
     fn next(&mut self) -> Option<Match<'a>> {
         match &mut self.inner {
+            MatchesInner::Empty => None,
             MatchesInner::TeddyFull(iter) => {
                 // Fast path: get match directly from Teddy iterator
                 iter.next().map(|(start, end)| Match {

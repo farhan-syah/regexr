@@ -3,7 +3,7 @@
 //! Extracts literal prefixes and suffixes from HIR patterns for prefiltering.
 //! Supports both single-literal and multi-literal extraction for Teddy.
 
-use crate::hir::{Hir, HirExpr};
+use crate::hir::{Hir, HirExpr, HirLookaroundKind};
 
 /// Extracted literals from a pattern.
 #[derive(Debug, Clone, Default)]
@@ -385,8 +385,59 @@ fn find_common_prefix(seqs: &[Vec<u8>]) -> Option<Vec<u8>> {
     }
 }
 
+/// A literal that every match must contain, drawn from a positive lookahead.
+///
+/// `\w+(?=ing\b)` cannot match anywhere in a haystack with no `ing` in it, so
+/// one `memmem` settles the whole search. Only a top-level concatenation is
+/// walked: under an alternation a branch may not require the literal.
+pub fn required_literal(hir: &Hir) -> Option<Vec<u8>> {
+    fn walk(expr: &HirExpr) -> Option<Vec<u8>> {
+        match expr {
+            HirExpr::Lookaround(look) => match look.kind {
+                HirLookaroundKind::PositiveLookahead | HirLookaroundKind::PositiveLookbehind => {
+                    let mut extractor = LiteralExtractor::new();
+                    let inner = extractor.extract(&look.expr);
+                    inner.prefixes.first().filter(|l| l.len() >= 2).cloned()
+                }
+                _ => None,
+            },
+            HirExpr::Concat(exprs) => exprs.iter().find_map(walk),
+            HirExpr::Capture(capture) => walk(&capture.expr),
+            HirExpr::Repeat(repeat) if repeat.min >= 1 => walk(&repeat.expr),
+            _ => None,
+        }
+    }
+    walk(&hir.expr)
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn required(pattern: &str) -> Option<Vec<u8>> {
+        let ast = crate::parser::parse(pattern).unwrap();
+        let hir = crate::hir::translate(&ast).unwrap();
+        required_literal(&hir)
+    }
+
+    #[test]
+    fn test_required_literal_from_positive_lookahead() {
+        assert_eq!(required(r"\w+(?=ing\b)"), Some(b"ing".to_vec()));
+        assert_eq!(required(r"(\w+)(?=ing\b)"), Some(b"ing".to_vec()));
+        assert_eq!(required(r"a(?=bcd)"), Some(b"bcd".to_vec()));
+    }
+
+    #[test]
+    fn test_no_required_literal_when_a_branch_may_not_need_it() {
+        // An alternation can match via a branch without the lookahead, so
+        // rejecting on the literal's absence would lose real matches.
+        assert_eq!(required(r"\w+(?=ing\b)|zzz"), None);
+        assert_eq!(required(r"(?:a(?=bcd)|q)"), None);
+        // A negative lookahead requires the literal to be ABSENT.
+        assert_eq!(required(r"\w+(?!ing)"), None);
+        // Optional: the lookahead need not apply at all.
+        assert_eq!(required(r"a(?:(?=bcd))?"), None);
+        assert_eq!(required(r"\w+"), None);
+    }
     use super::*;
     use crate::hir::translate;
     use crate::parser::parse;
