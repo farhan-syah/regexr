@@ -62,6 +62,13 @@ pub enum TokenKind {
     Exclamation,
     /// An identifier (for named groups).
     Ident(String),
+    /// A POSIX bracket-expression class, e.g. `[:alpha:]` or `[:^alpha:]`.
+    PosixClass {
+        /// The class name (e.g. `"alpha"`), without the `^` or delimiters.
+        name: String,
+        /// Whether the class was negated with a leading `^` (`[:^alpha:]`).
+        negated: bool,
+    },
     /// End of input.
     Eof,
 }

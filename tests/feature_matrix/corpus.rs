@@ -1207,16 +1207,9 @@ const CLASSES: &[Feature] = &[
     Feature {
         syntax: "[[:class:]]",
         desc: "POSIX class name inside a bracket expression",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: "[[:alpha:]]+",
-            matches: Some("abc123"),
-            rejects: Some("123"),
-            expect: Some("abc"),
-            icase: false,
-            xmode: false,
-        }],
+        support: Support::Yes,
+        covered_by: Some("features::posix_class"),
+        probes: &[],
     },
 ];
 

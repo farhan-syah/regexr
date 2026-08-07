@@ -196,6 +196,11 @@ impl<'a> Lexer<'a> {
     fn lex_class_char(&mut self, c: char, start: usize) -> Result<TokenKind> {
         match c {
             ']' => Ok(TokenKind::CloseBracket),
+            // `[:` opens a POSIX bracket-expression class, e.g. `[[:alpha:]]`.
+            // Checked before the generic nested-class arm below so `[:...:]`
+            // is never mistaken for a nested class containing the literal
+            // members `:`, `a`, `l`, `p`, `h`.
+            '[' if self.peek_char() == Some(':') => self.lex_posix_class(start),
             // `[` opens a nested class (set union), matching the Rust `regex`
             // crate / HuggingFace tokenizers — e.g. `[a[b-c]]` or `[^(\s|[.,!])]`.
             '[' => Ok(TokenKind::OpenBracket),

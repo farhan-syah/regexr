@@ -41,6 +41,7 @@ mod inline_flags;
 mod lookaround;
 mod named_capture;
 mod pattern_rejection;
+mod posix_class;
 mod quoting;
 mod syntax;
 mod word_boundary;

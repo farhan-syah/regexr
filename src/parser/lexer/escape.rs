@@ -277,6 +277,49 @@ impl Lexer<'_> {
         }
     }
 
+    /// Lexes a POSIX bracket-expression class (`[:alpha:]`, `[:^alpha:]`),
+    /// already past the opening `[` — the caller peeked the following `:`
+    /// before dispatching here. Once `[:` has been seen the syntax is
+    /// committed: anything short of a well-formed `[:name:]` (or `[:^name:]`)
+    /// is an error, never a silent fallback to a literal `[`.
+    pub(super) fn lex_posix_class(&mut self, start: usize) -> Result<TokenKind> {
+        self.next_char(); // consume ':'
+
+        let negated = if self.peek_char() == Some('^') {
+            self.next_char();
+            true
+        } else {
+            false
+        };
+
+        let mut name = String::new();
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_alphabetic() {
+                self.next_char();
+                name.push(c);
+            } else {
+                break;
+            }
+        }
+
+        if name.is_empty() {
+            return Err(Error::with_span(
+                ErrorKind::InvalidPosixClass,
+                self.src,
+                Span::new(start, self.pos),
+            ));
+        }
+
+        match (self.next_char(), self.next_char()) {
+            (Some((_, ':')), Some((_, ']'))) => Ok(TokenKind::PosixClass { name, negated }),
+            _ => Err(Error::with_span(
+                ErrorKind::InvalidPosixClass,
+                self.src,
+                Span::new(start, self.pos),
+            )),
+        }
+    }
+
     /// Lexes a backreference (\1, \12, etc.).
     fn lex_backref(&mut self, first: char) -> Result<u32> {
         let mut n = first.to_digit(10).unwrap();

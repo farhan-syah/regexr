@@ -418,6 +418,27 @@ impl Parser<'_> {
                     )),
                 }
             }
+            // POSIX bracket-expression class, e.g. `[:alpha:]` or `[:^alpha:]`.
+            // The lexer has already validated the syntax; only the name can
+            // still be unrecognized here.
+            TokenKind::PosixClass { name, negated } => {
+                let name = name.clone();
+                let negated = *negated;
+                let ranges = posix_class_ranges(&name).ok_or_else(|| {
+                    Error::with_span(
+                        ErrorKind::UnknownPosixClass(name.clone()),
+                        self.pattern,
+                        self.current.span,
+                    )
+                })?;
+                let ranges = if negated {
+                    complement_ranges(ranges)
+                } else {
+                    ranges.to_vec()
+                };
+                self.advance()?;
+                Ok(ClassItem::Ranges(ranges))
+            }
             TokenKind::Literal(c) => {
                 let c = *c;
                 self.advance()?;
@@ -464,6 +485,162 @@ fn unicode_whitespace_ranges() -> Vec<ClassRange> {
     WS.iter()
         .map(|&(s, e)| ClassRange::new(char::from_u32(s).unwrap(), char::from_u32(e).unwrap()))
         .collect()
+}
+
+/// ASCII ranges for the 14 POSIX bracket-expression class names, e.g.
+/// `[:alpha:]`. Returns `None` for an unrecognized name.
+///
+/// Deliberately ASCII-only — `[:alpha:]` is `[A-Za-z]`, not Unicode
+/// `Alphabetic`. This matches PCRE, grep and the `regex` crate, and matches
+/// this codebase's own precedent that `\d`/`\w` are ASCII-only rather than
+/// wired to `crate::hir::unicode_data`.
+fn posix_class_ranges(name: &str) -> Option<&'static [ClassRange]> {
+    const ALPHA: &[ClassRange] = &[
+        ClassRange {
+            start: 'A',
+            end: 'Z',
+        },
+        ClassRange {
+            start: 'a',
+            end: 'z',
+        },
+    ];
+    const DIGIT: &[ClassRange] = &[ClassRange {
+        start: '0',
+        end: '9',
+    }];
+    const ALNUM: &[ClassRange] = &[
+        ClassRange {
+            start: 'A',
+            end: 'Z',
+        },
+        ClassRange {
+            start: 'a',
+            end: 'z',
+        },
+        ClassRange {
+            start: '0',
+            end: '9',
+        },
+    ];
+    const UPPER: &[ClassRange] = &[ClassRange {
+        start: 'A',
+        end: 'Z',
+    }];
+    const LOWER: &[ClassRange] = &[ClassRange {
+        start: 'a',
+        end: 'z',
+    }];
+    const SPACE: &[ClassRange] = &[
+        ClassRange {
+            start: '\t',
+            end: '\r',
+        },
+        ClassRange {
+            start: ' ',
+            end: ' ',
+        },
+    ];
+    const BLANK: &[ClassRange] = &[
+        ClassRange {
+            start: '\t',
+            end: '\t',
+        },
+        ClassRange {
+            start: ' ',
+            end: ' ',
+        },
+    ];
+    const CNTRL: &[ClassRange] = &[
+        ClassRange {
+            start: '\x00',
+            end: '\x1F',
+        },
+        ClassRange {
+            start: '\x7F',
+            end: '\x7F',
+        },
+    ];
+    const PRINT: &[ClassRange] = &[ClassRange {
+        start: '\x20',
+        end: '\x7E',
+    }];
+    const GRAPH: &[ClassRange] = &[ClassRange {
+        start: '\x21',
+        end: '\x7E',
+    }];
+    const PUNCT: &[ClassRange] = &[
+        ClassRange {
+            start: '\x21',
+            end: '\x2F',
+        },
+        ClassRange {
+            start: '\x3A',
+            end: '\x40',
+        },
+        ClassRange {
+            start: '\x5B',
+            end: '\x60',
+        },
+        ClassRange {
+            start: '\x7B',
+            end: '\x7E',
+        },
+    ];
+    const XDIGIT: &[ClassRange] = &[
+        ClassRange {
+            start: '0',
+            end: '9',
+        },
+        ClassRange {
+            start: 'A',
+            end: 'F',
+        },
+        ClassRange {
+            start: 'a',
+            end: 'f',
+        },
+    ];
+    const WORD: &[ClassRange] = &[
+        ClassRange {
+            start: 'A',
+            end: 'Z',
+        },
+        ClassRange {
+            start: 'a',
+            end: 'z',
+        },
+        ClassRange {
+            start: '0',
+            end: '9',
+        },
+        ClassRange {
+            start: '_',
+            end: '_',
+        },
+    ];
+    const ASCII: &[ClassRange] = &[ClassRange {
+        start: '\x00',
+        end: '\x7F',
+    }];
+
+    match name {
+        "alpha" => Some(ALPHA),
+        "digit" => Some(DIGIT),
+        "alnum" => Some(ALNUM),
+        "upper" => Some(UPPER),
+        "lower" => Some(LOWER),
+        "space" => Some(SPACE),
+        "blank" => Some(BLANK),
+        "cntrl" => Some(CNTRL),
+        "print" => Some(PRINT),
+        "graph" => Some(GRAPH),
+        "punct" => Some(PUNCT),
+        "xdigit" => Some(XDIGIT),
+        "word" => Some(WORD),
+        "ascii" => Some(ASCII),
+        _ => None,
+    }
 }
 
 /// Complement of a sorted-or-unsorted set of character ranges over the Unicode
@@ -515,5 +692,62 @@ fn push_scalar_range(out: &mut Vec<ClassRange>, start: u32, end: u32) {
                 char::from_u32(end).unwrap(),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_14_posix_class_names() {
+        for name in [
+            "alpha", "digit", "alnum", "upper", "lower", "space", "blank", "cntrl", "print",
+            "graph", "punct", "xdigit", "word", "ascii",
+        ] {
+            assert!(
+                posix_class_ranges(name).is_some(),
+                "{name} should be a recognized POSIX class"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_names() {
+        assert!(posix_class_ranges("bogus").is_none());
+        assert!(posix_class_ranges("").is_none());
+        assert!(posix_class_ranges("Alpha").is_none());
+    }
+
+    #[test]
+    fn alpha_is_ascii_letters_only() {
+        let ranges = posix_class_ranges("alpha").unwrap();
+        assert!(ranges.iter().any(|r| r.contains('a')));
+        assert!(ranges.iter().any(|r| r.contains('X')));
+        assert!(!ranges.iter().any(|r| r.contains('9')));
+        assert!(!ranges.iter().any(|r| r.contains('_')));
+        // Not the Unicode `Alphabetic` property.
+        assert!(!ranges.iter().any(|r| r.contains('é')));
+    }
+
+    #[test]
+    fn digit_is_0_to_9() {
+        let ranges = posix_class_ranges("digit").unwrap();
+        assert!(ranges.iter().any(|r| r.contains('5')));
+        assert!(!ranges.iter().any(|r| r.contains('a')));
+    }
+
+    #[test]
+    fn space_matches_space_and_tab_but_not_a() {
+        let ranges = posix_class_ranges("space").unwrap();
+        assert!(ranges.iter().any(|r| r.contains(' ')));
+        assert!(ranges.iter().any(|r| r.contains('\t')));
+        assert!(!ranges.iter().any(|r| r.contains('a')));
+    }
+
+    #[test]
+    fn word_matches_underscore() {
+        let ranges = posix_class_ranges("word").unwrap();
+        assert!(ranges.iter().any(|r| r.contains('_')));
     }
 }

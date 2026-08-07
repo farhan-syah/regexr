@@ -66,6 +66,11 @@ pub enum ErrorKind {
     InvalidUnicodeProperty,
     /// Unknown Unicode property name.
     UnknownUnicodeProperty(String),
+    /// Malformed POSIX bracket-expression class syntax (e.g. `[[:alpha]`,
+    /// `[[::]]`, or a non-alphabetic character in the name).
+    InvalidPosixClass,
+    /// Well-formed but unrecognized POSIX class name (e.g. `[[:bogus:]]`).
+    UnknownPosixClass(String),
     /// Invalid repetition syntax.
     InvalidRepetition,
     /// Repetition quantifier on nothing.
@@ -185,6 +190,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidUnicodeProperty => write!(f, "invalid unicode property syntax"),
             ErrorKind::UnknownUnicodeProperty(name) => {
                 write!(f, "unknown unicode property '{}'", name)
+            }
+            ErrorKind::InvalidPosixClass => write!(f, "invalid POSIX class syntax"),
+            ErrorKind::UnknownPosixClass(name) => {
+                write!(f, "unknown POSIX class '[:{}:]'", name)
             }
             ErrorKind::InvalidRepetition => write!(f, "invalid repetition syntax"),
             ErrorKind::RepetitionOnNothing => write!(f, "quantifier on nothing"),

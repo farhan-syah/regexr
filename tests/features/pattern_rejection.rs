@@ -40,6 +40,9 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"\p{",
     r"\p{L",
     r"\P{",
+    r"[[:bogus:]]",
+    r"[[:alpha]",
+    r"[[::]]",
 ];
 
 #[test]
