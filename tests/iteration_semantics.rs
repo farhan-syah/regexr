@@ -305,3 +305,152 @@ fn broad_match_sequences_agree_with_an_independent_engine() {
         divergences.join("\n")
     );
 }
+
+/// `replace_all` and `replace` are built on iteration, so the empty-match rule
+/// decides their output too — and a wrong rule shows up as text, not spans.
+#[test]
+fn replacement_agrees_with_an_independent_engine() {
+    const HAYSTACKS: &[&str] = &[
+        "",
+        "a",
+        "aa",
+        "ab",
+        "abc",
+        "aab",
+        "hello world",
+        "  ",
+        "a b c",
+        "123 456",
+        "aXbXc",
+        "_x_",
+        "aaa",
+        "abab",
+    ];
+    let mut divergences = Vec::new();
+
+    for pattern in PATTERNS.iter().chain(BROAD_PATTERNS) {
+        if INTENTIONAL_DIVERGENCE.iter().any(|(p, _)| p == pattern) {
+            continue;
+        }
+        let (Ok(ours), Ok(theirs)) = (Regex::new(pattern), regex::Regex::new(pattern)) else {
+            continue;
+        };
+        for haystack in HAYSTACKS {
+            let all = (
+                ours.replace_all(haystack, "X"),
+                theirs.replace_all(haystack, "X"),
+            );
+            if all.0 != all.1 {
+                divergences.push(format!(
+                    "  replace_all {pattern:?} on {haystack:?}: regexr={:?} regex={:?}",
+                    all.0, all.1
+                ));
+            }
+            let one = (ours.replace(haystack, "X"), theirs.replace(haystack, "X"));
+            if one.0 != one.1 {
+                divergences.push(format!(
+                    "  replace {pattern:?} on {haystack:?}: regexr={:?} regex={:?}",
+                    one.0, one.1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        divergences.is_empty(),
+        "{} replacements disagree:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+}
+
+/// Every group of every match in a sequence, not just group 0 of the first.
+///
+/// A group can be wrong while the span that contains it is right, and it can be
+/// wrong only on the second match — neither is visible to a single-`captures`
+/// comparison.
+#[test]
+fn capture_groups_across_a_sequence_agree_with_an_independent_engine() {
+    const GROUP_PATTERNS: &[&str] = &[
+        r"(a)(b)",
+        r"(a)(b)?(c)",
+        r"((a)(b))c",
+        r"(a|b)+",
+        r"(a)*",
+        r"(a*)(b*)",
+        r"(\d{4})-(\d{2})-(\d{2})",
+        r"(\w+)@(\w+)\.(\w+)",
+        r"([a-z]+)([0-9]*)",
+        r"(a+)(b+)",
+        r"(?:(a)|(b))+",
+        r"(a)(?:b)(c)",
+        r"((a)|(b))c",
+        r"(a?)(b?)",
+        r"(\w)(\w)?",
+        r"(a)(a)?(a)?",
+        r"(?P<x>\d+)-(?P<y>\d+)",
+        r"(a|ab)(c|bcd)",
+        r"((a*)*)b",
+        r"(a)(b)(c)(d)(e)",
+    ];
+    const HAYSTACKS: &[&str] = &[
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcd",
+        "abcde",
+        "aab",
+        "abab",
+        "aaa",
+        "bbb",
+        "2024-01-15",
+        "user@site.com",
+        "abc123",
+        "12-34",
+        "ac",
+        "bc",
+        "aabb",
+        "x1y2",
+        "aaab",
+        "abcbcd",
+        "b",
+        "ba",
+    ];
+
+    let spans = |caps: regexr::Captures<'_>| -> Vec<Option<(usize, usize)>> {
+        (0..caps.len())
+            .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+            .collect()
+    };
+    let mut divergences = Vec::new();
+
+    for pattern in GROUP_PATTERNS {
+        let (Ok(ours), Ok(theirs)) = (Regex::new(pattern), regex::Regex::new(pattern)) else {
+            continue;
+        };
+        for haystack in HAYSTACKS {
+            let a: Vec<_> = ours.captures_iter(haystack).map(spans).collect();
+            let b: Vec<Vec<_>> = theirs
+                .captures_iter(haystack)
+                .map(|c| {
+                    (0..c.len())
+                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                        .collect()
+                })
+                .collect();
+            if a != b {
+                divergences.push(format!(
+                    "  {pattern:?} on {haystack:?}: regexr={a:?} regex={b:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        divergences.is_empty(),
+        "{} capture sequences disagree:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+}
