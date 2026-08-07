@@ -39,6 +39,13 @@ const PATTERNS: &[&str] = &[
     r"(a|b)c\1",
     r"(\w)\1{2}",
     r"([abc])x\1y",
+    // A quantified negated class: it lowers to an ASCII class beside a UTF-8
+    // trie, so the engines run the ASCII half as a byte scan and leave the rest
+    // to the general loop. A haystack below carries non-ASCII *inside* one of
+    // these, which is the only way the handover between the two is exercised.
+    r"(\w)[^x]*\1",
+    r"(a)[^x]*\1",
+    r#"(\d)[^'"]+\1"#,
 ];
 
 const HAYSTACKS: &[&str] = &[
@@ -58,6 +65,13 @@ const HAYSTACKS: &[&str] = &[
     "zzzz",
     "éé café",
     "中中",
+    // Non-ASCII *between* the delimiters of a quantified negated class. With
+    // only ASCII here a run that wrongly refuses to hand over to the general
+    // loop still passes, because the run covers the whole match.
+    "'héllo' and 'bye'",
+    "a中中a xax",
+    "1é2 \"ü\" 1",
+    "x中x a中a",
     "aXa bXb",
     "ab-ab cd-ef",
     "999",

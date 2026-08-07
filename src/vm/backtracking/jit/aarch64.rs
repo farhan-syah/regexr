@@ -613,7 +613,11 @@ impl BacktrackingCompiler {
     /// backtracking gives back the general loop\'s iterations first and only then
     /// the run\'s bytes — the same order, longest first, that the per-iteration
     /// loop produced on its own.
-    fn emit_run_prologue(&mut self, expr: &HirExpr) -> Result<Option<dynasmrt::DynamicLabel>> {
+    fn emit_run_prologue(
+        &mut self,
+        expr: &HirExpr,
+        loop_done: dynasmrt::DynamicLabel,
+    ) -> Result<Option<dynasmrt::DynamicLabel>> {
         let Some(set) = crate::literal::single_byte_run_set(expr) else {
             return Ok(None);
         };
@@ -651,6 +655,29 @@ impl BacktrackingCompiler {
             ; add x26, x26, #32
         );
         self.byte_set_tables.push((table, set));
+
+        // The scan stopped on a byte the run does not cover. If the body cannot
+        // begin with it either, the general loop would push a choice point, fail
+        // its first iteration and unwind straight back out — so skip it.
+        if let Some(first) = crate::literal::expr_first_byte_set(expr) {
+            let body_first = self.asm.new_dynamic_label();
+            dynasm!(self.asm
+                ; .arch aarch64
+                ; cmp x21, x20
+                ; b.hs >none
+                ; adr x9, =>body_first
+                ; ldrb w10, [x19, x21]
+                ; ldrb w11, [x9, x10]
+                ; cbnz w11, >enter
+                ; none:
+                // The general loop is skipped, so zero the count it would have
+                // kept: `loop_done` still checks it against the minimum.
+                ; mov x25, #0
+                ; b =>loop_done
+                ; enter:
+            );
+            self.byte_set_tables.push((body_first, first));
+        }
 
         Ok(Some(retry))
     }
@@ -725,7 +752,7 @@ impl BacktrackingCompiler {
         // such bytes, or when the general loop's own minimum count would be
         // wrong about a run it did not make.
         let run_retry = if greedy && min == 0 && max.is_none() {
-            self.emit_run_prologue(expr)?
+            self.emit_run_prologue(expr, loop_done)?
         } else {
             None
         };

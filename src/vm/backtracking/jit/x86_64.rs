@@ -797,7 +797,11 @@ impl BacktrackingCompiler {
     ///
     /// Returns the label the backtrack handler resumes at, to be emitted once
     /// the general loop's body is behind us.
-    fn emit_run_prologue(&mut self, expr: &HirExpr) -> Result<Option<dynasmrt::DynamicLabel>> {
+    fn emit_run_prologue(
+        &mut self,
+        expr: &HirExpr,
+        loop_done: dynasmrt::DynamicLabel,
+    ) -> Result<Option<dynasmrt::DynamicLabel>> {
         let Some(set) = crate::literal::single_byte_run_set(expr) else {
             return Ok(None);
         };
@@ -832,6 +836,31 @@ impl BacktrackingCompiler {
             ; add rbx, 32
         );
         self.byte_set_tables.push((table, set));
+
+        // The scan stopped on a byte the run does not cover. If the body cannot
+        // begin with it either, the general loop would push a choice point,
+        // fail its first iteration and unwind straight back out — so skip it.
+        // `[^'"]*` stops on a quote, which no branch of it matches, so this is
+        // one push, one attempt and one unwind saved per run.
+        if let Some(first) = crate::literal::expr_first_byte_set(expr) {
+            let body_first = self.asm.new_dynamic_label();
+            dynasm!(self.asm
+                ; .arch x64
+                ; cmp rcx, rsi
+                ; jae >none
+                ; lea r14, [=>body_first]
+                ; movzx eax, BYTE [rdi + rcx]
+                ; cmp BYTE [r14 + rax], 0
+                ; jne >enter
+                ; none:
+                // The general loop is skipped, so zero the count it would have
+                // kept: `loop_done` still checks it against the minimum.
+                ; xor r15d, r15d
+                ; jmp =>loop_done
+                ; enter:
+            );
+            self.byte_set_tables.push((body_first, first));
+        }
 
         Ok(Some(retry))
     }
@@ -907,7 +936,7 @@ impl BacktrackingCompiler {
         // such bytes, or when the general loop's own minimum count would be
         // wrong about a run it did not make.
         let run_retry = if greedy && min == 0 && max.is_none() {
-            self.emit_run_prologue(expr)?
+            self.emit_run_prologue(expr, loop_done)?
         } else {
             None
         };
