@@ -501,12 +501,28 @@ fn find_common_prefix(seqs: &[Vec<u8>]) -> Option<Vec<u8>> {
     }
 }
 
-/// A literal that every match must contain, drawn from a positive lookahead.
+/// A literal that every match must contain.
 ///
-/// `\w+(?=ing\b)` cannot match anywhere in a haystack with no `ing` in it, so
-/// one `memmem` settles the whole search. Only a top-level concatenation is
-/// walked: under an alternation a branch may not require the literal.
+/// `\w+(?=ing\b)` cannot match anywhere in a haystack with no `ing` in it, and
+/// neither can `(\w+)@\1` where there is no `@`, so one `memmem` settles the
+/// whole search. Neither pattern has a literal *prefix*, so a prefilter — which
+/// answers "where could a match start" — has nothing to offer either one.
+///
+/// Only a top-level concatenation is walked: under an alternation a branch may
+/// not require the literal. A repetition qualifies only when it must run at
+/// least once, and case-insensitivity is not a concern because the HIR builder
+/// turns a folded literal into a class, never a [`HirExpr::Literal`].
+///
+/// This is a rejection filter and nothing more. It can only turn "no match" into
+/// "no match" sooner; it never decides which match is reported.
 pub fn required_literal(hir: &Hir) -> Option<Vec<u8>> {
+    /// Replaces `best` with `candidate` when the candidate is more selective.
+    fn keep_longer(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
+        if candidate.len() > best.as_ref().map_or(0, Vec::len) {
+            *best = Some(candidate);
+        }
+    }
+
     fn walk(expr: &HirExpr) -> Option<Vec<u8>> {
         match expr {
             HirExpr::Lookaround(look) => match look.kind {
@@ -517,7 +533,28 @@ pub fn required_literal(hir: &Hir) -> Option<Vec<u8>> {
                 }
                 _ => None,
             },
-            HirExpr::Concat(exprs) => exprs.iter().find_map(walk),
+            HirExpr::Literal(bytes) => (!bytes.is_empty()).then(|| bytes.clone()),
+            // Every element of a concatenation has to match, so any of them may
+            // be chosen and the longest is the most selective. Adjacent literals
+            // are joined first: the builder splits `-->` into three of them, and
+            // searching for the whole run rejects far more than searching for
+            // `>` alone.
+            HirExpr::Concat(exprs) => {
+                let mut best: Option<Vec<u8>> = None;
+                let mut run: Vec<u8> = Vec::new();
+                for expr in exprs {
+                    if let HirExpr::Literal(bytes) = expr {
+                        run.extend_from_slice(bytes);
+                        continue;
+                    }
+                    keep_longer(&mut best, std::mem::take(&mut run));
+                    if let Some(found) = walk(expr) {
+                        keep_longer(&mut best, found);
+                    }
+                }
+                keep_longer(&mut best, run);
+                best
+            }
             HirExpr::Capture(capture) => walk(&capture.expr),
             HirExpr::Repeat(repeat) if repeat.min >= 1 => walk(&repeat.expr),
             _ => None,
@@ -583,16 +620,31 @@ mod tests {
         assert_eq!(required(r"a(?=bcd)"), Some(b"bcd".to_vec()));
     }
 
+    /// A literal the pattern must consume is a rejection filter too, and one no
+    /// prefilter can supply: `(\w+)@\1` has no literal *prefix*, so without this
+    /// a haystack with no `@` in it is searched position by position.
+    #[test]
+    fn test_required_literal_from_the_pattern_itself() {
+        assert_eq!(required(r"(\w+)@\1"), Some(b"@".to_vec()));
+        assert_eq!(required(r"\d+-->\d+"), Some(b"-->".to_vec()));
+        // The most selective of several is the one worth searching for.
+        assert_eq!(required(r"a\d+bcde\d+"), Some(b"bcde".to_vec()));
+        // A repetition that must run at least once still requires its literal.
+        assert_eq!(required(r"(?:xy)+\d"), Some(b"xy".to_vec()));
+    }
+
     #[test]
     fn test_no_required_literal_when_a_branch_may_not_need_it() {
         // An alternation can match via a branch without the lookahead, so
         // rejecting on the literal's absence would lose real matches.
         assert_eq!(required(r"\w+(?=ing\b)|zzz"), None);
         assert_eq!(required(r"(?:a(?=bcd)|q)"), None);
+        assert_eq!(required(r"abc|def"), None);
         // A negative lookahead requires the literal to be ABSENT.
         assert_eq!(required(r"\w+(?!ing)"), None);
-        // Optional: the lookahead need not apply at all.
-        assert_eq!(required(r"a(?:(?=bcd))?"), None);
+        // Optional: neither the lookahead nor the literal need apply at all.
+        assert_eq!(required(r"\w(?:(?=bcd))?"), None);
+        assert_eq!(required(r"\d+(?:xy)*"), None);
         assert_eq!(required(r"\w+"), None);
     }
     use super::*;
