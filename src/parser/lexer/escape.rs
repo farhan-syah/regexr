@@ -27,6 +27,10 @@ impl Lexer<'_> {
             'W' => EscapeKind::NotWord,
             's' => EscapeKind::Whitespace,
             'S' => EscapeKind::NotWhitespace,
+            // \h/\H (horizontal whitespace) are always Unicode-correct, the
+            // same way \s/\S are — see `HirTranslator::translate_perl_class`.
+            'h' => EscapeKind::HorizontalWhitespace,
+            'H' => EscapeKind::NotHorizontalWhitespace,
 
             // Anchors
             'b' => EscapeKind::WordBoundary,
@@ -51,6 +55,29 @@ impl Lexer<'_> {
             // One extended grapheme cluster. Expanded by the HIR builder into
             // the UAX #29 boundary rules.
             'X' => EscapeKind::GraphemeCluster,
+
+            // Any Unicode line-break sequence, matched as a single unit
+            // (`\r\n`, or one of LF/VT/FF/CR/NEL/LS/PS). Bare only; rejected
+            // inside a character class in `Parser::parse_class_item` since a
+            // multi-character escape cannot be a class member.
+            'R' => EscapeKind::LineBreak,
+
+            // Any code point except line feed — like `.` with dot-all off,
+            // but unaffected by the `s` flag. Bare only, same class
+            // restriction as `\R`. The named-character form `\N{NAME}` is not
+            // supported (it needs the full Unicode character-name database),
+            // so it is rejected here rather than being misparsed as bare `\N`
+            // followed by a literal `{`.
+            'N' => {
+                if self.peek_char() == Some('{') {
+                    return Err(Error::with_span(
+                        ErrorKind::NamedUnicodeCharacterNotSupported,
+                        self.src,
+                        Span::new(start, self.pos),
+                    ));
+                }
+                EscapeKind::AnyExceptNewline
+            }
 
             // Hex escape: \xHH (exactly two digits) or \x{H..HHHHHH} (braced,
             // 1-6 digits, same syntax and range as \u{...}).

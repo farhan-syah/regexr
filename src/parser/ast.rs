@@ -46,8 +46,14 @@ pub enum Expr {
         /// Whether this is negated (\P{...}).
         negated: bool,
     },
-    /// Perl shorthand class (\w, \d, \s, \W, \D, \S).
+    /// Perl shorthand class (\w, \d, \s, \W, \D, \S, \h, \H).
     PerlClass(PerlClassKind),
+    /// `\R` - any Unicode line-break sequence, matched as a single unit.
+    /// Bare only; rejected inside a character class.
+    LineBreak,
+    /// `\N` - any code point except line feed, unaffected by the `s` flag.
+    /// Bare only; rejected inside a character class.
+    AnyExceptNewline,
 }
 
 /// Perl shorthand character classes.
@@ -65,6 +71,10 @@ pub enum PerlClassKind {
     Whitespace,
     /// \S - non-whitespace
     NotWhitespace,
+    /// \h - horizontal whitespace
+    HorizontalWhitespace,
+    /// \H - non-horizontal-whitespace
+    NotHorizontalWhitespace,
 }
 
 impl Expr {
@@ -86,6 +96,10 @@ impl Expr {
             Expr::GraphemeCluster => false,
             Expr::UnicodeProperty { .. } => false,
             Expr::PerlClass(_) => false,
+            // `\R` always consumes at least one character; `\N` always
+            // consumes exactly one.
+            Expr::LineBreak => false,
+            Expr::AnyExceptNewline => false,
         }
     }
 }
@@ -361,7 +375,11 @@ impl fmt::Display for Expr {
                 PerlClassKind::NotWord => write!(f, "\\W"),
                 PerlClassKind::Whitespace => write!(f, "\\s"),
                 PerlClassKind::NotWhitespace => write!(f, "\\S"),
+                PerlClassKind::HorizontalWhitespace => write!(f, "\\h"),
+                PerlClassKind::NotHorizontalWhitespace => write!(f, "\\H"),
             },
+            Expr::LineBreak => write!(f, "\\R"),
+            Expr::AnyExceptNewline => write!(f, "\\N"),
         }
     }
 }

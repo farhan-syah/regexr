@@ -49,6 +49,11 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"\x{263A",
     r"\c",
     r"\c1",
+    // `\R` and `\N` are multi-/single-character escapes that cannot be a
+    // class member; `\N{NAME}` (named Unicode characters) is unsupported.
+    r"[\R]",
+    r"[\N]",
+    r"\N{LATIN SMALL LETTER A}",
     // Named backreferences: undefined name, empty name, unterminated,
     // missing/unrecognized delimiter, and mismatched delimiter pairs.
     r"\k<nosuch>",

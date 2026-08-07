@@ -90,6 +90,22 @@ pub enum EscapeKind {
     Whitespace,
     /// \S - non-whitespace.
     NotWhitespace,
+    /// \h - horizontal whitespace (Tab and the horizontal Unicode space
+    /// separators; a fixed 18-code-point set, not derived from a UCD table).
+    HorizontalWhitespace,
+    /// \H - non-horizontal-whitespace (any code point not in `\h`'s set,
+    /// matched as one whole code point).
+    NotHorizontalWhitespace,
+    /// \R - any Unicode line-break sequence, matched as a single unit: `\r\n`
+    /// if present, else one of LF, VT, FF, CR, NEL, LS, PS. Bare only — a
+    /// hard error inside a character class, since it can span two
+    /// characters.
+    LineBreak,
+    /// \N - any code point except line feed. Identical to `.` with dot-all
+    /// off, and unaffected by the `s` flag. Bare only — a hard error inside a
+    /// character class. `\N{NAME}` (named Unicode characters) is rejected at
+    /// the lexer, not represented here.
+    AnyExceptNewline,
     /// \b - word boundary.
     WordBoundary,
     /// \B - non-word boundary.

@@ -109,6 +109,15 @@ impl Parser<'_> {
             EscapeKind::NotWord => Ok(Expr::PerlClass(PerlClassKind::NotWord)),
             EscapeKind::Whitespace => Ok(Expr::PerlClass(PerlClassKind::Whitespace)),
             EscapeKind::NotWhitespace => Ok(Expr::PerlClass(PerlClassKind::NotWhitespace)),
+            EscapeKind::HorizontalWhitespace => {
+                Ok(Expr::PerlClass(PerlClassKind::HorizontalWhitespace))
+            }
+            EscapeKind::NotHorizontalWhitespace => {
+                Ok(Expr::PerlClass(PerlClassKind::NotHorizontalWhitespace))
+            }
+
+            EscapeKind::LineBreak => Ok(Expr::LineBreak),
+            EscapeKind::AnyExceptNewline => Ok(Expr::AnyExceptNewline),
 
             EscapeKind::WordBoundary => Ok(Expr::Anchor(Anchor::WordBoundary)),
             EscapeKind::NotWordBoundary => Ok(Expr::Anchor(Anchor::NotWordBoundary)),

@@ -64,6 +64,10 @@ pub enum ErrorKind {
     InvalidUnicodeEscape,
     /// Invalid control escape (e.g. `\c` at end of pattern, or `\c1`).
     InvalidControlEscape,
+    /// `\N{NAME}` (named Unicode character escape) is not supported — it
+    /// needs the full Unicode character-name database, which is out of
+    /// scope. Bare `\N` (any code point except line feed) is unaffected.
+    NamedUnicodeCharacterNotSupported,
     /// Invalid Unicode property (e.g., \p{InvalidName}).
     InvalidUnicodeProperty,
     /// Unknown Unicode property name.
@@ -198,6 +202,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidHexEscape => write!(f, "invalid hex escape sequence"),
             ErrorKind::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
             ErrorKind::InvalidControlEscape => write!(f, "invalid control escape sequence"),
+            ErrorKind::NamedUnicodeCharacterNotSupported => write!(
+                f,
+                "\\N{{NAME}} named Unicode character escapes are not supported"
+            ),
             ErrorKind::InvalidUnicodeProperty => write!(f, "invalid unicode property syntax"),
             ErrorKind::UnknownUnicodeProperty(name) => {
                 write!(f, "unknown unicode property '{}'", name)

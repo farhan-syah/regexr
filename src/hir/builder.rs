@@ -9,6 +9,28 @@ use crate::parser::{
     PerlClassKind, Repeat,
 };
 
+/// Code points matched by `\h` (horizontal whitespace): Tab, Space, and every
+/// Unicode horizontal space separator. A fixed 18-code-point list per PCRE —
+/// not derived from a UCD property table. This is the single source of truth
+/// for the set; `parser::class::horizontal_whitespace_ranges` (used for
+/// `[\h]`/`[\H]`) builds its ranges from this same constant via the `hir`
+/// crate-root re-export.
+pub const HORIZONTAL_WHITESPACE: &[(u32, u32)] = &[
+    (0x0009, 0x0009),
+    (0x0020, 0x0020),
+    (0x00A0, 0x00A0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200A),
+    (0x202F, 0x202F),
+    (0x205F, 0x205F),
+    (0x3000, 0x3000),
+];
+
+/// Code points `\R` matches singly, once the two-character `\r\n` sequence
+/// has already been tried first (see `HirTranslator::build_line_break_expr`):
+/// LF, VT, FF, CR, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR.
+const LINE_BREAK_SINGLE: &[(u32, u32)] = &[(0x000A, 0x000D), (0x0085, 0x0085), (0x2028, 0x2029)];
+
 use super::unicode_data;
 
 use super::{
@@ -179,6 +201,13 @@ impl HirTranslator {
             }
 
             Expr::PerlClass(kind) => self.translate_perl_class(*kind),
+
+            Expr::LineBreak => self.build_line_break_expr(),
+
+            // Identical to `.` with dot-all off, and deliberately built from
+            // a literal `false` rather than `self.flags.dot_all` — `\N` stays
+            // "no newline" even under `(?s)`, unlike `.`.
+            Expr::AnyExceptNewline => Ok(self.build_dot_expr(false)),
         }
     }
 
@@ -210,12 +239,17 @@ impl HirTranslator {
         // `\s`/`\S` always use the full Unicode `White_Space` set, matching the
         // Rust `regex`/Python defaults and the reference tokenizer engines (onig,
         // PCRE2+UCP) — e.g. `\s` includes U+00A0 and U+2000-U+200A. It's a small
-        // set (~25 codepoints). `\w`/`\d`/`\b` stay gated on Unicode mode (`(?u)`)
-        // since their Unicode forms are huge and would bloat the byte engines.
+        // set (~25 codepoints). `\h`/`\H` (horizontal whitespace) are always
+        // Unicode-correct for the same reason and the same size class. `\w`/`\d`/`\b`
+        // stay gated on Unicode mode (`(?u)`) since their Unicode forms are huge
+        // and would bloat the byte engines.
         let unicode = self.flags.unicode
             || matches!(
                 kind,
-                PerlClassKind::Whitespace | PerlClassKind::NotWhitespace
+                PerlClassKind::Whitespace
+                    | PerlClassKind::NotWhitespace
+                    | PerlClassKind::HorizontalWhitespace
+                    | PerlClassKind::NotHorizontalWhitespace
             );
         if unicode {
             self.translate_perl_class_unicode(kind)
@@ -267,6 +301,15 @@ impl HirTranslator {
                 ],
                 true,
             ),
+            // The ASCII-only members of `\h`'s set (Tab and Space); the
+            // remaining 16 code points are all non-ASCII. This arm is
+            // unreachable in practice — `translate_perl_class`'s `unicode`
+            // guard always routes `\h`/`\H` through
+            // `translate_perl_class_unicode` instead, the same way it already
+            // does for `\s`/`\S` — but is kept correct rather than left as a
+            // trap, matching this match's existing precedent.
+            PerlClassKind::HorizontalWhitespace => (vec![(b'\t', b'\t'), (b' ', b' ')], false),
+            PerlClassKind::NotHorizontalWhitespace => (vec![(b'\t', b'\t'), (b' ', b' ')], true),
         };
 
         if negated {
@@ -289,6 +332,8 @@ impl HirTranslator {
             PerlClassKind::NotWord => (unicode_data::PERL_WORD, true),
             PerlClassKind::Whitespace => (unicode_data::PERL_SPACE, false),
             PerlClassKind::NotWhitespace => (unicode_data::PERL_SPACE, true),
+            PerlClassKind::HorizontalWhitespace => (HORIZONTAL_WHITESPACE, false),
+            PerlClassKind::NotHorizontalWhitespace => (HORIZONTAL_WHITESPACE, true),
         };
 
         // Unicode Perl classes can have many code points, causing DFA state explosion.
@@ -661,6 +706,24 @@ impl HirTranslator {
             vec![(0x00, 0x09), (0x0b, 0x7f)]
         };
         self.build_ascii_or_non_ascii(ascii)
+    }
+
+    /// Builds `\R` — any Unicode line-break sequence, matched as one unit:
+    /// the two-character `\r\n` sequence if present, else any single
+    /// line-break character (LF, VT, FF, CR, NEL, LS, PS).
+    ///
+    /// PCRE makes `\R` atomic, so once it commits to matching `\r\n` it can
+    /// never back off to just the `\r`. This engine has no atomic groups yet,
+    /// so the same observable behavior is built as an ordered alternation
+    /// with the two-character branch listed first: both branches can start
+    /// on `\r`, so `engine::selector::hir_has_alternation` detects the
+    /// overlap and routes the pattern to the PikeVM, which honors
+    /// leftmost-first branch priority and therefore always prefers the
+    /// longer `\r\n` branch over the bare `\r` when both are viable.
+    fn build_line_break_expr(&mut self) -> Result<HirExpr> {
+        let crlf = HirExpr::Literal(vec![b'\r', b'\n']);
+        let single = self.translate_ranges_to_hir(LINE_BREAK_SINGLE, false)?;
+        Ok(HirExpr::Alt(vec![crlf, single]))
     }
 
     /// Builds "one byte from `ascii_ranges`, or any whole non-ASCII

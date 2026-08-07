@@ -5,6 +5,7 @@ use super::lexer::{EscapeKind, TokenKind};
 use super::state::Parser;
 use crate::error::{Error, ErrorKind, Result};
 use crate::hir::unicode_data;
+use crate::hir::HORIZONTAL_WHITESPACE;
 
 impl Parser<'_> {
     /// Parses a character class: [abc], [^abc], [a-z].
@@ -356,6 +357,16 @@ impl Parser<'_> {
                             &unicode_whitespace_ranges(),
                         )))
                     }
+                    EscapeKind::HorizontalWhitespace => {
+                        self.advance()?;
+                        Ok(ClassItem::Ranges(horizontal_whitespace_ranges()))
+                    }
+                    EscapeKind::NotHorizontalWhitespace => {
+                        self.advance()?;
+                        Ok(ClassItem::Ranges(complement_ranges(
+                            &horizontal_whitespace_ranges(),
+                        )))
+                    }
                     // Single character escapes
                     EscapeKind::Literal(c) => {
                         let c = *c;
@@ -418,7 +429,11 @@ impl Parser<'_> {
                         })
                     }
                     // Anchors and boundaries are assertions, not members of a
-                    // set. Naming the offending escape is what makes the
+                    // set. `\R` (which falls here too) can match two
+                    // characters (`\r\n`), which a single class member can
+                    // never be; `\N` is rejected the same way for symmetry
+                    // with PCRE, since it is not a fixed set of code points.
+                    // Naming the offending escape is what makes the
                     // rejection actionable, so recover its text from the span.
                     _ => Err(Error::with_span(
                         ErrorKind::EscapeNotAllowedInClass(self.current_text().to_string()),
@@ -478,21 +493,30 @@ enum ClassItem {
 }
 
 /// The Unicode `White_Space` property as character ranges (for `\s`/`\S`).
+///
+/// Built from the generated `PERL_SPACE` table, the same one `\s`/`\S` use
+/// outside a class, so `\s` and `[\s]` cannot drift apart.
 fn unicode_whitespace_ranges() -> Vec<ClassRange> {
-    const WS: &[(u32, u32)] = &[
-        (0x0009, 0x000D),
-        (0x0020, 0x0020),
-        (0x0085, 0x0085),
-        (0x00A0, 0x00A0),
-        (0x1680, 0x1680),
-        (0x2000, 0x200A),
-        (0x2028, 0x2029),
-        (0x202F, 0x202F),
-        (0x205F, 0x205F),
-        (0x3000, 0x3000),
-    ];
-    WS.iter()
-        .map(|&(s, e)| ClassRange::new(char::from_u32(s).unwrap(), char::from_u32(e).unwrap()))
+    codepoints_to_ranges(unicode_data::PERL_SPACE)
+}
+
+/// The fixed 18-code-point `\h` (horizontal whitespace) set as character
+/// ranges, for use inside a character class (`[\h]`). Built from
+/// `hir::HORIZONTAL_WHITESPACE`, the single source of truth for the set that
+/// `\h`/`\H` also use outside a class.
+fn horizontal_whitespace_ranges() -> Vec<ClassRange> {
+    codepoints_to_ranges(HORIZONTAL_WHITESPACE)
+}
+
+/// Converts a table of inclusive code-point ranges into [`ClassRange`]s.
+///
+/// The tables are compile-time constants holding only scalar values, so a
+/// non-scalar entry would be a bug in the table rather than bad input; such an
+/// entry is skipped rather than panicking.
+fn codepoints_to_ranges(table: &[(u32, u32)]) -> Vec<ClassRange> {
+    table
+        .iter()
+        .filter_map(|&(s, e)| Some(ClassRange::new(char::from_u32(s)?, char::from_u32(e)?)))
         .collect()
 }
 
