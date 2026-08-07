@@ -77,3 +77,31 @@ fn failing_search_stays_linear_in_the_input() {
         over.join("\n")
     );
 }
+
+/// The same bound for the one-pass capture search.
+///
+/// `captures()` on a one-pass pattern locates the match by trying the positions
+/// the prefilter keeps, which is a win only while a failed attempt gives up
+/// quickly. `(a{64})b` over a run of `a`s is the shape where it does not: every
+/// position is a candidate and every attempt reads 64 bytes before failing. The
+/// candidate loop has to notice and hand the rest of the input back to the
+/// linear-time search.
+#[test]
+fn failing_one_pass_capture_search_stays_linear_in_the_input() {
+    const BUDGET_MS: f64 = 25.0;
+
+    let text = "a".repeat(128 * 1024);
+    let re = regexr::Regex::new(r"(a{64})b").unwrap();
+    assert!(re.captures(&text).is_none());
+
+    let start = Instant::now();
+    assert!(re.captures(&text).is_none());
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    assert!(
+        ms <= BUDGET_MS,
+        "a failing one-pass capture search over 128 KB took {ms:.1} ms, more \
+         than {BUDGET_MS} ms. Each candidate is costing a full attempt, so the \
+         search is quadratic in the input."
+    );
+}

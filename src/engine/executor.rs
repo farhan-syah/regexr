@@ -127,6 +127,17 @@ const MAX_ATTEMPTS: usize = 64;
 /// discarding enough of the input to be worth verifying position by position.
 const MIN_SELECTIVITY: usize = 8;
 
+/// Outcome of [`CompiledRegex::captures_one_pass`].
+enum OnePassSearch<T> {
+    Match(T),
+    /// No candidate position matched, so neither will any other.
+    NoMatch,
+    /// The candidate loop was abandoned; resume the general search here.
+    GaveUp(usize),
+    /// The prefilter is not a source of anchored start positions.
+    NotApplicable,
+}
+
 impl PrefilterDrive {
     fn new() -> Self {
         Self {
@@ -573,11 +584,23 @@ impl CompiledRegex {
     /// groups there is nothing for a second pass to do: the match bounds found in
     /// step 1 *are* the whole capture set, and slot 0 is returned directly.
     ///
-    /// Step 2 is skipped entirely for a one-pass pattern: [`OnePass`] writes the
-    /// slots in a single deterministic scan from `match_start`, with no thread
-    /// set to simulate. It reports the same slots as the PikeVM or declines, in
-    /// which case the second pass below runs unchanged.
+    /// Both passes are skipped entirely for a one-pass pattern: [`OnePass`] both
+    /// locates the match and writes the slots in a single deterministic scan (see
+    /// [`CompiledRegex::captures_one_pass`]), so the match region is walked once
+    /// instead of once by the search engine and again by the capture pass.
     fn captures_two_pass(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        let mut from = from;
+        if let Some(ref one_pass) = self.one_pass {
+            match self.captures_one_pass(one_pass, input, from) {
+                OnePassSearch::Match(slots) => return Some(slots),
+                OnePassSearch::NoMatch => return None,
+                // The candidate loop stopped paying for itself; every position
+                // before `resume` has already been ruled out.
+                OnePassSearch::GaveUp(resume) => from = resume,
+                OnePassSearch::NotApplicable => {}
+            }
+        }
+
         let (match_start, match_end) = self.find_from(input, from)?;
 
         if let Some(ref one_pass) = self.one_pass {
@@ -602,6 +625,65 @@ impl CompiledRegex {
         let ctx = ctx_ref.as_mut()?;
 
         vm.captures_with_context(input, ctx, match_start)
+    }
+
+    /// Drives [`OnePass`] over candidate start positions, so a match is located
+    /// and its slots written by the same scan.
+    ///
+    /// The two-pass path asks the search engine where the match is and then
+    /// re-scans it to recover the groups, which walks the match region twice.
+    /// `OnePass` is anchored and deterministic: an attempt at a position that
+    /// cannot match stops at the first byte with no transition, so trying the
+    /// positions the prefilter keeps replaces the search outright.
+    ///
+    /// Leftmost-first is preserved because candidates arrive in increasing order
+    /// and a prefilter only ever skips positions where no match can begin, so the
+    /// first position `OnePass` accepts is the leftmost one.
+    ///
+    /// A failed attempt is bounded by the pattern, not by the input, but it is not
+    /// bounded by a *constant*: `(a{1000})b` over a run of `a`s would scan a
+    /// thousand bytes per candidate. [`PrefilterDrive`] watches for exactly that
+    /// and hands the rest of the input back to the linear-time search.
+    fn captures_one_pass(
+        &self,
+        one_pass: &OnePass,
+        input: &[u8],
+        from: usize,
+    ) -> OnePassSearch<Vec<Option<(usize, usize)>>> {
+        // A full-match prefilter already reports the span without running an
+        // engine, and an inner-byte one yields positions inside the match rather
+        // than starts. Neither is a source of anchored candidates.
+        if self.prefilter.is_full_match() || self.prefilter.is_inner_byte() {
+            return OnePassSearch::NotApplicable;
+        }
+
+        // A candidate iterator stops one short of the end, because no prefilter
+        // byte can live at `input.len()`. A nullable pattern can still match
+        // there, so end-of-input is always the last position tried.
+        let candidates = self
+            .prefilter
+            .find_candidates_from(input, from)
+            .chain(std::iter::once(input.len()));
+
+        // Allocated once for the whole search rather than once per attempt.
+        let mut scratch = vec![None; one_pass.slot_count()];
+        let mut slots = vec![None; one_pass.slot_count()];
+
+        let mut drive = PrefilterDrive::new();
+        for candidate in candidates {
+            // A match never starts inside a codepoint; `find_from` applies the
+            // same rule to the engines' answers.
+            if !crate::nfa::is_utf8_boundary(input, candidate) {
+                continue;
+            }
+            if one_pass.captures_at_into(input, candidate, &mut scratch, &mut slots) {
+                return OnePassSearch::Match(slots);
+            }
+            if drive.give_up(candidate) {
+                return OnePassSearch::GaveUp(candidate);
+            }
+        }
+        OnePassSearch::NoMatch
     }
 
     /// Check if there's a match starting at `pos`.

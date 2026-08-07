@@ -265,15 +265,37 @@ impl OnePass {
     /// returned vector always has `capture_count + 1` entries, and a group the
     /// match never entered stays `None`.
     pub fn captures_at(&self, input: &[u8], start: usize) -> Option<Vec<Option<(usize, usize)>>> {
-        if start > input.len() {
-            return None;
-        }
-
-        // Slots for the path currently being walked, and a snapshot taken at each
-        // position a match could end. The snapshot is what a later, longer match
-        // overwrites — the live slots keep advancing past it.
         let mut slots = vec![None; self.slot_count];
         let mut match_slots = vec![None; self.slot_count];
+        self.captures_at_into(input, start, &mut slots, &mut match_slots)
+            .then_some(match_slots)
+    }
+
+    /// Number of slots the scratch buffers passed to [`Self::captures_at_into`]
+    /// must hold.
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    /// [`Self::captures_at`] writing into caller-owned buffers.
+    ///
+    /// A search that tries many start positions would otherwise allocate two
+    /// vectors per attempt. Both buffers must hold [`Self::slot_count`] entries;
+    /// `match_slots` is only meaningful when this returns true.
+    pub fn captures_at_into(
+        &self,
+        input: &[u8],
+        start: usize,
+        slots: &mut [Option<(usize, usize)>],
+        match_slots: &mut [Option<(usize, usize)>],
+    ) -> bool {
+        if start > input.len() || slots.len() != self.slot_count {
+            return false;
+        }
+        // `slots` holds the path currently being walked; `match_slots` is the
+        // snapshot taken at each position a match could end, which a later,
+        // longer match overwrites while the live slots keep advancing past it.
+        slots.fill(None);
         let mut match_end: Option<usize> = None;
         // A recorded match whose snapshot has not been taken yet. It is deferred
         // until `slots` is about to change, so a greedy tail like `(.+)` — which
@@ -281,7 +303,9 @@ impl OnePass {
         // once rather than once per byte.
         let mut pending: Option<(ActionSpan, usize)> = None;
 
-        let mut closure = self.closures.first()?;
+        let Some(mut closure) = self.closures.first() else {
+            return false;
+        };
         let mut pos = start;
         loop {
             // The first match whose assertions hold both records a candidate end
@@ -319,28 +343,28 @@ impl OnePass {
             if transition.actions.len != 0 {
                 // `slots` is about to change, so a deferred snapshot has to be
                 // taken from their current values first.
-                // `slots` is about to change, so a deferred snapshot has to be
-                // taken from their current values first.
                 if let Some((actions, at)) = pending.take() {
-                    match_slots.copy_from_slice(&slots);
-                    self.apply(&mut match_slots, actions, at);
+                    match_slots.copy_from_slice(slots);
+                    self.apply(match_slots, actions, at);
                 }
-                self.apply(&mut slots, transition.actions, pos);
+                self.apply(slots, transition.actions, pos);
             }
             closure = target;
             pos += 1;
         }
 
         if let Some((actions, at)) = pending.take() {
-            match_slots.copy_from_slice(&slots);
-            self.apply(&mut match_slots, actions, at);
+            match_slots.copy_from_slice(slots);
+            self.apply(match_slots, actions, at);
         }
 
-        let end = match_end?;
+        let Some(end) = match_end else {
+            return false;
+        };
         if let Some(slot) = match_slots.first_mut() {
             *slot = Some((start, end));
         }
-        Some(match_slots)
+        true
     }
 
     /// Whether every assertion on a path holds at `pos`.
