@@ -29,16 +29,32 @@
 //! - closures are built by walking `state.epsilon` in order (index 0 = highest
 //!   priority, which is what encodes greedy vs non-greedy) with first-arrival
 //!   deduplication, matching `add_thread`'s DFS;
-//! - the walk stops at the first match state in that order, mirroring the
-//!   PikeVM's `limit`: threads at or after the matching one never advance, so
-//!   any transition found later is dead. A non-greedy exit therefore ends the
-//!   scan exactly where the VM would end it;
+//! - the walk stops at the first *unconditional* match state in that order,
+//!   mirroring the PikeVM's `limit`: threads at or after the matching one never
+//!   advance, so any transition found later is dead. A non-greedy exit therefore
+//!   ends the scan exactly where the VM would end it;
 //! - capture actions are applied with the same rules as the PikeVM's
 //!   `reconstruct_captures` (`pike/shared.rs`) — a start overwrites
 //!   the slot with `(pos, pos)` and an end extends an already-started slot — so a
 //!   group inside a repetition reports its last iteration.
+//!
+//! # Assertions
+//!
+//! An anchor or word boundary cannot be baked into a static transition table,
+//! because whether it holds depends on the scan position. It can, however, be
+//! *carried* by the transition it gates: every assertion on the epsilon path to
+//! an item becomes a [`Guard`] evaluated at the position the item fires. That
+//! keeps the table static while letting the run prune the same branches the
+//! PikeVM prunes.
+//!
+//! A guarded match no longer cuts the walk short, so items after it stay
+//! reachable and each records its DFS `order`. At run time the first match whose
+//! guards hold sets the limit, and a transition after that limit is dead — the
+//! same rule the PikeVM applies, resolved per position instead of once.
 
-use crate::nfa::{ByteRange, Nfa, NfaInstruction, StateId};
+use crate::nfa::{
+    at_end_or_before_final_newline, is_word_boundary, ByteRange, Nfa, NfaInstruction, StateId,
+};
 use std::collections::HashMap;
 
 /// Upper bound on distinct closures, so compiling a pathological NFA cannot blow
@@ -60,6 +76,32 @@ enum Action {
     End(u32),
 }
 
+/// A position assertion gating an epsilon path, evaluated during the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    StartOfText,
+    EndOfText,
+    StartOfLine,
+    EndOfLine,
+    WordBoundary,
+    NotWordBoundary,
+}
+
+impl Guard {
+    /// Whether the assertion holds at `pos`. Mirrors `PikeVm::process_instruction`.
+    #[inline]
+    fn holds(self, input: &[u8], pos: usize) -> bool {
+        match self {
+            Self::StartOfText => pos == 0,
+            Self::EndOfText => at_end_or_before_final_newline(input, pos),
+            Self::StartOfLine => pos == 0 || input.get(pos.wrapping_sub(1)) == Some(&b'\n'),
+            Self::EndOfLine => pos == input.len() || input.get(pos) == Some(&b'\n'),
+            Self::WordBoundary => is_word_boundary(input, pos),
+            Self::NotWordBoundary => !is_word_boundary(input, pos),
+        }
+    }
+}
+
 /// A range of [`OnePass::actions`], applied in order.
 #[derive(Debug, Clone, Copy)]
 struct ActionSpan {
@@ -72,11 +114,41 @@ impl ActionSpan {
     const EMPTY: Self = Self { start: 0, len: 0 };
 }
 
+/// A range of [`OnePass::guards`], all of which must hold.
+#[derive(Debug, Clone, Copy)]
+struct GuardSpan {
+    start: u32,
+    len: u32,
+}
+
+impl GuardSpan {
+    /// The empty span, for an unconditional epsilon path.
+    const EMPTY: Self = Self { start: 0, len: 0 };
+
+    /// Whether this path is unconditional, so the run can skip evaluation.
+    #[inline]
+    const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 /// One resolved transition: the closure to enter and the slots to write first.
 #[derive(Debug, Clone, Copy)]
 struct Transition {
     target: u32,
     actions: ActionSpan,
+    guards: GuardSpan,
+    /// Position in the closure's DFS order, against which a match's `order`
+    /// decides whether this transition is still live.
+    order: u32,
+}
+
+/// A match reachable from a closure, and the assertions that gate it.
+#[derive(Debug, Clone, Copy)]
+struct MatchItem {
+    actions: ActionSpan,
+    guards: GuardSpan,
+    order: u32,
 }
 
 /// An epsilon-closure, compiled to a deterministic byte dispatch.
@@ -85,9 +157,9 @@ struct Closure {
     /// Byte value to index into `transitions`, or [`NO_TRANSITION`].
     table: [u8; 256],
     transitions: Vec<Transition>,
-    /// Slots written on the epsilon path to the match state, when this closure
-    /// reaches one. `Some` means a match may end here.
-    match_actions: Option<ActionSpan>,
+    /// Matches reachable from this closure, in DFS order. Empty when no match
+    /// can end here; more than one entry only when assertions gate them.
+    matches: Vec<MatchItem>,
 }
 
 /// A deterministic capture engine for one-pass patterns.
@@ -97,6 +169,8 @@ pub struct OnePass {
     closures: Vec<Closure>,
     /// Every capture action, addressed by an `ActionSpan`.
     actions: Vec<Action>,
+    /// Every path assertion, addressed by a `GuardSpan`.
+    guards: Vec<Guard>,
     /// Number of capture slots, including slot 0 for the whole match.
     slot_count: usize,
 }
@@ -107,9 +181,9 @@ impl OnePass {
     /// The pattern is one-pass when, for every reachable closure, the byte ranges
     /// of the transitions that can still advance are pairwise disjoint — a single
     /// shared byte value is enough to reject. Rejected outright: backreferences,
-    /// lookaround, Unicode codepoint classes, any anchor or boundary assertion
-    /// (position-dependent, so not representable in a static transition table),
-    /// and any NFA needing more than `MAX_CLOSURES` closures.
+    /// lookaround, Unicode codepoint classes, a state reachable under two
+    /// different sets of assertions (the byte alone would no longer decide the
+    /// path), and any NFA needing more than `MAX_CLOSURES` closures.
     pub fn compile(nfa: &Nfa) -> Option<Self> {
         if nfa.has_backrefs || nfa.has_lookaround {
             return None;
@@ -124,6 +198,7 @@ impl OnePass {
 
         let mut closures: Vec<Closure> = Vec::new();
         let mut actions: Vec<Action> = Vec::new();
+        let mut guards: Vec<Guard> = Vec::new();
         let mut next = 0;
 
         while next < roots.len() {
@@ -144,32 +219,42 @@ impl OnePass {
                 for byte in range.start..=range.end {
                     let entry = table.get_mut(byte as usize)?;
                     if *entry != NO_TRANSITION {
-                        // Two live transitions accept this byte: not one-pass.
+                        // Two transitions accept this byte: not one-pass. The
+                        // check spans the whole closure, including transitions
+                        // behind a guard, so the byte decides the path before
+                        // any assertion is consulted.
                         return None;
                     }
                     *entry = index as u8;
                 }
                 transitions.push(Transition {
                     target: intern(&mut ids, &mut roots, raw_transition.target)?,
-                    actions: push_actions(&mut actions, &raw_transition.actions)?,
+                    actions: push_actions(&mut actions, &raw_transition.path.actions)?,
+                    guards: push_guards(&mut guards, &raw_transition.path.guards)?,
+                    order: raw_transition.order,
                 });
             }
 
-            let match_actions = match raw.match_actions {
-                Some(ref path) => Some(push_actions(&mut actions, path)?),
-                None => None,
-            };
+            let mut matches = Vec::with_capacity(raw.matches.len());
+            for raw_match in &raw.matches {
+                matches.push(MatchItem {
+                    actions: push_actions(&mut actions, &raw_match.path.actions)?,
+                    guards: push_guards(&mut guards, &raw_match.path.guards)?,
+                    order: raw_match.order,
+                });
+            }
 
             closures.push(Closure {
                 table,
                 transitions,
-                match_actions,
+                matches,
             });
         }
 
         Some(Self {
             closures,
             actions,
+            guards,
             slot_count: nfa.capture_count as usize + 1,
         })
     }
@@ -194,10 +279,17 @@ impl OnePass {
         let mut closure = self.closures.first()?;
         let mut pos = start;
         loop {
-            if let Some(span) = closure.match_actions {
-                match_slots.copy_from_slice(&slots);
-                self.apply(&mut match_slots, span, pos);
-                match_end = Some(pos);
+            // The first match whose assertions hold both records a candidate end
+            // and kills every lower-priority item, transitions included.
+            let mut limit = u32::MAX;
+            for candidate in &closure.matches {
+                if self.guards_hold(candidate.guards, input, pos) {
+                    match_slots.copy_from_slice(&slots);
+                    self.apply(&mut match_slots, candidate.actions, pos);
+                    match_end = Some(pos);
+                    limit = candidate.order;
+                    break;
+                }
             }
 
             let byte = match input.get(pos) {
@@ -211,6 +303,11 @@ impl OnePass {
             let Some(&transition) = closure.transitions.get(index) else {
                 break;
             };
+            // Transitions are disjoint on bytes, so a dead or unsatisfied one has
+            // no alternative to fall back to.
+            if transition.order > limit || !self.guards_hold(transition.guards, input, pos) {
+                break;
+            }
             let Some(target) = self.closures.get(transition.target as usize) else {
                 break;
             };
@@ -225,6 +322,21 @@ impl OnePass {
             *slot = Some((start, end));
         }
         Some(match_slots)
+    }
+
+    /// Whether every assertion on a path holds at `pos`.
+    #[inline]
+    fn guards_hold(&self, span: GuardSpan, input: &[u8], pos: usize) -> bool {
+        if span.is_empty() {
+            return true;
+        }
+        let range = span.start as usize..span.start as usize + span.len as usize;
+        match self.guards.get(range) {
+            Some(guards) => guards.iter().all(|guard| guard.holds(input, pos)),
+            // Unreachable for a span this type produced; refusing is the safe
+            // reading, since the caller falls back to the PikeVM on no match.
+            None => false,
+        }
     }
 
     /// Applies a span of capture actions at `pos`.
@@ -257,18 +369,32 @@ impl OnePass {
     }
 }
 
+/// What an epsilon path accumulates on its way to a transition or a match.
+#[derive(Debug, Clone, Default)]
+struct Path {
+    actions: Vec<Action>,
+    guards: Vec<Guard>,
+}
+
 /// A transition collected from an epsilon closure, before its target has been
 /// resolved to a closure index.
 struct RawTransition {
     range: ByteRange,
     target: StateId,
-    actions: Vec<Action>,
+    path: Path,
+    order: u32,
+}
+
+/// A match state collected from an epsilon closure.
+struct RawMatch {
+    path: Path,
+    order: u32,
 }
 
 /// The result of walking one epsilon closure.
 struct RawClosure {
     transitions: Vec<RawTransition>,
-    match_actions: Option<Vec<Action>>,
+    matches: Vec<RawMatch>,
 }
 
 /// Walks the epsilon closure of `root`, collecting the transitions that can
@@ -276,48 +402,70 @@ struct RawClosure {
 ///
 /// The walk is the PikeVM's: a depth-first traversal in epsilon order (children
 /// pushed in reverse so the highest-priority one pops first) with first-arrival
-/// deduplication. It stops at the first match state, because the VM lets only
-/// threads *before* the matching one consume a byte — transitions found after it
-/// are unreachable, and stopping there is what makes a non-greedy exit end the
-/// scan.
+/// deduplication. It stops at the first *unconditional* match state, because the
+/// VM lets only threads before the matching one consume a byte — transitions
+/// found after it are unreachable, and stopping there is what makes a non-greedy
+/// exit end the scan. A match behind an assertion may not fire, so the walk
+/// continues past it and the `order` counter records the priority the run needs
+/// to reproduce that cut.
 ///
 /// Returns `None` when the closure contains a construct this engine does not
-/// model.
+/// model, or when a state is reachable under two different sets of assertions —
+/// then which path a byte takes is no longer decided by the byte.
 fn expand_closure(nfa: &Nfa, root: StateId) -> Option<RawClosure> {
-    let mut visited = vec![false; nfa.states.len()];
-    let mut stack: Vec<(StateId, Vec<Action>)> = vec![(root, Vec::new())];
+    let mut visited: Vec<Option<Vec<Guard>>> = vec![None; nfa.states.len()];
+    let mut stack: Vec<(StateId, Path)> = vec![(root, Path::default())];
     let mut transitions = Vec::new();
+    let mut matches = Vec::new();
+    let mut order = 0u32;
 
     while let Some((state_id, mut path)) = stack.pop() {
         let seen = visited.get_mut(state_id as usize)?;
-        if *seen {
+        if let Some(previous) = seen {
+            // First arrival won, as in the PikeVM. That is only faithful while
+            // both arrivals are gated the same way; otherwise the dropped path
+            // could be the live one at some position.
+            if *previous != path.guards {
+                return None;
+            }
             continue;
         }
-        *seen = true;
+        *seen = Some(path.guards.clone());
 
         let state = nfa.get(state_id)?;
         match state.instruction {
             None | Some(NfaInstruction::NonGreedyExit) => {}
-            Some(NfaInstruction::CaptureStart(index)) => path.push(Action::Start(index)),
-            Some(NfaInstruction::CaptureEnd(index)) => path.push(Action::End(index)),
-            // Assertions depend on the position, and backreferences, lookaround
-            // and codepoint classes are not byte transitions at all.
+            Some(NfaInstruction::CaptureStart(index)) => path.actions.push(Action::Start(index)),
+            Some(NfaInstruction::CaptureEnd(index)) => path.actions.push(Action::End(index)),
+            Some(NfaInstruction::StartOfText) => path.guards.push(Guard::StartOfText),
+            Some(NfaInstruction::EndOfText) => path.guards.push(Guard::EndOfText),
+            Some(NfaInstruction::StartOfLine) => path.guards.push(Guard::StartOfLine),
+            Some(NfaInstruction::EndOfLine) => path.guards.push(Guard::EndOfLine),
+            Some(NfaInstruction::WordBoundary) => path.guards.push(Guard::WordBoundary),
+            Some(NfaInstruction::NotWordBoundary) => path.guards.push(Guard::NotWordBoundary),
+            // Backreferences, lookaround and codepoint classes are not byte
+            // transitions at all.
             Some(_) => return None,
         }
 
         if state.is_match {
-            return Some(RawClosure {
-                transitions,
-                match_actions: Some(path),
-            });
+            let unconditional = path.guards.is_empty();
+            matches.push(RawMatch { path, order });
+            order += 1;
+            if unconditional {
+                break;
+            }
+            continue;
         }
 
         for &(range, target) in &state.transitions {
             transitions.push(RawTransition {
                 range,
                 target,
-                actions: path.clone(),
+                path: path.clone(),
+                order,
             });
+            order += 1;
         }
         for &next in state.epsilon.iter().rev() {
             stack.push((next, path.clone()));
@@ -326,7 +474,7 @@ fn expand_closure(nfa: &Nfa, root: StateId) -> Option<RawClosure> {
 
     Some(RawClosure {
         transitions,
-        match_actions: None,
+        matches,
     })
 }
 
@@ -358,6 +506,17 @@ fn push_actions(arena: &mut Vec<Action>, path: &[Action]) -> Option<ActionSpan> 
     let len = u32::try_from(path.len()).ok()?;
     arena.extend_from_slice(path);
     Some(ActionSpan { start, len })
+}
+
+/// Appends `path` to the guard arena and returns the span addressing it.
+fn push_guards(arena: &mut Vec<Guard>, path: &[Guard]) -> Option<GuardSpan> {
+    if path.is_empty() {
+        return Some(GuardSpan::EMPTY);
+    }
+    let start = u32::try_from(arena.len()).ok()?;
+    let len = u32::try_from(path.len()).ok()?;
+    arena.extend_from_slice(path);
+    Some(GuardSpan { start, len })
 }
 
 #[cfg(test)]
@@ -434,11 +593,53 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_anchors_and_boundaries() {
-        assert!(compile(r"^(a)").is_none());
-        assert!(compile(r"(a)$").is_none());
-        assert!(compile(r"\b(a)").is_none());
-        assert!(compile(r"\B(a)").is_none());
+    fn test_compiles_anchors_and_boundaries() {
+        assert!(compile(r"^(a)").is_some());
+        assert!(compile(r"(a)$").is_some());
+        assert!(compile(r"\b(\w+)\b").is_some());
+        assert!(compile(r"\B(a)").is_some());
+        assert!(compile(r"^(\w+): *(\d+)$").is_some());
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_with_anchors() {
+        assert_agrees_with_pike(r"^(\d+)", &["123", "x123", "", "1"]);
+        assert_agrees_with_pike(r"(\d+)$", &["123", "123x", "1"]);
+        assert_agrees_with_pike(r"^(\w+):(\d+)$", &["ab:12", "ab:12x", ":1"]);
+    }
+
+    #[test]
+    fn test_slots_match_pike_vm_with_word_boundaries() {
+        assert_agrees_with_pike(r"\b(\w+)\b", &["hi there", " hi ", "", "_"]);
+        assert_agrees_with_pike(r"\B(a)", &["ba", "a", "xa y"]);
+    }
+
+    /// A guarded match must not end the scan when its assertion fails: the
+    /// greedy body has to keep consuming and try again further along.
+    #[test]
+    fn test_guarded_match_does_not_end_scan_early() {
+        assert_agrees_with_pike(r"(a+)$", &["aaa", "aaab", "a"]);
+        // Non-greedy: the exit is the highest-priority branch, so the loop
+        // transition sits *after* the guarded match in DFS order and is only
+        // reachable because the failing guard leaves it live.
+        assert_agrees_with_pike(r"(a+?)$", &["aaa", "a", "aab"]);
+    }
+
+    /// An anchor that never holds must yield no match, not the unanchored one.
+    #[test]
+    fn test_anchor_that_fails_rejects_the_position() {
+        let one_pass = compile(r"^(\d+)").unwrap();
+        assert_eq!(one_pass.captures_at(b"x123", 1), None);
+
+        let one_pass = compile(r"(\d+)$").unwrap();
+        assert_eq!(one_pass.captures_at(b"123x", 0), None);
+    }
+
+    /// Two epsilon paths reaching one state under different assertions leave the
+    /// byte unable to decide the path, so compilation must refuse.
+    #[test]
+    fn test_rejects_state_reachable_under_differing_guards() {
+        assert!(compile(r"(?:\b|)(a)").is_none());
     }
 
     #[test]
@@ -517,6 +718,72 @@ mod tests {
         let one_pass = compile(r"(\d+)").unwrap();
         assert_eq!(one_pass.captures_at(b"abc", 0), None);
         assert_eq!(one_pass.captures_at(b"abc", 9), None);
+    }
+
+    /// Broad sweep: whatever compiles must agree with the PikeVM everywhere.
+    ///
+    /// The targeted tests above cover the cases reasoning identified; this one
+    /// covers the cases it did not, which is where an assertion-ordering mistake
+    /// would hide.
+    #[test]
+    fn test_agrees_with_pike_vm_across_assertion_patterns() {
+        const PATTERNS: &[&str] = &[
+            r"^(a+)$",
+            r"^(a*)(b*)$",
+            r"(a+)$",
+            r"^(a+)",
+            r"\b(\w+)\b",
+            r"\b(\w+)",
+            r"(\w+)\b",
+            r"\B(\w)",
+            r"^(\w+)=(\w*)$",
+            r"(a+?)$",
+            r"^(a+?)",
+            r"^(\d)(\d)?$",
+            r"\b(\d+)\b",
+            r"^$",
+            r"^(x?)$",
+            r"(?:(a)\b)+",
+            r"^(a)|^(b)",
+            r"\b(a+)$",
+        ];
+        const INPUTS: &[&str] = &[
+            "", "a", "aa", "aaa", "b", "ab", "ba", "a b", " a ", "x=1", "=", "1", "12", "abc",
+            "abc def", "_", "a\n", "\n", "aab", "x", "xy", "a1", "1a",
+        ];
+
+        let mut compiled = 0usize;
+        for pattern in PATTERNS {
+            let nfa = build_nfa(pattern);
+            let Some(one_pass) = OnePass::compile(&nfa) else {
+                continue;
+            };
+            compiled += 1;
+            let vm = PikeVm::new(nfa);
+            let mut ctx = vm.create_context();
+
+            for input in INPUTS {
+                let bytes = input.as_bytes();
+                // Compare at every position, not just the VM's chosen start: the
+                // executor calls `captures_at` with a start the search engine
+                // found, which need not be the leftmost one.
+                for start in 0..=bytes.len() {
+                    let expected = vm.captures_with_context(bytes, &mut ctx, start);
+                    assert_eq!(
+                        one_pass.captures_at(bytes, start),
+                        expected,
+                        "pattern {pattern:?} input {input:?} start {start}"
+                    );
+                }
+            }
+        }
+
+        // Guards against the sweep quietly becoming vacuous if acceptance narrows.
+        assert!(
+            compiled >= PATTERNS.len() * 2 / 3,
+            "only {compiled} of {} patterns compiled",
+            PATTERNS.len()
+        );
     }
 
     #[test]

@@ -189,12 +189,12 @@ impl TaggedNfa {
                     // Zero-width: don't advance pos
                 }
                 PatternStep::WordBoundary => {
-                    if !Self::is_word_boundary(input, pos) {
+                    if !crate::nfa::is_word_boundary(input, pos) {
                         return None;
                     }
                 }
                 PatternStep::NotWordBoundary => {
-                    if Self::is_word_boundary(input, pos) {
+                    if crate::nfa::is_word_boundary(input, pos) {
                         return None;
                     }
                 }
@@ -428,7 +428,7 @@ impl TaggedNfa {
                 false
             }
             PatternStep::WordBoundary => {
-                if !Self::is_word_boundary(input, pos) {
+                if !crate::nfa::is_word_boundary(input, pos) {
                     return false;
                 }
                 Self::check_lookahead_recursive(rest, input, pos)
@@ -519,7 +519,7 @@ impl TaggedNfa {
                     p += 1;
                 }
                 PatternStep::WordBoundary => {
-                    if !Self::is_word_boundary(input, p) {
+                    if !crate::nfa::is_word_boundary(input, p) {
                         return false;
                     }
                 }
@@ -546,18 +546,6 @@ impl TaggedNfa {
         }
         // Match succeeds if we consumed exactly the required characters
         p == pos
-    }
-
-    #[inline]
-    fn is_word_boundary(input: &[u8], pos: usize) -> bool {
-        let prev_word = pos > 0 && Self::is_word_char(input[pos - 1]);
-        let curr_word = pos < input.len() && Self::is_word_char(input[pos]);
-        prev_word != curr_word
-    }
-
-    #[inline]
-    fn is_word_char(b: u8) -> bool {
-        matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
     }
 
     /// The start of the UTF-8 codepoint that ends at `end`.

@@ -15,8 +15,7 @@
 //! 2. **BinaryHeap Scheduling**: Efficient backref handling with min-heap instead of BTreeMap
 //! 3. **`Arc<Nfa>` for Lookarounds**: Avoids expensive NFA cloning during lookaround checks
 
-use crate::hir::unicode::is_word_byte;
-use crate::nfa::{Nfa, NfaInstruction, StateId};
+use crate::nfa::{is_word_boundary, Nfa, NfaInstruction, StateId};
 use std::sync::Arc;
 
 use crate::vm::pike::shared::{
@@ -465,14 +464,14 @@ impl PikeVm {
                 }
             }
             NfaInstruction::WordBoundary => {
-                if !self.is_word_boundary(input, pos) {
+                if !is_word_boundary(input, pos) {
                     InstructionResult::Kill
                 } else {
                     InstructionResult::Continue
                 }
             }
             NfaInstruction::NotWordBoundary => {
-                if self.is_word_boundary(input, pos) {
+                if is_word_boundary(input, pos) {
                     InstructionResult::Kill
                 } else {
                     InstructionResult::Continue
@@ -615,12 +614,5 @@ impl PikeVm {
                 unreachable!("CodepointClass is consumed in the closure, not here")
             }
         }
-    }
-
-    /// Returns true if position is at a word boundary.
-    fn is_word_boundary(&self, input: &[u8], pos: usize) -> bool {
-        let prev_word = pos > 0 && is_word_byte(input[pos - 1]);
-        let curr_word = pos < input.len() && is_word_byte(input[pos]);
-        prev_word != curr_word
     }
 }

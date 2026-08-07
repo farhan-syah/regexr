@@ -38,6 +38,23 @@ pub fn at_end_or_before_final_newline(input: &[u8], pos: usize) -> bool {
     pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n')
 }
 
+/// Whether `pos` satisfies `\b`: exactly one side of the position is a word
+/// byte. `\B` is its negation.
+///
+/// Every engine that implements the assertion shares this definition, so a
+/// change to what counts as a word byte cannot reach one engine and miss another.
+#[inline]
+pub fn is_word_boundary(input: &[u8], pos: usize) -> bool {
+    let before = pos
+        .checked_sub(1)
+        .and_then(|i| input.get(i))
+        .is_some_and(|&b| crate::hir::unicode::is_word_byte(b));
+    let after = input
+        .get(pos)
+        .is_some_and(|&b| crate::hir::unicode::is_word_byte(b));
+    before != after
+}
+
 /// Whether `pos` is a UTF-8 codepoint boundary in `input` (start of a codepoint,
 /// or the end). Matches are only attempted at boundaries so a zero-width/optional
 /// construct can't match in the middle of a multi-byte codepoint — the Unicode

@@ -99,6 +99,18 @@ const PATTERNS: &[&str] = &[
     r"([a-z]+)([0-9]*)",
     r"(a)(b)?(c)",
     r"((a)(b))c",
+    // The same, gated by assertions: these take the one-pass engine's guard
+    // path, where a wrongly-ordered assertion changes the groups but not the
+    // full match.
+    r"^(\d+)-(\d+)$",
+    r"\b(\w+)\b",
+    r"^(\w+)",
+    r"(\w+)$",
+    r"\B(\w)",
+    r"(?m)^(\w+)$",
+    r"\b(\d+)\b-(\w+)",
+    r"^(a+)$",
+    r"^(a+?)$",
     // Lookaround
     r"a(?=b)",
     r"a(?!b)",
