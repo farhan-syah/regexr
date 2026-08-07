@@ -9,6 +9,15 @@ use crate::hir::HORIZONTAL_WHITESPACE;
 
 impl Parser<'_> {
     /// Parses a character class: [abc], [^abc], [a-z].
+    ///
+    /// Also handles the binary set operators `&&` (intersection), `--`
+    /// (difference), and `~~` (symmetric difference), e.g.
+    /// `[a-z&&[^aeiou]]`. All three share one precedence level and associate
+    /// left to right: `[a-z&&[^aeiou]--[xyz]]` is `((a-z) && (^aeiou)) --
+    /// (xyz)`. A leading `^` negates the *result* of the whole expression,
+    /// which falls out naturally here — `negated` is only ever consumed by
+    /// the caller once `ranges` is final, so it is applied last regardless
+    /// of how many operators preceded it.
     pub(super) fn parse_class(&mut self) -> Result<Expr> {
         let start_span = self.current.span;
         // Set in_class BEFORE advancing so the next token is lexed correctly
@@ -25,16 +34,99 @@ impl Parser<'_> {
 
         let mut ranges = Vec::new();
 
-        // Handle leading ] or -
+        // Handle leading ] or - (but not the leading '-' of a `--` operator,
+        // which has no left operand and must be rejected, not read as a
+        // literal hyphen).
         if matches!(self.current.kind, TokenKind::CloseBracket) {
             ranges.push(ClassRange::single(']'));
             self.advance()?;
-        } else if matches!(self.current.kind, TokenKind::Hyphen) {
+        } else if matches!(self.current.kind, TokenKind::Hyphen) && self.peek_set_op().is_none() {
             ranges.push(ClassRange::single('-'));
             self.advance()?;
         }
 
-        while !matches!(self.current.kind, TokenKind::CloseBracket | TokenKind::Eof) {
+        ranges.extend(self.parse_class_term()?);
+
+        while let Some(op) = self.peek_set_op() {
+            let op_span = self.current.span;
+            if ranges.is_empty() {
+                // e.g. `[&&a-z]` or `[--z]`: the operator has no left operand.
+                return Err(Error::with_span(
+                    ErrorKind::InvalidClassSetOp,
+                    self.pattern,
+                    op_span,
+                ));
+            }
+            self.advance()?; // first operator character
+            self.advance()?; // second operator character
+
+            let rhs = self.parse_class_term()?;
+            if rhs.is_empty() {
+                // e.g. `[a-z&&]` (operand is the closing bracket), `[a-z&&`
+                // (operand is end of pattern), or `[a-z&&&&b]` (operand is
+                // another operator).
+                return Err(Error::with_span(
+                    ErrorKind::InvalidClassSetOp,
+                    self.pattern,
+                    op_span,
+                ));
+            }
+
+            ranges = op.apply(&ranges, &rhs);
+        }
+
+        self.lexer.set_in_class(false);
+
+        if matches!(self.current.kind, TokenKind::Eof) {
+            return Err(Error::with_span(
+                ErrorKind::UnmatchedOpenBracket,
+                self.pattern,
+                start_span,
+            ));
+        }
+
+        self.advance()?; // consume ']'
+
+        if ranges.is_empty() {
+            return Err(Error::with_span(
+                ErrorKind::EmptyClass,
+                self.pattern,
+                start_span,
+            ));
+        }
+
+        Ok(Expr::Class(Box::new(Class::new(ranges, negated))))
+    }
+
+    /// Detects a doubled set-operator (`&&`, `--`, `~~`) starting at the
+    /// current token, without consuming anything. Only two of the same
+    /// character back to back count — a single `&`, `-`, or `~` keeps its
+    /// ordinary meaning (literal member, or range hyphen). Checking the raw
+    /// source text (rather than lexing ahead) also means an escaped second
+    /// character, e.g. `&\&`, is correctly *not* read as `&&`.
+    fn peek_set_op(&self) -> Option<SetOp> {
+        let next = self.pattern.get(self.current.span.end..)?.chars().next();
+        match (&self.current.kind, next) {
+            (TokenKind::Literal('&'), Some('&')) => Some(SetOp::Intersection),
+            (TokenKind::Hyphen, Some('-')) => Some(SetOp::Difference),
+            (TokenKind::Literal('~'), Some('~')) => Some(SetOp::SymmetricDifference),
+            _ => None,
+        }
+    }
+
+    /// Parses one operand of a bracket expression: a run of class members —
+    /// literal characters, ranges, nested classes (`[...]`, unioned in as
+    /// today), Perl classes, Unicode properties, POSIX classes — up to
+    /// whichever comes first: the closing `]`, end of input, or the start of
+    /// a doubled set-operator. Returns whatever ranges were accumulated,
+    /// which is empty if the term is empty; the caller treats an empty term
+    /// next to an operator as a missing operand.
+    fn parse_class_term(&mut self) -> Result<Vec<ClassRange>> {
+        let mut ranges = Vec::new();
+
+        while !matches!(self.current.kind, TokenKind::CloseBracket | TokenKind::Eof)
+            && self.peek_set_op().is_none()
+        {
             // Nested character class (set union), e.g. `[a[b-c]]` or the bracketed
             // alternation `[^(\s|[.,!])]`. Parse it recursively and union its
             // members into the parent (complementing a negated nested class).
@@ -53,8 +145,13 @@ impl Parser<'_> {
 
             match item {
                 ClassItem::Char(start_char) => {
-                    // Check for range
-                    if matches!(self.current.kind, TokenKind::Hyphen) {
+                    // Check for range, but not when the hyphen is actually
+                    // the start of a `--` (difference) operator — e.g. in
+                    // `[aeiou--a]` the `u` must not try to start a `u-?`
+                    // range and swallow half the operator.
+                    if matches!(self.current.kind, TokenKind::Hyphen)
+                        && self.peek_set_op().is_none()
+                    {
                         self.advance()?;
 
                         // Trailing hyphen
@@ -284,27 +381,7 @@ impl Parser<'_> {
             }
         }
 
-        self.lexer.set_in_class(false);
-
-        if matches!(self.current.kind, TokenKind::Eof) {
-            return Err(Error::with_span(
-                ErrorKind::UnmatchedOpenBracket,
-                self.pattern,
-                start_span,
-            ));
-        }
-
-        self.advance()?; // consume ']'
-
-        if ranges.is_empty() {
-            return Err(Error::with_span(
-                ErrorKind::EmptyClass,
-                self.pattern,
-                start_span,
-            ));
-        }
-
-        Ok(Expr::Class(Box::new(Class::new(ranges, negated))))
+        Ok(ranges)
     }
 
     /// Parses a class item which can be a single char, a range, or a Perl class.
@@ -726,6 +803,152 @@ fn push_scalar_range(out: &mut Vec<ClassRange>, start: u32, end: u32) {
             ));
         }
     }
+}
+
+/// A binary set operator inside a bracket expression: `&&` (intersection),
+/// `--` (difference), or `~~` (symmetric difference). All three share one
+/// precedence level and associate left to right (see `Parser::parse_class`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetOp {
+    Intersection,
+    Difference,
+    SymmetricDifference,
+}
+
+impl SetOp {
+    /// Applies the operator to a left- and right-hand range set, returning
+    /// the normalized (sorted, coalesced) result.
+    fn apply(self, lhs: &[ClassRange], rhs: &[ClassRange]) -> Vec<ClassRange> {
+        match self {
+            SetOp::Intersection => intersect_ranges(lhs, rhs),
+            SetOp::Difference => difference_ranges(lhs, rhs),
+            SetOp::SymmetricDifference => symmetric_difference_ranges(lhs, rhs),
+        }
+    }
+}
+
+/// An inclusive code-point interval `(start, end)`, both bounds inclusive.
+/// The raw-`u32` counterpart of [`ClassRange`], used while combining range
+/// sets so that intervals spanning the surrogate gap can be manipulated as
+/// ordinary numeric ranges and only split back into valid `char` ranges at
+/// the very end, via [`push_scalar_range`].
+type Interval = (u32, u32);
+
+/// Sorts a list of intervals and coalesces any that overlap or touch
+/// (`b.start <= a.end + 1`) into one. This is the canonical form every set
+/// operation below both expects as input and produces as output.
+fn sorted_merged(mut intervals: Vec<Interval>) -> Vec<Interval> {
+    intervals.sort_by_key(|r| r.0);
+    let mut merged: Vec<Interval> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1.saturating_add(1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+/// Converts `ClassRange`s into normalized (sorted, coalesced) intervals.
+fn to_intervals(ranges: &[ClassRange]) -> Vec<Interval> {
+    sorted_merged(
+        ranges
+            .iter()
+            .map(|r| (r.start as u32, r.end as u32))
+            .collect(),
+    )
+}
+
+/// Converts normalized intervals back into `ClassRange`s, splitting any
+/// interval that spans the surrogate gap.
+fn intervals_to_ranges(intervals: &[Interval]) -> Vec<ClassRange> {
+    let mut out = Vec::new();
+    for &(start, end) in intervals {
+        push_scalar_range(&mut out, start, end);
+    }
+    out
+}
+
+/// Intersection of two normalized interval sets: `[s, e]` for every
+/// overlapping pair, where `s = max(a.start, b.start)` and
+/// `e = min(a.end, b.end)`.
+fn intersect_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
+    let mut out = Vec::new();
+    for &(a_start, a_end) in a {
+        for &(b_start, b_end) in b {
+            if b_end < a_start {
+                continue;
+            }
+            if b_start > a_end {
+                // `b` is sorted ascending, so no later `b` interval can
+                // overlap this `a` interval either.
+                break;
+            }
+            let start = a_start.max(b_start);
+            let end = a_end.min(b_end);
+            if start <= end {
+                out.push((start, end));
+            }
+        }
+    }
+    out
+}
+
+/// Difference (`a - b`) of two normalized interval sets: every part of `a`
+/// not covered by any interval of `b`.
+fn difference_intervals(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
+    let mut out = Vec::new();
+    for &(a_start, a_end) in a {
+        let mut cur = a_start;
+        for &(b_start, b_end) in b {
+            if b_end < cur {
+                continue;
+            }
+            if b_start > a_end {
+                break;
+            }
+            if b_start > cur {
+                out.push((cur, b_start - 1));
+            }
+            if b_end >= a_end {
+                cur = a_end + 1;
+                break;
+            }
+            cur = b_end + 1;
+        }
+        if cur <= a_end {
+            out.push((cur, a_end));
+        }
+    }
+    out
+}
+
+/// Intersection of two character-range sets, normalized before and after.
+fn intersect_ranges(a: &[ClassRange], b: &[ClassRange]) -> Vec<ClassRange> {
+    let a = to_intervals(a);
+    let b = to_intervals(b);
+    intervals_to_ranges(&sorted_merged(intersect_intervals(&a, &b)))
+}
+
+/// Difference (`a - b`) of two character-range sets, normalized before and
+/// after.
+fn difference_ranges(a: &[ClassRange], b: &[ClassRange]) -> Vec<ClassRange> {
+    let a = to_intervals(a);
+    let b = to_intervals(b);
+    intervals_to_ranges(&sorted_merged(difference_intervals(&a, &b)))
+}
+
+/// Symmetric difference of two character-range sets: `(a - b) ∪ (b - a)`,
+/// normalized before and after.
+fn symmetric_difference_ranges(a: &[ClassRange], b: &[ClassRange]) -> Vec<ClassRange> {
+    let a = to_intervals(a);
+    let b = to_intervals(b);
+    let mut sym = difference_intervals(&a, &b);
+    sym.extend(difference_intervals(&b, &a));
+    intervals_to_ranges(&sorted_merged(sym))
 }
 
 #[cfg(test)]

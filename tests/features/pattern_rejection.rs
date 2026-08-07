@@ -67,6 +67,13 @@ const MALFORMED_ESCAPES: &[&str] = &[
     r"(?P=nosuch)",
     r"(?P=)",
     r"(?P=w",
+    // Character-class set operations (`&&`, `--`, `~~`): missing right
+    // operand, missing left operand, and a dangling operator at class end.
+    r"[a-z&&]",
+    r"[a-z--]",
+    r"[a-z~~]",
+    r"[&&a-z]",
+    r"[a-z&&",
 ];
 
 #[test]

@@ -90,6 +90,11 @@ pub enum ErrorKind {
     },
     /// Empty character class.
     EmptyClass,
+    /// Malformed character-class set operation (`&&`, `--`, `~~`): the
+    /// operator is missing its left operand (e.g. `[&&a-z]`), missing its
+    /// right operand (e.g. `[a-z&&]`), or the class ends (`]` or end of
+    /// pattern) immediately after the operator.
+    InvalidClassSetOp,
     /// Invalid group syntax.
     InvalidGroup,
     /// Invalid backreference.
@@ -220,6 +225,12 @@ impl fmt::Display for ErrorKind {
                 write!(f, "invalid character class range '{}-{}'", start, end)
             }
             ErrorKind::EmptyClass => write!(f, "empty character class"),
+            ErrorKind::InvalidClassSetOp => {
+                write!(
+                    f,
+                    "invalid character class set operation: '&&', '--', and '~~' require both a left and a right operand"
+                )
+            }
             ErrorKind::InvalidGroup => write!(f, "invalid group syntax"),
             ErrorKind::InvalidBackref(n) => write!(f, "invalid backreference '\\{}'", n),
             ErrorKind::BackrefNotFound(n) => {

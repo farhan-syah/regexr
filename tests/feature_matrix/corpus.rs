@@ -1224,17 +1224,10 @@ const SET_OPERATORS: &[Feature] = &[
     },
     Feature {
         syntax: "[…] && […]",
-        desc: "intersection of two adjacent bracket expressions, double-ampersand spelling",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: "[a-z]&&[aeiou]",
-            matches: Some("a"),
-            rejects: Some("bcd"),
-            expect: Some("a"),
-            icase: false,
-            xmode: false,
-        }],
+        desc: "intersection of a bracket expression with a nested one, double-ampersand spelling",
+        support: Support::Yes,
+        covered_by: Some("features::class_set_ops"),
+        probes: &[],
     },
     Feature {
         syntax: "[…] || […]",
@@ -1252,31 +1245,18 @@ const SET_OPERATORS: &[Feature] = &[
     },
     Feature {
         syntax: "[…] -- […]",
-        desc: "difference of two adjacent bracket expressions, double-dash spelling",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: "[a-z]--[aeiou]",
-            matches: Some("b"),
-            rejects: Some("a"),
-            expect: Some("b"),
-            icase: false,
-            xmode: false,
-        }],
+        desc: "difference of a bracket expression and a nested one, double-dash spelling",
+        support: Support::Yes,
+        covered_by: Some("features::class_set_ops"),
+        probes: &[],
     },
     Feature {
         syntax: "[…] ~~ […]",
-        desc: "symmetric difference of two adjacent bracket expressions, double-tilde spelling",
-        support: Support::No,
-        covered_by: None,
-        probes: &[Probe {
-            pattern: "[abc]~~[bcd]",
-            matches: Some("a"),
-            rejects: Some("b"),
-            expect: Some("a"),
-            icase: false,
-            xmode: false,
-        }],
+        desc:
+            "symmetric difference of a bracket expression and a nested one, double-tilde spelling",
+        support: Support::Yes,
+        covered_by: Some("features::class_set_ops"),
+        probes: &[],
     },
 ];
 

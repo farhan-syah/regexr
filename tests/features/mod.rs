@@ -34,6 +34,7 @@ pub fn regex(pattern: &str) -> Regex {
 
 mod backreference;
 mod case_insensitive;
+mod class_set_ops;
 mod escape_sequences;
 mod extended_mode;
 mod grapheme_cluster;
