@@ -1289,6 +1289,16 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         return compile_with_pikevm(hir);
     }
 
+    // An alternation — including the one a negated class lowers to — belongs on
+    // the DFA rather than Shift-Or, whose step walks the live positions and so
+    // costs more the more branches there are. `select_engine_from_hir` already
+    // routes it there, and this path has to agree: without it `jit(true)` reached
+    // JitShiftOr and ran the tokenizer's alternation ~20% SLOWER than
+    // `Regex::new`, which is the one thing asking for the JIT must never do.
+    if crate::engine::selector::hir_contains_alternation(&hir.expr) {
+        return compile_from_hir(hir);
+    }
+
     // One repeated byte class is answered by a scan in the interpreted ShiftOr,
     // and no engine on this path beats it: JitShiftOr compiles the bit-parallel
     // automaton the scan replaces, and the DFA JIT is slower still. `\w+` — the

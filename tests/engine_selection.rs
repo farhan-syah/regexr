@@ -95,9 +95,9 @@ fn requesting_jit_never_downgrades_the_engine() {
         );
     }
 
-    // Nothing about the *results* changes when either of the next two
-    // regresses, so both assertions are on the selection itself.
-    //
+    // Nothing about the *results* changes when any of the next three regresses,
+    // so all three assertions are on the selection itself.
+
     // A pattern that is one repeated byte class is answered by a scan, not by
     // the bit-parallel automaton — so JIT-compiling that automaton, or reaching
     // for the DFA JIT, compiles the very thing the scan exists to replace.
@@ -106,39 +106,45 @@ fn requesting_jit_never_downgrades_the_engine() {
     // UTF-8 trie, which is not one byte per iteration.
     const RUN_PATTERNS: &[&str] = &[r"\w+", r"\d+", r"[a-z]+", r"[0-9a-f]{2,}", r"\w{2,8}"];
 
-    for pattern in RUN_PATTERNS {
-        let plain = regexr::Regex::new(pattern).unwrap();
-        let jitted = regexr::RegexBuilder::new(pattern)
-            .jit(true)
-            .build()
-            .unwrap();
-        assert_eq!(
-            plain.engine_name(),
-            jitted.engine_name(),
-            "{pattern}: a repeated byte class must reach the same engine either way"
-        );
-    }
+    // An alternation belongs on the DFA, whose step is one table lookup however
+    // many branches there are, rather than Shift-Or, which walks the live
+    // positions. Both selection paths have to agree: the rule landed in
+    // `select_engine_from_hir` first, and until `compile_with_jit` matched it the
+    // tokenizer's alternation ran ~20% slower under `jit(true)`. Negated classes
+    // lower to an alternation, so `[^>]+` is one of these too.
+    const ALTERNATION_PATTERNS: &[&str] = &[
+        r#"[a-zA-Z_][a-zA-Z0-9_]*|[0-9]+(?:\.[0-9]+)?|[+\-*/=<>!&|^%]+|[(){}\[\];,.]|"[^"]*"|'[^']*'"#,
+        r"[^>]+",
+        r"<[^>]+>",
+        r"https?://[^\s<>]+",
+        r"error|warning|critical|fatal",
+    ];
 
     // A word boundary next to an effective prefilter is the DFA JIT's worst
     // shape: the prefilter finds a literal, the boundary is what makes those
     // candidates fail ("the" inside "their"), and the DFA JIT has no anchored
     // entry, so a failed candidate becomes a scan of the rest of the input
-    // instead of a rejection. `\bthe\b` ran ~2.5x slower under `jit(true)` than
-    // under `Regex::new` until both paths agreed here.
+    // instead of a rejection. `\bthe\b` ran ~2.5x slower under `jit(true)`.
     const BOUNDARY_PATTERNS: &[&str] = &[r"\bthe\b", r"\bword\b", r"\bfoo\b\s"];
 
-    for pattern in BOUNDARY_PATTERNS {
-        let plain = regexr::Regex::new(pattern).unwrap();
-        let jitted = regexr::RegexBuilder::new(pattern)
-            .jit(true)
-            .build()
-            .unwrap();
-        assert_eq!(
-            plain.engine_name(),
-            jitted.engine_name(),
-            "{pattern}: a literal guarded by a word boundary must reach the same \
-             engine either way"
-        );
+    let selection: &[(&str, &[&str])] = &[
+        ("a repeated byte class", RUN_PATTERNS),
+        ("an alternation", ALTERNATION_PATTERNS),
+        ("a literal guarded by a word boundary", BOUNDARY_PATTERNS),
+    ];
+    for (shape, patterns) in selection {
+        for pattern in *patterns {
+            let plain = regexr::Regex::new(pattern).unwrap();
+            let jitted = regexr::RegexBuilder::new(pattern)
+                .jit(true)
+                .build()
+                .unwrap();
+            assert_eq!(
+                plain.engine_name(),
+                jitted.engine_name(),
+                "{pattern}: {shape} must reach the same engine either way"
+            );
+        }
     }
 
     // Whatever each path selects, they must agree on what they find.
