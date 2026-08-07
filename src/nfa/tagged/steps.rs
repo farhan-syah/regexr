@@ -259,6 +259,44 @@ impl<'a> StepExtractor<'a> {
         Some(combine_greedy_with_lookahead(steps))
     }
 
+    /// Whether an alternation at `state` can re-enter itself.
+    ///
+    /// The extractor emits `Alt` as the *last* step and stops, which is only
+    /// faithful when the branches run to the end of the pattern. A quantified
+    /// alternation (`(?:a|b)+`, and now `\s+`, whose class expands to an
+    /// alternation of UTF-8 shapes) loops back instead, so everything after the
+    /// alternation — including the repetition itself — would be silently
+    /// dropped, leaving a program that matches one iteration and stops. Refusing
+    /// hands the pattern to the PikeVM, which models the loop.
+    fn alternation_loops_back(&self, state: StateId) -> bool {
+        let mut seen = vec![false; self.nfa.states.len()];
+        let mut stack: Vec<StateId> = Vec::new();
+
+        let Some(root) = self.nfa.get(state) else {
+            return true;
+        };
+        stack.extend(root.epsilon.iter().copied());
+        stack.extend(root.transitions.iter().map(|&(_, target)| target));
+
+        while let Some(id) = stack.pop() {
+            if id == state {
+                return true;
+            }
+            match seen.get_mut(id as usize) {
+                Some(flag) if !*flag => *flag = true,
+                Some(_) => continue,
+                // Out of range: treat as unknown, which must read as unsafe.
+                None => return true,
+            }
+            let Some(next) = self.nfa.get(id) else {
+                return true;
+            };
+            stack.extend(next.epsilon.iter().copied());
+            stack.extend(next.transitions.iter().map(|&(_, target)| target));
+        }
+        false
+    }
+
     fn extract_from_state(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
         let mut steps = Vec::new();
         let mut current = start;
@@ -620,6 +658,9 @@ impl<'a> StepExtractor<'a> {
                 }
 
                 // Not a greedy star, treat as alternation
+                if self.alternation_loops_back(current) {
+                    return Vec::new();
+                }
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
                 for &target in state.epsilon.iter() {
@@ -648,6 +689,9 @@ impl<'a> StepExtractor<'a> {
 
             // More than 2 epsilons - must be alternation
             if state.epsilon.len() > 2 {
+                if self.alternation_loops_back(current) {
+                    return Vec::new();
+                }
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
                 for &target in state.epsilon.iter() {

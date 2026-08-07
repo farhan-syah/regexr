@@ -347,29 +347,40 @@ pub fn optimize_sequences(sequences: Vec<Utf8Sequence>) -> Vec<Utf8Sequence> {
         return sequences;
     }
 
-    let mut optimized = Vec::new();
-    let mut i = 0;
+    // Repeat until nothing more merges. A single pass only ever collapses the
+    // last byte, which leaves the byte *before* it split into one sequence per
+    // value — a full 3-byte range would stay 1024 sequences instead of one.
+    // Collapsing the last byte first is what makes the next one mergeable, so
+    // the passes have to run to a fixed point.
+    let mut current = sequences;
+    loop {
+        let mut merged = Vec::with_capacity(current.len());
+        let mut changed = false;
+        let mut index = 0;
 
-    while i < sequences.len() {
-        let mut current = sequences[i].clone();
-
-        // Try to merge with subsequent sequences of the same length
-        while i + 1 < sequences.len() {
-            let next = &sequences[i + 1];
-
-            if let Some(merged) = try_merge_sequences(&current, next) {
-                current = merged;
-                i += 1;
-            } else {
+        while index < current.len() {
+            let Some(mut sequence) = current.get(index).cloned() else {
                 break;
+            };
+            while let Some(next) = current.get(index + 1) {
+                match try_merge_sequences(&sequence, next) {
+                    Some(combined) => {
+                        sequence = combined;
+                        index += 1;
+                        changed = true;
+                    }
+                    None => break,
+                }
             }
+            merged.push(sequence);
+            index += 1;
         }
 
-        optimized.push(current);
-        i += 1;
+        current = merged;
+        if !changed {
+            return current;
+        }
     }
-
-    optimized
 }
 
 /// Computes the complement of sorted, non-overlapping code point ranges.
@@ -516,38 +527,94 @@ pub fn compile_utf8_complement(ranges: &[(u32, u32)]) -> Vec<Utf8Sequence> {
     optimize_sequences(sequences)
 }
 
-/// Tries to merge two UTF-8 sequences if they differ only in the last byte range
-/// and those ranges are adjacent.
+/// Tries to merge two UTF-8 sequences that agree everywhere but one byte
+/// position, where their ranges are adjacent.
+///
+/// `[A][B1][C]` and `[A][B2][C]` cover exactly `[A][B1∪B2][C]` when `B1` and
+/// `B2` abut, whichever position they sit at — restricting this to the last byte
+/// would leave a fully covered range spread across one sequence per value of the
+/// second-to-last byte.
 fn try_merge_sequences(a: &Utf8Sequence, b: &Utf8Sequence) -> Option<Utf8Sequence> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
 
-    let n = a.len();
-
-    // All bytes except the last must be identical
-    for i in 0..n - 1 {
-        if a.ranges[i] != b.ranges[i] {
-            return None;
+    let mut differing = None;
+    for (index, (left, right)) in a.ranges.iter().zip(b.ranges.iter()).enumerate() {
+        if left != right {
+            if differing.is_some() {
+                return None;
+            }
+            differing = Some(index);
         }
     }
 
-    // Last byte ranges must be adjacent
-    let (a_start, a_end) = a.ranges[n - 1];
-    let (b_start, b_end) = b.ranges[n - 1];
-
-    if a_end.checked_add(1) == Some(b_start) {
-        let mut merged_ranges = a.ranges[..n - 1].to_vec();
-        merged_ranges.push((a_start, b_end));
-        Some(Utf8Sequence::new(merged_ranges))
-    } else {
-        None
+    let index = differing?;
+    let &(a_start, a_end) = a.ranges.get(index)?;
+    let &(b_start, b_end) = b.ranges.get(index)?;
+    if a_end.checked_add(1) != Some(b_start) {
+        return None;
     }
+
+    let mut ranges = a.ranges.clone();
+    *ranges.get_mut(index)? = (a_start, b_end);
+    Some(Utf8Sequence::new(ranges))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The complement of a small class must stay a handful of sequences.
+    ///
+    /// This is a size property, not a behaviour one: nothing *matches* wrong when
+    /// it regresses. The class simply exceeds the trie budget and falls back to a
+    /// code-point node, which forces every pattern containing it onto the PikeVM
+    /// — a large, silent slowdown that no correctness test would catch.
+    #[test]
+    fn test_complement_of_small_class_stays_compact() {
+        // Roughly `[^\s<>]`: ASCII whitespace, the two brackets, and the
+        // non-ASCII White_Space code points.
+        let excluded = [
+            (0x09, 0x0D),
+            (0x20, 0x20),
+            (0x3C, 0x3C),
+            (0x3E, 0x3E),
+            (0x85, 0x85),
+            (0xA0, 0xA0),
+            (0x1680, 0x1680),
+            (0x2000, 0x200A),
+            (0x2028, 0x2029),
+            (0x202F, 0x202F),
+            (0x205F, 0x205F),
+            (0x3000, 0x3000),
+        ];
+        let sequences = compile_utf8_complement(&excluded);
+        assert!(
+            sequences.len() <= 64,
+            "complement expanded to {} sequences; merging must reach a fixed \
+             point across every byte position, not just the last",
+            sequences.len()
+        );
+    }
+
+    /// A fully covered encoding class collapses to one sequence per byte width.
+    #[test]
+    fn test_full_range_collapses_to_one_sequence_per_width() {
+        let three_byte = optimize_sequences(compile_utf8_range(0xE000, 0xFFFF));
+        assert_eq!(
+            three_byte.len(),
+            1,
+            "U+E000..U+FFFF is one contiguous 3-byte block: {three_byte:?}"
+        );
+
+        let four_byte = optimize_sequences(compile_utf8_range(0x10000, 0x10FFFF));
+        assert!(
+            four_byte.len() <= 4,
+            "the 4-byte plane should not stay split per byte-2 value: {} sequences",
+            four_byte.len()
+        );
+    }
 
     #[test]
     fn test_encode_code_point_ascii() {

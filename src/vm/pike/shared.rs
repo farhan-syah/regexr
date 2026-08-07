@@ -15,12 +15,12 @@ use std::collections::{BinaryHeap, HashMap};
 
 /// Thread scheduled for a future input position.
 ///
-/// Threads are popped in `(pos ascending, seq ascending)` order. `seq` is a
-/// monotonic counter assigned in priority order when the thread is scheduled, so
-/// among threads landing at the same position the higher-priority (lower `seq`)
-/// one is processed first. This is what gives the VM correct leftmost-first
-/// semantics across both fixed-width (byte) and variable-width (codepoint)
-/// transitions — they share one priority-ordered queue.
+/// Threads are popped in `(pos, start, seq)` ascending order. `start` is where
+/// the thread's match attempt began, which is what makes the queue leftmost-first
+/// across both fixed-width (byte) and variable-width (codepoint) transitions.
+/// `seq` is a monotonic counter assigned in priority order when a thread is
+/// scheduled, so among threads that began together the higher-priority (lower
+/// `seq`) one is processed first.
 #[derive(Debug)]
 pub struct PendingThread {
     pub pos: usize,
@@ -30,7 +30,7 @@ pub struct PendingThread {
 
 impl PartialEq for PendingThread {
     fn eq(&self, other: &Self) -> bool {
-        self.pos == other.pos && self.seq == other.seq
+        self.pos == other.pos && self.thread.start == other.thread.start && self.seq == other.seq
     }
 }
 
@@ -44,11 +44,24 @@ impl PartialOrd for PendingThread {
 
 impl Ord for PendingThread {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap is a max-heap but we want the smallest (pos, seq) first, so
-        // reverse: order by position ascending, then by seq (priority) ascending.
+        // BinaryHeap is a max-heap but we want the smallest
+        // `(pos, start, seq)` first, so every comparison is reversed: position
+        // ascending, then start position ascending, then seq (priority)
+        // ascending.
+        //
+        // `start` has to outrank `seq`, because `seq` is reassigned every time a
+        // thread is rescheduled and therefore measures how recently it moved, not
+        // how early it began. A thread advancing one byte at a time collects a
+        // larger `seq` than one that crossed the same span in a single step — and
+        // `CodepointClass` consumes up to four bytes at once — so ordering on
+        // `seq` alone hands the match to whichever thread took bigger strides.
+        // Comparing `start` first makes leftmost-first hold regardless of stride;
+        // `seq` still resolves pattern priority between threads that began
+        // together, since threads are rescheduled in priority order.
         other
             .pos
             .cmp(&self.pos)
+            .then_with(|| other.thread.start.cmp(&self.thread.start))
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }
@@ -59,8 +72,9 @@ impl Ord for PendingThread {
 pub struct PikeVmContext {
     /// Thread storage for the position currently being processed.
     pub current_threads: Vec<Thread>,
-    /// Threads scheduled for future positions, ordered by `(position, seq)`. All
-    /// consuming transitions (byte and codepoint) flow through this single queue.
+    /// Threads scheduled for future positions, ordered by
+    /// `(position, start, seq)`. All consuming transitions (byte and codepoint)
+    /// flow through this single queue.
     pub future_threads: BinaryHeap<PendingThread>,
     /// O(1) deduplication: `visited[state_id] == generation` means state already visited
     pub visited: Vec<usize>,

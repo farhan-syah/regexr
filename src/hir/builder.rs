@@ -582,11 +582,10 @@ impl HirTranslator {
         // Optimize multi-byte sequences
         let optimized_seqs = optimize_sequences(utf8_sequences);
 
-        // Any multi-byte UTF-8 sequences cause slow DFA materialization.
-        // Mark as large unicode class to skip DFA JIT.
-        if !optimized_seqs.is_empty() {
-            self.props.has_large_unicode_class = true;
-        }
+        // Whether this class is "large" is decided by how it actually lowers, not
+        // by the mere presence of multi-byte members: the branches that emit a
+        // codepoint node set the flag themselves. Setting it here as well would
+        // push a class that lowered to a small trie off the DFA for no reason.
 
         // Build the final expression
         let expr = self.build_class_expr(merged_bytes, optimized_seqs, class.negated);
@@ -615,8 +614,18 @@ impl HirTranslator {
         utf8_sequences: Vec<Utf8Sequence>,
         negated: bool,
     ) -> HirExpr {
-        // If negated and we have multi-byte sequences, compute the complement
+        // If negated and we have multi-byte sequences, compute the complement.
+        //
+        // `[^\s<>]` and friends are worth lowering to bytes rather than taking
+        // the codepoint node: the excluded set is small, so its complement is a
+        // handful of scalar ranges and expands to a trie the DFA engines run
+        // directly. Only when the expansion is genuinely large does the
+        // codepoint node win.
         if negated && !utf8_sequences.is_empty() {
+            let excluded = class_codepoint_ranges(&byte_ranges, &utf8_sequences, self);
+            if let Some(expr) = self.lower_complement_to_bytes(&excluded) {
+                return expr;
+            }
             return self.build_negated_unicode_class(byte_ranges, utf8_sequences);
         }
 
@@ -637,14 +646,13 @@ impl HirTranslator {
             return self.build_ascii_or_non_ascii(surviving_ascii);
         }
 
-        // IMPORTANT: Multi-byte UTF-8 sequences must use CodepointClass to ensure
-        // matches only occur at valid UTF-8 codepoint boundaries. The trie-based approach
-        // creates byte-level transitions that can match at partial UTF-8 sequences,
-        // causing panics when slicing strings at non-character boundaries.
-        //
-        // Note: CodepointClass requires PikeVM which is slower than LazyDFA, but
-        // correctness is more important than performance here.
-        if !utf8_sequences.is_empty() {
+        // A class with multi-byte members becomes a codepoint node once its UTF-8
+        // expansion stops being cheap. Below that bound the trie is the better
+        // representation: it holds only *complete* sequences, so it still cannot
+        // match at a partial codepoint, and unlike the codepoint node it does not
+        // pin the whole pattern to the PikeVM — a small class like `\s` would
+        // otherwise drag every pattern containing it onto the slowest engine.
+        if utf8_sequences.len() > MAX_TRIE_SEQUENCES {
             return self.build_unicode_codepoint_class(byte_ranges, utf8_sequences, negated);
         }
 
@@ -680,6 +688,46 @@ impl HirTranslator {
             }
             1 => alternatives.pop().unwrap(),
             _ => HirExpr::Alt(alternatives),
+        }
+    }
+
+    /// Expands "any character except `excluded`" into a byte-level automaton, or
+    /// `None` when the expansion would be too large to be worth it.
+    ///
+    /// The bound is on the number of UTF-8 sequences, which is what the NFA and
+    /// DFA actually pay for — a code-point count would reject `[^\s]`, whose
+    /// complement spans most of Unicode yet expands to only a few sequences.
+    fn lower_complement_to_bytes(&self, excluded: &[(u32, u32)]) -> Option<HirExpr> {
+        let complement = compile_utf8_complement(excluded);
+        if complement.len() > MAX_TRIE_SEQUENCES {
+            return None;
+        }
+
+        // Single-byte sequences are ASCII and belong in a plain byte class; the
+        // rest form the trie.
+        let mut byte_ranges = Vec::new();
+        let mut sequences = Vec::new();
+        for seq in complement {
+            match seq.ranges.as_slice() {
+                [single] => byte_ranges.push(*single),
+                _ => sequences.push(seq),
+            }
+        }
+
+        let mut alternatives: Vec<HirExpr> = Vec::new();
+        if !byte_ranges.is_empty() {
+            alternatives.push(HirExpr::Class(HirClass::new(
+                merge_byte_ranges(byte_ranges),
+                false,
+            )));
+        }
+        if !sequences.is_empty() {
+            alternatives.push(self.build_utf8_trie(&sequences));
+        }
+        match alternatives.len() {
+            0 => Some(HirExpr::Class(HirClass::new(vec![], false))),
+            1 => alternatives.pop(),
+            _ => Some(HirExpr::Alt(alternatives)),
         }
     }
 
@@ -755,25 +803,35 @@ impl HirTranslator {
 
     /// Builds a trie-based HIR expression for UTF-8 sequences.
     /// This shares common prefixes to minimize NFA states.
+    ///
+    /// Leading ranges are split at every boundary they share before grouping, so
+    /// the resulting branches start on pairwise-disjoint bytes. Two sequences
+    /// compiled from different code-point ranges routinely share a leading byte
+    /// without sharing a leading *range* (`C2-C3` and `C3-DF`); grouping on the
+    /// range alone would leave two branches competing for `C3`, which reads as a
+    /// real alternation and sends the whole pattern to the PikeVM.
     #[allow(clippy::only_used_in_recursion)]
     fn build_utf8_trie(&self, sequences: &[Utf8Sequence]) -> HirExpr {
         if sequences.is_empty() {
             return HirExpr::Empty;
         }
 
-        // Group sequences by their first byte range
+        // Group sequences by their first byte range, split into atoms so the
+        // groups partition the byte space instead of overlapping.
+        let atoms = leading_range_atoms(sequences);
         let mut groups: std::collections::BTreeMap<(u8, u8), Vec<Utf8Sequence>> =
             std::collections::BTreeMap::new();
 
         for seq in sequences {
-            if seq.ranges.is_empty() {
+            let Some(&(lo, hi)) = seq.ranges.first() else {
                 continue;
+            };
+            for &atom in atoms.iter().filter(|(a, b)| *a >= lo && *b <= hi) {
+                groups
+                    .entry(atom)
+                    .or_default()
+                    .push(Utf8Sequence::new(seq.ranges[1..].to_vec()));
             }
-            let first = seq.ranges[0];
-            groups
-                .entry(first)
-                .or_default()
-                .push(Utf8Sequence::new(seq.ranges[1..].to_vec()));
         }
 
         // Build alternatives for each group
@@ -1040,6 +1098,56 @@ fn merge_codepoint_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 /// to a raw byte (e.g. U+00E9 'é' is the two bytes 0xC3 0xA9, not the single
 /// byte 0xE9). Single-byte results from `compile_utf8_range` (pure ASCII)
 /// are folded into `byte_ranges` alongside the direct ASCII portion.
+/// Partitions the leading byte ranges of `sequences` into the coarsest set of
+/// pairwise-disjoint ranges that refines all of them.
+fn leading_range_atoms(sequences: &[Utf8Sequence]) -> Vec<(u8, u8)> {
+    let mut cuts: Vec<u16> = Vec::with_capacity(sequences.len() * 2);
+    for seq in sequences {
+        if let Some(&(lo, hi)) = seq.ranges.first() {
+            cuts.push(lo as u16);
+            cuts.push(hi as u16 + 1);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut atoms = Vec::with_capacity(cuts.len());
+    for pair in cuts.windows(2) {
+        let (Some(&start), Some(&end)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        // `end` is exclusive and both came from `u8` bounds, so the cast holds.
+        if let (Ok(lo), Ok(hi)) = (u8::try_from(start), u8::try_from(end - 1)) {
+            atoms.push((lo, hi));
+        }
+    }
+    atoms
+}
+
+/// Largest UTF-8 expansion a class may have before it becomes a codepoint node
+/// instead. Past this the trie costs more NFA states than the codepoint check
+/// costs in engine restrictions; below it the byte automaton wins outright.
+const MAX_TRIE_SEQUENCES: usize = 64;
+
+/// The scalar values a class covers, as merged codepoint ranges.
+fn class_codepoint_ranges(
+    byte_ranges: &[(u8, u8)],
+    utf8_sequences: &[Utf8Sequence],
+    translator: &HirTranslator,
+) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = byte_ranges
+        .iter()
+        .map(|&(start, end)| (start as u32, end as u32))
+        .collect();
+    for seq in utf8_sequences {
+        if let Some(range) = translator.utf8_sequence_to_code_point_range(seq) {
+            ranges.push(range);
+        }
+    }
+    ranges.sort_by_key(|range| range.0);
+    merge_codepoint_ranges(ranges)
+}
+
 fn push_codepoint_range(
     start_cp: u32,
     end_cp: u32,
@@ -1132,85 +1240,98 @@ mod tests {
         assert_eq!(merged, vec![(1, 5), (7, 9)]);
     }
 
+    /// Whether any node in the tree is a code-point class, i.e. the class did
+    /// not lower to a byte automaton.
+    fn contains_codepoint_class(expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::UnicodeCpClass(_) => true,
+            HirExpr::Concat(exprs) | HirExpr::Alt(exprs) => {
+                exprs.iter().any(contains_codepoint_class)
+            }
+            HirExpr::Repeat(repeat) => contains_codepoint_class(&repeat.expr),
+            HirExpr::Capture(capture) => contains_codepoint_class(&capture.expr),
+            HirExpr::Lookaround(look) => contains_codepoint_class(&look.expr),
+            HirExpr::Empty
+            | HirExpr::Literal(_)
+            | HirExpr::Class(_)
+            | HirExpr::Anchor(_)
+            | HirExpr::Backref(_) => false,
+        }
+    }
+
     #[test]
     fn test_translate_full_codepoint_range() {
-        // [\x00-\xff] should match codepoints U+0000-U+00FF. Anything at or
-        // above U+0080 is encoded as multi-byte UTF-8 (not a raw byte), so
-        // this now compiles to a UnicodeCpClass over codepoints rather than
-        // a plain byte Class.
+        // [\x00-\xff] covers code points U+0000-U+00FF. Everything at or above
+        // U+0080 is multi-byte UTF-8, not a raw byte, so this is an ASCII byte
+        // class alternated with a trie of two-byte sequences — small enough to
+        // stay a byte automaton rather than becoming a code-point node.
         let ast = parse("[\\x00-\\xff]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
-        if let HirExpr::UnicodeCpClass(cpclass) = hir.expr {
-            assert_eq!(cpclass.ranges, vec![(0, 255)]);
-            assert!(!cpclass.negated);
-        } else {
-            panic!("Expected UnicodeCpClass, got {:?}", hir.expr);
-        }
+        assert!(
+            !contains_codepoint_class(&hir.expr),
+            "small class should lower to bytes, got {:?}",
+            hir.expr
+        );
+
+        let re = crate::Regex::new("^[\\x00-\\xff]$").unwrap();
+        assert!(re.is_match("\u{0}"));
+        assert!(re.is_match("é"));
+        assert!(!re.is_match("Ā"), "U+0100 is outside the class");
     }
 
     #[test]
     fn test_translate_high_codepoint_range() {
-        // [\x80-\xff] should match codepoints U+0080-U+00FF. These are all
-        // above the ASCII cutoff, so they are encoded as 2-byte UTF-8
-        // sequences (0xC2 0x80 .. 0xC3 0xBF) and represented as a
-        // UnicodeCpClass over codepoints, not raw bytes 128-255.
+        // [\x80-\xff] covers U+0080-U+00FF, all above the ASCII cutoff, so it is
+        // a trie of the two-byte sequences 0xC2 0x80 .. 0xC3 0xBF — never the raw
+        // bytes 128-255, which are not characters.
         let ast = parse("[\\x80-\\xff]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
-        if let HirExpr::UnicodeCpClass(cpclass) = hir.expr {
-            assert_eq!(cpclass.ranges, vec![(0x80, 0xff)]);
-            assert!(!cpclass.negated);
-        } else {
-            panic!("Expected UnicodeCpClass, got {:?}", hir.expr);
-        }
+        assert!(
+            !contains_codepoint_class(&hir.expr),
+            "small class should lower to bytes, got {:?}",
+            hir.expr
+        );
+
+        let re = crate::Regex::new("^[\\x80-\\xff]$").unwrap();
+        assert!(re.is_match("\u{80}"));
+        assert!(re.is_match("ÿ"));
+        assert!(!re.is_match("a"));
+        assert!(!re.is_match("Ā"));
     }
 
     #[test]
     fn test_translate_unicode_class_greek() {
-        // [α-ω] should produce UnicodeCpClass to ensure correct UTF-8 boundary matching
+        // [α-ω] lowers to a trie of complete three-byte sequences, so it matches
+        // only at code-point boundaries while staying on the byte engines.
         let ast = parse("[α-ω]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
+        assert!(
+            !contains_codepoint_class(&hir.expr),
+            "small Unicode range should lower to bytes, got {:?}",
+            hir.expr
+        );
 
-        // Greek lowercase letters (U+03B1-U+03C9) should be represented as UnicodeCpClass
-        // to ensure matches only occur at valid UTF-8 codepoint boundaries
-        match hir.expr {
-            HirExpr::UnicodeCpClass(cpclass) => {
-                // Should contain Greek letters range
-                assert!(!cpclass.ranges.is_empty());
-                assert!(!cpclass.negated);
-                // Verify the range covers Greek lowercase (α=0x3B1, ω=0x3C9)
-                assert!(cpclass
-                    .ranges
-                    .iter()
-                    .any(|&(start, end)| start <= 0x3B1 && end >= 0x3C9));
-            }
-            _ => panic!(
-                "Expected UnicodeCpClass for Unicode class, got {:?}",
-                hir.expr
-            ),
-        }
+        let re = crate::Regex::new("^[α-ω]$").unwrap();
+        assert!(re.is_match("α"));
+        assert!(re.is_match("ω"));
+        assert!(!re.is_match("Α"), "uppercase alpha is outside the range");
+        assert!(!re.is_match("a"));
     }
 
     #[test]
     fn test_translate_unicode_single_char() {
-        // [α] should produce UnicodeCpClass for single multi-byte char
+        // A single multi-byte member is just its own UTF-8 sequence.
         let ast = parse("[α]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
+        assert!(
+            !contains_codepoint_class(&hir.expr),
+            "single multi-byte char should lower to bytes, got {:?}",
+            hir.expr
+        );
 
-        // Single Greek letter should be UnicodeCpClass
-        match hir.expr {
-            HirExpr::UnicodeCpClass(cpclass) => {
-                // Should contain single codepoint (α=0x3B1)
-                assert!(!cpclass.ranges.is_empty());
-                assert!(cpclass
-                    .ranges
-                    .iter()
-                    .any(|&(start, end)| start == 0x3B1 && end == 0x3B1));
-            }
-            _ => panic!(
-                "Expected UnicodeCpClass for single multi-byte char, got {:?}",
-                hir.expr
-            ),
-        }
+        let re = crate::Regex::new("^[α]$").unwrap();
+        assert!(re.is_match("α"));
+        assert!(!re.is_match("β"));
     }
 
     #[test]
@@ -1310,12 +1431,14 @@ mod tests {
             "[a-z] should not be large"
         );
 
-        // Greek range uses multi-byte UTF-8, should be flagged to skip DFA JIT
+        // Multi-byte membership alone no longer makes a class "large": the Greek
+        // range lowers to a small trie, and flagging it would push every pattern
+        // containing it off the DFA for nothing.
         let ast = parse(r"[α-ω]").unwrap();
         let hir = HirTranslator::new().translate(&ast).unwrap();
         assert!(
-            hir.props.has_large_unicode_class,
-            "[α-ω] has multi-byte UTF-8, should skip DFA JIT"
+            !hir.props.has_large_unicode_class,
+            "[α-ω] lowers to a small trie and should not be flagged large"
         );
     }
 }
