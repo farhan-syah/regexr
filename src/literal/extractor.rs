@@ -19,6 +19,9 @@ pub struct Literals {
     /// True if the pattern starts with a digit class (0-9).
     /// Used to create StartsWithDigit prefilter when no literal prefix exists.
     pub starts_with_digit: bool,
+    /// The few distinct bytes a match can start with, when there are few enough
+    /// to search for directly. Set only when no literal prefix was found.
+    pub leading_bytes: Vec<u8>,
 }
 
 impl Literals {
@@ -71,13 +74,53 @@ pub fn extract_literals(hir: &Hir) -> Literals {
     // If no prefix literals found, check if pattern starts with digit class
     let starts_with_digit = result.prefixes.is_empty() && starts_with_digit_class(&hir.expr);
 
+    let leading_bytes = if result.prefixes.is_empty() && !starts_with_digit {
+        leading_byte_set(&hir.expr).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     Literals {
         prefixes: result.prefixes,
         suffixes: vec![],
         prefix_complete,
         starts_with_digit,
+        leading_bytes,
     }
 }
+
+/// Bytes a match can begin with, when a leading character class names at most
+/// [`MAX_LEADING_BYTES`] of them.
+///
+/// `(['\"])[^'\"]*\1` starts with one of two bytes; without this it has no
+/// prefilter at all and the engine visits every position.
+fn leading_byte_set(expr: &HirExpr) -> Option<Vec<u8>> {
+    match expr {
+        HirExpr::Class(class) if !class.negated => {
+            let mut bytes = Vec::new();
+            for &(lo, hi) in &class.ranges {
+                if bytes.len() + (hi as usize - lo as usize + 1) > MAX_LEADING_BYTES {
+                    return None;
+                }
+                bytes.extend(lo..=hi);
+            }
+            (!bytes.is_empty()).then_some(bytes)
+        }
+        HirExpr::Literal(bytes) => bytes.first().map(|&b| vec![b]),
+        HirExpr::Concat(exprs) => exprs
+            .iter()
+            .find(|e| !is_zero_width(e))
+            .and_then(leading_byte_set),
+        HirExpr::Capture(capture) => leading_byte_set(&capture.expr),
+        HirExpr::Repeat(repeat) if repeat.min >= 1 => leading_byte_set(&repeat.expr),
+        _ => None,
+    }
+}
+
+/// Beyond this many distinct starting bytes a direct search stops paying: the
+/// `memchr` family covers up to three, and more candidates than that in ordinary
+/// text is no better than scanning.
+const MAX_LEADING_BYTES: usize = 3;
 
 /// Checks if an HIR expression starts with a pure digit character class.
 /// Returns true only if the class exclusively matches digits (0-9), not if it
@@ -418,6 +461,24 @@ pub fn required_literal(hir: &Hir) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A leading class of a few bytes must produce a searchable byte set.
+    ///
+    /// Without it the pattern has no prefilter at all and the engine visits
+    /// every position — invisible to any correctness test.
+    #[test]
+    fn test_small_leading_class_yields_a_byte_set() {
+        assert_eq!(literals(r#"(['"])[^'"]*\1"#).leading_bytes, b"\"'".to_vec());
+        assert_eq!(literals(r"[abc]xyz").leading_bytes, b"abc".to_vec());
+        assert_eq!(literals(r"(?:[ab])+z").leading_bytes, b"ab".to_vec());
+
+        // Too many members to be worth searching for directly.
+        assert!(literals(r"[a-z]xyz").leading_bytes.is_empty());
+        // A negated class says which bytes CANNOT start a match.
+        assert!(literals(r"[^ab]xyz").leading_bytes.is_empty());
+        // A literal prefix is a stronger filter and wins.
+        assert!(literals(r"abc[de]").leading_bytes.is_empty());
+    }
 
     fn literals(pattern: &str) -> Literals {
         let ast = crate::parser::parse(pattern).unwrap();

@@ -135,6 +135,13 @@ const PATTERNS: &[&str] = &[
     r"(?!x)\d+",
     r"(?<!a)bcd",
     r"a(?=b)bc",
+    // A small leading class drives the byte-set prefilter; a wrong set silently
+    // skips real matches.
+    r#"['"][^'"]*['"]"#,
+    r#"(['"])[^'"]*\1"#,
+    r"[abc]+",
+    r"[ab]x",
+    r"[^ab]x",
     // Escapes
     r"\x41",
     r"\x{263A}",
@@ -191,6 +198,10 @@ const HAYSTACKS: &[&str] = &[
     "ing",
     "zzz nothing",
     "zzz",
+    "let x = \"hi\"; y = 'z';",
+    "'a' and \"b\"",
+    "abcabc",
+    "ax bx cx",
     "$100 and 200",
     "price 42",
     "a1 $2 b3",

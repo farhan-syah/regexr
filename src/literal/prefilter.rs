@@ -34,6 +34,9 @@ pub enum Prefilter {
     Literal(Box<memchr::memmem::Finder<'static>>),
     /// Pattern starts with a digit (0-9). Uses memchr to find digit positions.
     StartsWithDigit,
+    /// Match starts with one of two or three known bytes; searched with the
+    /// `memchr` family.
+    LeadingBytes([u8; 3], u8),
     /// Multi-pattern search using aho-corasick packed searcher (for prefix candidates).
     AhoCorasick {
         /// The aho-corasick automaton.
@@ -72,6 +75,9 @@ impl std::fmt::Debug for Prefilter {
             }
             Self::Literal(_) => write!(f, "Prefilter::Literal"),
             Self::StartsWithDigit => write!(f, "Prefilter::StartsWithDigit"),
+            Self::LeadingBytes(bytes, len) => {
+                write!(f, "Prefilter::LeadingBytes({:?})", &bytes[..*len as usize])
+            }
             Self::AhoCorasick { ac } => {
                 write!(f, "Prefilter::AhoCorasick({} patterns)", ac.patterns_len())
             }
@@ -99,6 +105,12 @@ impl Prefilter {
             // No literal prefix - check for specialized prefilters
             if literals.starts_with_digit {
                 return Self::StartsWithDigit;
+            }
+            match literals.leading_bytes.as_slice() {
+                [a] => return Self::SingleByte(*a),
+                [a, b] => return Self::LeadingBytes([*a, *b, *b], 2),
+                [a, b, c] => return Self::LeadingBytes([*a, *b, *c], 3),
+                _ => {}
             }
             return Self::None;
         }
@@ -158,6 +170,14 @@ impl Prefilter {
             Self::Literal(finder) => {
                 let slice = &haystack[pos..];
                 finder.find(slice).map(|i| pos + i)
+            }
+            Self::LeadingBytes(bytes, len) => {
+                let slice = &haystack[pos..];
+                match len {
+                    2 => memchr::memchr2(bytes[0], bytes[1], slice),
+                    _ => memchr::memchr3(bytes[0], bytes[1], bytes[2], slice),
+                }
+                .map(|i| pos + i)
             }
             Self::StartsWithDigit => {
                 // Find next digit (0-9) position using SIMD range search
@@ -308,6 +328,7 @@ impl Prefilter {
             // Not effective - weak or no selectivity
             Self::None => false,
             Self::StartsWithDigit => false, // Too many candidates in typical text
+            Self::LeadingBytes(..) => true,
             Self::InnerByte { .. } => false, // Requires lookback, complex handling
         }
     }
@@ -455,6 +476,7 @@ mod tests {
             suffixes: vec![],
             prefix_complete: true,
             starts_with_digit: false,
+            leading_bytes: Vec::new(),
         };
         let pf = Prefilter::from_literals(&literals);
         assert!(matches!(pf, Prefilter::Literal(_)));
@@ -467,6 +489,7 @@ mod tests {
             suffixes: vec![],
             prefix_complete: true,
             starts_with_digit: false,
+            leading_bytes: Vec::new(),
         };
         let pf = Prefilter::from_literals(&literals);
         assert!(matches!(pf, Prefilter::SingleByte(b'h')));
@@ -479,6 +502,7 @@ mod tests {
             suffixes: vec![],
             prefix_complete: false,
             starts_with_digit: false,
+            leading_bytes: Vec::new(),
         };
         let pf = Prefilter::from_literals(&literals);
         assert!(pf.is_none());
@@ -491,6 +515,7 @@ mod tests {
             suffixes: vec![],
             prefix_complete: true,
             starts_with_digit: false,
+            leading_bytes: Vec::new(),
         };
         let pf = Prefilter::from_literals(&literals);
         // With prefix_complete=true, we get AhoCorasickFull for complete literal matching
@@ -513,6 +538,7 @@ mod tests {
             suffixes: vec![],
             prefix_complete: false, // Not a complete literal match
             starts_with_digit: false,
+            leading_bytes: Vec::new(),
         };
         let pf = Prefilter::from_literals(&literals);
         // With prefix_complete=false, we get regular AhoCorasick
