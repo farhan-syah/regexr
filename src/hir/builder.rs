@@ -92,14 +92,8 @@ impl HirTranslator {
             Expr::GraphemeCluster => Ok(super::grapheme::grapheme_cluster()),
 
             Expr::Dot => {
-                // Dot matches any byte except newline (unless dot_all mode is enabled)
-                if self.flags.dot_all {
-                    // (?s) mode: dot matches ANY byte including newline
-                    Ok(HirExpr::Class(HirClass::any_byte()))
-                } else {
-                    // Default: dot matches any byte except newline
-                    Ok(HirExpr::Class(HirClass::dot()))
-                }
+                let dot_all = self.flags.dot_all;
+                Ok(self.build_dot_expr(dot_all))
             }
 
             Expr::Concat(exprs) => {
@@ -631,6 +625,40 @@ impl HirTranslator {
                 HirExpr::Class(HirClass::new(vec![], false))
             }
             1 => alternatives.pop().unwrap(),
+            _ => HirExpr::Alt(alternatives),
+        }
+    }
+
+    /// Builds `.` — "any single character", not "any single byte".
+    ///
+    /// Written the same way a negated ASCII class is (see `build_class_expr`):
+    /// an alternation of "one surviving ASCII byte" and "any non-ASCII
+    /// character", the second half being a trie of complete UTF-8 sequences.
+    /// That keeps `.` an ordinary byte automaton — LazyDfa, EagerDfa, Shift-Or
+    /// and the JIT all run it natively — while making it impossible for a match
+    /// to start or end in the middle of a codepoint.
+    ///
+    /// Deliberately *not* a `HirExpr::UnicodeCpClass`: that node forces the
+    /// PikeVM (see `engine::selector::hir_uses_codepoint_class`), which would
+    /// drag every pattern containing `.` onto the slowest engine. The trie is
+    /// three fixed sequences, so `has_large_unicode_class` stays unset too.
+    ///
+    /// `\n` is 0x0A, which is never a UTF-8 lead or continuation byte, so
+    /// excluding it from the ASCII half alone gives the non-dot-all semantics.
+    fn build_dot_expr(&mut self, dot_all: bool) -> HirExpr {
+        let ascii: Vec<(u8, u8)> = if dot_all {
+            vec![(0x00, 0x7f)]
+        } else {
+            vec![(0x00, 0x09), (0x0b, 0x7f)]
+        };
+        let non_ascii = any_non_ascii_character();
+
+        let mut alternatives = vec![HirExpr::Class(HirClass::new(ascii, false))];
+        if !non_ascii.is_empty() {
+            alternatives.push(self.build_utf8_trie(&non_ascii));
+        }
+        match alternatives.len() {
+            1 => alternatives.swap_remove(0),
             _ => HirExpr::Alt(alternatives),
         }
     }

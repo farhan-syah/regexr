@@ -110,11 +110,11 @@ fn test_find_iter_empty() {
 // find_iter over multi-byte UTF-8
 // =============================================================================
 //
-// `.` and byte classes match a single byte (this is the engine's canonical
-// semantics, see `regexr::reference`), so a match can end inside a multi-byte
-// codepoint. The iterator reports that span as-is but always resumes at the
-// next codepoint boundary, so no match ever starts inside a codepoint and no
-// `&str` is ever sliced at a non-boundary.
+// `.` and character classes match one whole codepoint (this is the engine's
+// canonical semantics, see `regexr::reference`), so their spans cover complete
+// characters. The iterator also always resumes at the next codepoint boundary,
+// so no match ever starts inside a codepoint and no `&str` is ever sliced at a
+// non-boundary.
 
 /// Collects `(start, end)` for every match, driving the iterator to completion.
 fn ranges(re: &Regex, text: &str) -> Vec<(usize, usize)> {
@@ -123,7 +123,7 @@ fn ranges(re: &Regex, text: &str) -> Vec<(usize, usize)> {
 
 #[test]
 fn test_find_iter_dot_over_multibyte_text() {
-    // The reported panic: `.` over text containing a 3-byte codepoint.
+    // `.` over text containing 3-byte codepoints: one match per character.
     // "Hello " is bytes 0..6, '世' is 6..9, '界' is 9..12, '!' is 12..13.
     let re = regex(".");
     let text = "Hello 世界!";
@@ -137,41 +137,98 @@ fn test_find_iter_dot_over_multibyte_text() {
             (3, 4),
             (4, 5),
             (5, 6),
-            (6, 7),
-            (9, 10),
+            (6, 9),
+            (9, 12),
             (12, 13),
         ]
     );
 
-    // The two spans that split a codepoint have no `&str` representation.
+    // Every span is a whole character, so every one has a `&str` form.
     let strs: Vec<_> = re.find_iter(text).map(|m| m.as_str()).collect();
-    assert_eq!(strs, vec!["H", "e", "l", "l", "o", " ", "", "", "!"]);
+    assert_eq!(strs, vec!["H", "e", "l", "l", "o", " ", "世", "界", "!"]);
 
-    // ...but the bytes are always available and exact.
+    // The bytes agree: the full UTF-8 encoding, not just the lead byte.
     let bytes: Vec<_> = re.find_iter(text).map(|m| m.as_bytes().to_vec()).collect();
-    assert_eq!(bytes[6], vec![0xE4]); // lead byte of '世'
-    assert_eq!(bytes[7], vec![0xE7]); // lead byte of '界'
+    assert_eq!(bytes[6], "世".as_bytes().to_vec());
+    assert_eq!(bytes[7], "界".as_bytes().to_vec());
 }
 
 #[test]
 fn test_find_iter_dot_over_two_byte_codepoint() {
     // 'a' is 0..1, 'é' is 1..3, 'b' is 3..4.
     let re = regex(".");
-    assert_eq!(ranges(&re, "aéb"), vec![(0, 1), (1, 2), (3, 4)]);
+    assert_eq!(ranges(&re, "aéb"), vec![(0, 1), (1, 3), (3, 4)]);
 }
 
 #[test]
 fn test_find_iter_dot_over_three_byte_codepoint() {
     // '世' is 0..3, '界' is 3..6.
     let re = regex(".");
-    assert_eq!(ranges(&re, "世界"), vec![(0, 1), (3, 4)]);
+    assert_eq!(ranges(&re, "世界"), vec![(0, 3), (3, 6)]);
 }
 
 #[test]
 fn test_find_iter_dot_over_four_byte_codepoint() {
     // 'x' is 0..1, '🎉' is 1..5, 'y' is 5..6.
     let re = regex(".");
-    assert_eq!(ranges(&re, "x🎉y"), vec![(0, 1), (1, 2), (5, 6)]);
+    assert_eq!(ranges(&re, "x🎉y"), vec![(0, 1), (1, 5), (5, 6)]);
+}
+
+#[test]
+fn test_dot_matches_one_whole_codepoint() {
+    let re = regex(".");
+    for text in ["é", "世", "🎉"] {
+        let m = re.find(text).expect("`.` must match a non-ASCII character");
+        assert_eq!((m.start(), m.end()), (0, text.len()), "text {text:?}");
+        assert_eq!(m.as_str(), text);
+    }
+}
+
+#[test]
+fn test_dot_anchored_against_single_codepoint() {
+    // `^.$` only holds if `.` consumes the whole character.
+    let re = regex("^.$");
+    for text in ["é", "世", "🎉"] {
+        let m = re.find(text).expect("`^.$` must match a lone character");
+        assert_eq!((m.start(), m.end()), (0, text.len()), "text {text:?}");
+    }
+    // Two characters must not match a single `.` between the anchors.
+    assert!(regex("^.$").find("éé").is_none());
+}
+
+#[test]
+fn test_dot_between_ascii_literals() {
+    let re = regex("X.Y");
+    let m = re.find("XéY").expect("`X.Y` must span the whole codepoint");
+    assert_eq!((m.start(), m.end()), (0, "XéY".len()));
+    assert_eq!(m.as_str(), "XéY");
+
+    let m = regex("X.Y").find("X🎉Y").expect("4-byte codepoint");
+    assert_eq!(m.as_str(), "X🎉Y");
+}
+
+#[test]
+fn test_dot_and_newline() {
+    // Without dot-all, `.` still excludes '\n'.
+    assert!(regex(".").find("\n").is_none());
+    assert!(regex("a.b").find("a\nb").is_none());
+
+    // With `(?s)` it matches it.
+    let m = regex("(?s)a.b")
+        .find("a\nb")
+        .expect("dot-all matches newline");
+    assert_eq!(m.as_str(), "a\nb");
+
+    // Dot-all still matches whole codepoints.
+    let m = regex("(?s).").find("世").expect("dot-all over a character");
+    assert_eq!(m.as_str(), "世");
+}
+
+#[test]
+fn test_dot_inside_class_is_a_literal() {
+    let re = regex("[.]");
+    assert_eq!(re.find("a.b").map(|m| (m.start(), m.end())), Some((1, 2)));
+    assert!(re.find("aéb").is_none());
 }
 
 #[test]
@@ -220,17 +277,24 @@ fn test_captures_iter_over_multibyte_text() {
             (m.start(), m.end())
         })
         .collect();
-    assert_eq!(spans, vec![(0, 1), (3, 4)]);
+    assert_eq!(spans, vec![(0, 3), (3, 6)]);
 }
 
 #[test]
 fn test_replace_over_multibyte_text() {
-    // A byte-level match removes part of a codepoint; the orphaned bytes have
-    // no `str` form and become U+FFFD rather than panicking.
+    // `.` consumes whole codepoints, so a replace over multi-byte text
+    // round-trips cleanly: no orphaned continuation bytes, no U+FFFD.
     let re = regex(".");
     let replaced = re.replace_all("世", "-");
-    assert!(replaced.starts_with('-'));
-    assert!(replaced.contains('\u{FFFD}'));
+    assert_eq!(replaced, "-");
+    assert!(!replaced.contains('\u{FFFD}'));
+
+    let replaced = re.replace_all("a世🎉b", "-");
+    assert_eq!(replaced, "----");
+    assert!(!replaced.contains('\u{FFFD}'));
+
+    // Replacing only the first match leaves the rest of the text intact.
+    assert_eq!(re.replace("é世", "-"), "-世");
 
     // Codepoint-aligned matches are unaffected.
     let re = regex("世");

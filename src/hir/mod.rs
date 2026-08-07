@@ -219,24 +219,12 @@ impl HirClass {
     }
 
     /// Creates a class matching any byte.
+    ///
+    /// This is a raw byte class, so it is only meaningful for a single step of
+    /// a UTF-8 sequence or inside a zero-width assertion. `.` is not built from
+    /// it — see `build_dot_expr`, which spells `.` as an alternation covering a
+    /// whole code point.
     pub fn any() -> Self {
-        Self {
-            ranges: vec![(0, 255)],
-            negated: false,
-        }
-    }
-
-    /// Creates a class matching any byte except newline.
-    pub fn dot() -> Self {
-        Self {
-            ranges: vec![(0, 9), (11, 255)],
-            negated: false,
-        }
-    }
-
-    /// Creates a class matching any byte (including newline).
-    /// Used for (?s) dot-all mode.
-    pub fn any_byte() -> Self {
         Self {
             ranges: vec![(0, 255)],
             negated: false,

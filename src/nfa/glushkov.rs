@@ -1241,17 +1241,19 @@ mod tests {
 
     #[test]
     fn test_dot_star_glushkov() {
-        // a.*b pattern: position 0 = 'a', position 1 = '.', position 2 = 'b'
+        // `.` matches one whole codepoint, so it expands to an alternation of
+        // the ASCII byte and the three UTF-8 sequence shapes — 1 + 2 + 3 + 4
+        // positions. In `a.*b` that puts 'a' at position 0, the dot across
+        // positions 1..=10, and 'b' last.
         let nfa = make_glushkov("a.*b").unwrap();
 
-        // Should have 3 positions: 'a', '.', 'b'
-        assert_eq!(nfa.position_count, 3);
+        const DOT: std::ops::Range<usize> = 1..11;
+        const LAST: usize = 11;
+        assert_eq!(nfa.position_count, LAST + 1);
 
-        // First set should only include position 0 ('a')
-        assert_eq!(nfa.first, 0b001);
-
-        // Last set should only include position 2 ('b')
-        assert_eq!(nfa.last, 0b100);
+        // First set holds only position 0 ('a'); last set only 'b'.
+        assert_eq!(nfa.first, 0b1);
+        assert_eq!(nfa.last, 1 << LAST);
 
         // Pattern is not nullable (can't match empty string)
         assert!(!nfa.nullable);
@@ -1260,31 +1262,43 @@ mod tests {
         assert!(nfa.positions[0].contains(b'a'));
         assert!(!nfa.positions[0].contains(b'b'));
 
-        // Position 1 accepts any byte (.)
+        // Position 1 is the dot's ASCII branch: every ASCII byte but the line
+        // terminator, and never a byte belonging to a multi-byte sequence.
         assert!(nfa.positions[1].contains(b'a'));
-        assert!(nfa.positions[1].contains(b'b'));
         assert!(nfa.positions[1].contains(b'x'));
+        assert!(!nfa.positions[1].contains(b'\n'));
+        assert!(!nfa.positions[1].contains(0x80));
 
-        // Position 2 accepts 'b'
-        assert!(nfa.positions[2].contains(b'b'));
-        assert!(!nfa.positions[2].contains(b'a'));
+        // The remaining dot positions cover the multi-byte sequences, so a
+        // UTF-8 lead byte is accepted somewhere in the range.
+        assert!(DOT.clone().any(|i| nfa.positions[i].contains(0xC3)));
 
-        // Follow sets:
-        // Follow(0) = {1, 2} (after 'a', can go to '.' or 'b' since .* is nullable)
-        assert_eq!(
-            nfa.follow[0] & 0b110,
-            0b110,
-            "Follow(0) should include positions 1 and 2"
+        // The final position accepts 'b'
+        assert!(nfa.positions[LAST].contains(b'b'));
+        assert!(!nfa.positions[LAST].contains(b'a'));
+
+        // After 'a' the dot may be entered or skipped entirely, since `.*` is
+        // nullable — so 'b' is reachable directly.
+        assert!(
+            nfa.follow[0] & (1 << 1) != 0,
+            "Follow(0) should enter the dot"
+        );
+        assert!(
+            nfa.follow[0] & (1 << LAST) != 0,
+            "Follow(0) should be able to skip the dot and reach 'b'"
         );
 
-        // Follow(1) = {1, 2} (after '.', can stay at '.' or go to 'b')
-        assert_eq!(
-            nfa.follow[1] & 0b110,
-            0b110,
-            "Follow(1) should include positions 1 and 2"
+        // After one ASCII dot iteration the dot can repeat or 'b' can follow.
+        assert!(
+            nfa.follow[1] & (1 << 1) != 0,
+            "Follow(1) should allow the dot to repeat"
+        );
+        assert!(
+            nfa.follow[1] & (1 << LAST) != 0,
+            "Follow(1) should be able to reach 'b'"
         );
 
-        // Follow(2) = {} (after 'b', nothing follows - it's the end)
-        assert_eq!(nfa.follow[2], 0, "Follow(2) should be empty");
+        // Nothing follows the final 'b'.
+        assert_eq!(nfa.follow[LAST], 0, "Follow(LAST) should be empty");
     }
 }

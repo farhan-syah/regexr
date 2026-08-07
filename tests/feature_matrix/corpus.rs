@@ -833,7 +833,7 @@ const CLASSES: &[Feature] = &[
     Feature {
         syntax: ".",
         desc: "any character except the line terminator",
-        support: Support::No,
+        support: Support::Yes,
         covered_by: None,
         probes: &[
             Probe {
@@ -2115,7 +2115,7 @@ const MISCELLANEOUS: &[Feature] = &[
     Feature {
         syntax: "Unicode \".\"",
         desc: "dot matching a full Unicode code point, including supplementary-plane characters",
-        support: Support::No,
+        support: Support::Yes,
         covered_by: None,
         probes: &[Probe {
             pattern: r"a.b",

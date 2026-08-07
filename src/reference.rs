@@ -45,9 +45,13 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            // A positive byte class consumes exactly one byte: `.` and friends
-            // are byte-level in this engine, and a match may legitimately end
-            // inside a codepoint.
+            // A positive byte class consumes exactly one byte. It is only ever
+            // one *step* of a character: the builder emits positive classes for
+            // ASCII bytes and for the individual bytes of a UTF-8 sequence, and
+            // spells whole-character constructs out as an alternation of those.
+            // `.`, for instance, is "one non-newline ASCII byte, or a complete
+            // multi-byte sequence", so it consumes a whole codepoint even though
+            // every leaf here consumes one byte.
             //
             // A negated one consumes a whole codepoint. Its complement is taken
             // over Unicode scalar values, not over bytes — `[^a]` means "some
