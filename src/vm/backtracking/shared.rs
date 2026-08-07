@@ -56,6 +56,16 @@ pub enum Op {
     Any,
     /// Split: try pc+1 first, on backtrack try target.
     Split(u32),
+    /// Consume a run of bytes from a class, recording the whole run as one
+    /// choice point that resumes at `retry`.
+    ///
+    /// A greedy loop over a single byte class otherwise pushes a choice point
+    /// per byte. The run is equivalent because the body consumes exactly one
+    /// byte and writes nothing, so the only state a shorter attempt needs is the
+    /// position — which [`Op::RunRetry`] walks back one byte at a time.
+    RunScan { class: u16, retry: u32 },
+    /// Give one byte of a [`Op::RunScan`] run back, or backtrack past it.
+    RunRetry,
     /// Jump to target.
     Jump(u32),
     /// Save position to capture slot.

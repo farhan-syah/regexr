@@ -138,13 +138,93 @@ pub type ByteSet = [u8; 256];
 /// including a nullable one, since then the element after it decides the byte
 /// too, and a set that misses a viable start would skip real matches.
 pub fn first_byte_set(hir: &Hir) -> Option<ByteSet> {
-    let mut set = [0u8; 256];
-    if !add_first_bytes(&hir.expr, &mut set) {
-        return None;
-    }
     // A set every byte belongs to restricts nothing, and testing it would be
     // pure overhead on the search's hottest loop.
-    set.contains(&0).then_some(set)
+    expr_first_byte_set(&hir.expr).filter(|set| set.contains(&0))
+}
+
+/// [`first_byte_set`] for a subexpression.
+///
+/// Unlike the whole-pattern form this keeps an all-bytes answer, because a
+/// caller asking about one branch of an alternation needs to know what that
+/// branch can start with even when the answer is "anything".
+pub fn expr_first_byte_set(expr: &HirExpr) -> Option<ByteSet> {
+    let mut set = [0u8; 256];
+    add_first_bytes(expr, &mut set).then_some(set)
+}
+
+/// The membership table of a single byte class.
+///
+/// A negated class admits every byte its ranges do not name, which is how the
+/// engines read `negated` — see the class emitters in `vm::backtracking`.
+pub fn byte_class_set(ranges: &[(u8, u8)], negated: bool) -> ByteSet {
+    let mut set = [u8::from(negated); 256];
+    for &(lo, hi) in ranges {
+        for byte in lo..=hi {
+            if let Some(entry) = set.get_mut(byte as usize) {
+                *entry = u8::from(!negated);
+            }
+        }
+    }
+    set
+}
+
+/// Bytes that `expr` matches as a whole single-byte match, when consuming one
+/// such byte can never be the wrong choice.
+///
+/// A greedy repetition of `expr` can then be run as a byte scan rather than an
+/// iteration at a time. Two things have to hold for that to be sound, and both
+/// are checked here:
+///
+/// - a byte in the set is matched by `expr` *entirely*, consuming exactly one
+///   byte and writing no capture, so the scan cannot commit to the wrong length
+///   or skip a group;
+/// - no other branch of `expr` can begin with a byte in the set, so preferring
+///   the single-byte reading never overrides a branch the alternation ranks
+///   higher.
+///
+/// The set may be a strict subset of what `expr` matches: a scan that stops
+/// early just leaves the rest to the general loop. `[^'"]` lowers to an ASCII
+/// class beside a UTF-8 trie, and this returns the ASCII half — which is the
+/// whole of it on ASCII text.
+pub fn single_byte_run_set(expr: &HirExpr) -> Option<ByteSet> {
+    match expr {
+        HirExpr::Class(class) => Some(byte_class_set(&class.ranges, class.negated)),
+        HirExpr::Alt(branches) => {
+            let mut run = [0u8; 256];
+            let mut others = [0u8; 256];
+            let mut found = false;
+
+            for branch in branches {
+                if let HirExpr::Class(class) = branch {
+                    // A negated class reaches past ASCII, where the bytes it
+                    // admits are lead bytes of characters the trie beside it
+                    // spells out — the two would overlap.
+                    if !class.negated {
+                        for (entry, member) in
+                            run.iter_mut().zip(byte_class_set(&class.ranges, false))
+                        {
+                            *entry |= member;
+                        }
+                        found = true;
+                        continue;
+                    }
+                }
+                // Anything else has to be provably out of the way.
+                let first = expr_first_byte_set(branch)?;
+                for (entry, member) in others.iter_mut().zip(first) {
+                    *entry |= member;
+                }
+            }
+
+            let disjoint = run
+                .iter()
+                .zip(others)
+                .all(|(member, other)| *member == 0 || other == 0);
+            (found && disjoint).then_some(run)
+        }
+        _ => None,
+    }
 }
 
 /// Adds every byte `expr` can begin with to `set`. Returns false when the set
@@ -152,16 +232,9 @@ pub fn first_byte_set(hir: &Hir) -> Option<ByteSet> {
 fn add_first_bytes(expr: &HirExpr, set: &mut ByteSet) -> bool {
     match expr {
         HirExpr::Class(class) => {
-            let mut members = [0u8; 256];
-            for &(lo, hi) in &class.ranges {
-                for byte in lo..=hi {
-                    if let Some(entry) = members.get_mut(byte as usize) {
-                        *entry = 1;
-                    }
-                }
-            }
+            let members = byte_class_set(&class.ranges, class.negated);
             for (entry, member) in set.iter_mut().zip(members) {
-                *entry |= if class.negated { 1 - member } else { member };
+                *entry |= member;
             }
             true
         }

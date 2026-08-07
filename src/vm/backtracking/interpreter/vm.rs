@@ -200,6 +200,8 @@ impl BacktrackingVm {
 
         let mut pc = 0u32;
         let mut pos = start;
+        // Where the innermost `RunScan` run began, restored by `Trail::pop`.
+        let mut run_start = 0usize;
 
         // Set group 0 start
         slots[0] = start as i32;
@@ -213,7 +215,7 @@ impl BacktrackingVm {
                     if pos < input.len() && input[pos] == b {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -222,7 +224,7 @@ impl BacktrackingVm {
                     if pos < input.len() && input[pos] >= lo && input[pos] <= hi {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -243,7 +245,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -264,7 +266,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -277,7 +279,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -290,7 +292,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -308,7 +310,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -325,7 +327,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -334,9 +336,46 @@ impl BacktrackingVm {
                     if pos < input.len() {
                         pos += 1;
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
+                }
+
+                Op::RunScan { class, retry } => {
+                    let Some(set) = self.byte_classes.get(class as usize) else {
+                        return Ok(false);
+                    };
+                    let begin = pos;
+                    while input.get(pos).is_some_and(|&byte| set.contains(byte)) {
+                        pos += 1;
+                    }
+                    // One choice point for the run, charged as one step: the
+                    // scan itself is a forward walk whose cost the input already
+                    // bounds.
+                    if *budget == 0 {
+                        return Err(BudgetExhausted);
+                    }
+                    *budget -= 1;
+                    trail.push_run(retry, pos, begin, self.progress_regs);
+                    pc += 1;
+                }
+
+                Op::RunRetry => {
+                    // Resumed with `pos` at the length last tried and
+                    // `run_start` where the run began.
+                    if pos <= run_start {
+                        if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    pos -= 1;
+                    if *budget == 0 {
+                        return Err(BudgetExhausted);
+                    }
+                    *budget -= 1;
+                    trail.push_run(pc, pos, run_start, self.progress_regs);
+                    pc += 1;
                 }
 
                 Op::Split(target) => {
@@ -380,7 +419,7 @@ impl BacktrackingVm {
                     // which is where the choice point pushed at the loop head
                     // resumes, with the slots this iteration wrote put back.
                     if pos == progress[reg as usize] {
-                        if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                        if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                             return Ok(false);
                         }
                     } else {
@@ -396,7 +435,7 @@ impl BacktrackingVm {
                 Op::StartAnchor => {
                     if pos == 0 {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -404,7 +443,7 @@ impl BacktrackingVm {
                 Op::StartLineAnchor => {
                     if pos == 0 || input[pos - 1] == b'\n' {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -413,7 +452,7 @@ impl BacktrackingVm {
                     // End of text, or just before a trailing newline.
                     if pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n') {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -421,7 +460,7 @@ impl BacktrackingVm {
                 Op::EndLineAnchor => {
                     if pos == input.len() || input[pos] == b'\n' {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -431,7 +470,7 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before != after {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -441,7 +480,7 @@ impl BacktrackingVm {
                     let after = pos < input.len() && is_word_byte(input[pos]);
                     if before == after {
                         pc += 1;
-                    } else if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -459,7 +498,7 @@ impl BacktrackingVm {
                             continue;
                         }
                     }
-                    if !trail.pop(&mut pc, &mut pos, slots, progress) {
+                    if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
                     }
                 }
@@ -494,8 +533,9 @@ impl Scratch {
 /// flat stack plus a frame index per choice point, so resuming is a pop and a
 /// short unwind rather than a copy of the whole slot array.
 struct Trail {
-    /// `(pc, pos)` to resume from, innermost last.
-    stack: Vec<(u32, usize)>,
+    /// `(pc, pos, aux)` to resume from, innermost last. `aux` is where a
+    /// [`Op::RunScan`] run began, and unused by every other entry.
+    stack: Vec<(u32, usize, usize)>,
     /// Capture slots overwritten since a choice point, with their old values.
     slots: Vec<(u16, i32)>,
     /// Where each choice point's run of `slots` begins.
@@ -535,11 +575,18 @@ impl Trail {
     /// Records a choice point resuming at `pc` with the input at `pos`.
     #[inline]
     fn push(&mut self, pc: u32, pos: usize, progress_regs: usize) {
+        self.push_run(pc, pos, 0, progress_regs);
+    }
+
+    /// [`Self::push`] for a [`Op::RunScan`] choice point, which also has to
+    /// remember where its run began.
+    #[inline]
+    fn push_run(&mut self, pc: u32, pos: usize, start: usize, progress_regs: usize) {
         self.slot_frames.push(self.slots.len());
         if progress_regs > 0 {
             self.reg_frames.push(self.regs.len());
         }
-        self.stack.push((pc, pos));
+        self.stack.push((pc, pos, start));
     }
 
     /// Notes that `slot` is about to be overwritten, so the innermost choice
@@ -572,12 +619,14 @@ impl Trail {
         &mut self,
         pc: &mut u32,
         pos: &mut usize,
+        run_start: &mut usize,
         slots: &mut [i32],
         progress: &mut [usize],
     ) -> bool {
-        let Some((saved_pc, saved_pos)) = self.stack.pop() else {
+        let Some((saved_pc, saved_pos, saved_start)) = self.stack.pop() else {
             return false;
         };
+        *run_start = saved_start;
         if let Some(frame) = self.slot_frames.pop() {
             for (slot, val) in self.slots.drain(frame..).rev() {
                 slots[slot as usize] = val;
@@ -619,6 +668,13 @@ impl Compiler {
 
     fn pc(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    /// Interns a byte class and returns its index in `byte_classes`.
+    fn byte_class(&mut self, ranges: Vec<ByteRange>) -> u16 {
+        let index = self.byte_classes.len() as u16;
+        self.byte_classes.push(ByteClass::new(ranges));
+        index
     }
 
     /// Reserves a progress register for one repetition.
@@ -786,6 +842,31 @@ impl Compiler {
                         // back edge is only taken if the position moved.
                         let guard =
                             crate::hir::matches_empty(&rep.expr).then(|| self.progress_reg());
+
+                        // A leading run of single-byte matches, consumed before
+                        // the loop and recorded as one choice point instead of
+                        // one per byte. The loop still runs afterwards, so a
+                        // body that can also match something wider (a negated
+                        // class reaches past ASCII) keeps working.
+                        //
+                        // The `min` copies were emitted above, so this loop is
+                        // always a plain `*` and the run has no minimum to meet.
+                        let run_scan = greedy
+                            .then(|| crate::literal::single_byte_run_set(&rep.expr))
+                            .flatten()
+                            .map(|set| {
+                                let ranges: Vec<ByteRange> = set
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, member)| **member != 0)
+                                    .map(|(byte, _)| ByteRange::new(byte as u8, byte as u8))
+                                    .collect();
+                                let class = self.byte_class(ranges);
+                                let scan_pc = self.pc();
+                                self.emit(Op::RunScan { class, retry: 0 });
+                                scan_pc
+                            });
+
                         let loop_start = self.pc();
                         if greedy {
                             let split_pc = self.pc();
@@ -798,6 +879,19 @@ impl Compiler {
                                 self.emit(Op::AssertProgress(reg));
                             }
                             self.emit(Op::Jump(loop_start));
+                            // The retry lands between the loop and its exit, so
+                            // the loop's own exit skips over it and the retry
+                            // falls straight through once it has given a byte
+                            // back.
+                            let retry = self.pc();
+                            if let Some(scan_pc) = run_scan {
+                                self.emit(Op::RunRetry);
+                                if let Op::RunScan { retry: slot, .. } =
+                                    &mut self.code[scan_pc as usize]
+                                {
+                                    *slot = retry;
+                                }
+                            }
                             let exit = self.pc();
                             self.code[split_pc as usize] = Op::Split(exit);
                         } else {

@@ -102,6 +102,54 @@ impl Guard {
     }
 }
 
+/// Builds the [`StayRun`] for the closure about to be pushed at `index`.
+///
+/// `None` when a run would not be equivalent to stepping — see [`StayRun`].
+fn build_stay_run(
+    index: usize,
+    table: &[u8; 256],
+    transitions: &[Transition],
+    matches: &[MatchItem],
+) -> Option<StayRun> {
+    // A guarded match is decided per position, so the positions inside a run
+    // cannot be skipped.
+    if matches.iter().any(|item| !item.guards.is_empty()) {
+        return None;
+    }
+    let index = u32::try_from(index).ok()?;
+
+    // With every match unconditional the first one always fires, so the live
+    // limit is the same at every position and is known here. A transition the
+    // limit kills is dead, and a run of dead transitions would consume input the
+    // scan must stop at.
+    let limit = matches.first().map_or(u32::MAX, |item| item.order);
+
+    let mut stay = Box::new([0u8; 256]);
+    let mut found = false;
+
+    for (byte, &slot) in table.iter().enumerate() {
+        if slot == NO_TRANSITION {
+            continue;
+        }
+        let Some(transition) = transitions.get(slot as usize) else {
+            continue;
+        };
+        if transition.target != index
+            || transition.actions.len != 0
+            || !transition.guards.is_empty()
+            || transition.order > limit
+        {
+            continue;
+        }
+        if let Some(entry) = stay.get_mut(byte) {
+            *entry = 1;
+        }
+        found = true;
+    }
+
+    found.then_some(StayRun { table: stay })
+}
+
 /// A range of [`OnePass::actions`], applied in order.
 #[derive(Debug, Clone, Copy)]
 struct ActionSpan {
@@ -160,6 +208,26 @@ struct Closure {
     /// Matches reachable from this closure, in DFS order. Empty when no match
     /// can end here; more than one entry only when assertions gate them.
     matches: Vec<MatchItem>,
+    /// Bytes the scan may consume in a run rather than one step at a time.
+    stay: Option<StayRun>,
+}
+
+/// Bytes whose transition re-enters the closure that owns them writing nothing.
+///
+/// A byte qualifies when its transition returns to the same closure, writes no
+/// capture and carries no assertion: the scan's entire state is then the
+/// position, so consuming a run of such bytes in a tight loop leaves it exactly
+/// where stepping byte by byte would.
+///
+/// What a run skips is the per-position match check, which is only equivalent
+/// when every position decides it the same way. A closure with a *guarded* match
+/// therefore has no run: under `$` or `\b` the match belongs to the position its
+/// guard holds at, not to the end of the run. With unguarded matches every
+/// position records the same thing and the last one wins — which is the position
+/// the run stops at, so the scan records it on the way back into the main loop.
+#[derive(Debug)]
+struct StayRun {
+    table: Box<[u8; 256]>,
 }
 
 /// A deterministic capture engine for one-pass patterns.
@@ -244,10 +312,12 @@ impl OnePass {
                 });
             }
 
+            let stay = build_stay_run(closures.len(), &table, &transitions, &matches);
             closures.push(Closure {
                 table,
                 transitions,
                 matches,
+                stay,
             });
         }
 
@@ -320,6 +390,15 @@ impl OnePass {
                 }
             }
 
+            // A run of bytes that all re-enter this closure is consumed in one
+            // loop. Re-entering the main loop at its end runs the match check
+            // there, which is the only one of the skipped checks that survives.
+            let run_end = Self::run_stay(closure, input, pos);
+            if run_end != pos {
+                pos = run_end;
+                continue;
+            }
+
             let byte = match input.get(pos) {
                 Some(&byte) => byte,
                 None => break,
@@ -365,6 +444,32 @@ impl OnePass {
             *slot = Some((start, end));
         }
         true
+    }
+
+    /// Consumes a run of bytes that all re-enter the current closure.
+    ///
+    /// Returns the position after the run, which is `pos` when the byte there is
+    /// not part of one. The caller re-enters the main loop there, so the match
+    /// check and the transition still happen at the position the run ends on.
+    #[inline]
+    fn run_stay(closure: &Closure, input: &[u8], pos: usize) -> usize {
+        let Some(ref stay) = closure.stay else {
+            return pos;
+        };
+        // A match already seen at this position outranks the run's transitions,
+        // so they are dead and the scan has to stop rather than consume them.
+        let mut end = pos;
+        while let Some(&byte) = input.get(end) {
+            if stay
+                .table
+                .get(byte as usize)
+                .is_none_or(|member| *member == 0)
+            {
+                break;
+            }
+            end += 1;
+        }
+        end
     }
 
     /// Whether every assertion on a path holds at `pos`.

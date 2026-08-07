@@ -78,7 +78,7 @@ fn failing_search_stays_linear_in_the_input() {
     );
 }
 
-/// The same bound for the one-pass capture search.
+/// The one-pass capture search must stay proportional to the plain search.
 ///
 /// `captures()` on a one-pass pattern locates the match by trying the positions
 /// the prefilter keeps, which is a win only while a failed attempt gives up
@@ -86,22 +86,39 @@ fn failing_search_stays_linear_in_the_input() {
 /// position is a candidate and every attempt reads 64 bytes before failing. The
 /// candidate loop has to notice and hand the rest of the input back to the
 /// linear-time search.
+///
+/// The bound is a ratio against `find` rather than a wall-clock budget, because
+/// the two are measured on the same pattern and the same haystack in the same
+/// run: whatever the machine is doing to one it is doing to the other. An
+/// absolute budget here would have to sit close to this pattern's own linear
+/// cost — `find` alone is milliseconds — and would flip under load.
 #[test]
-fn failing_one_pass_capture_search_stays_linear_in_the_input() {
-    const BUDGET_MS: f64 = 25.0;
+fn failing_one_pass_capture_search_stays_proportional_to_the_search() {
+    // Measured at ~1.5x when linear and ~7.6x when every candidate costs an
+    // attempt, so this separates the two regimes with room on both sides.
+    const MAX_RATIO: f64 = 3.0;
 
     let text = "a".repeat(128 * 1024);
     let re = regexr::Regex::new(r"(a{64})b").unwrap();
+    // One untimed run each, so lazy initialisation is not charged to either.
     assert!(re.captures(&text).is_none());
+    assert!(re.find(&text).is_none());
+
+    let start = Instant::now();
+    assert!(re.find(&text).is_none());
+    let find = start.elapsed().as_secs_f64();
 
     let start = Instant::now();
     assert!(re.captures(&text).is_none());
-    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    let captures = start.elapsed().as_secs_f64();
 
+    let ratio = captures / find.max(f64::MIN_POSITIVE);
     assert!(
-        ms <= BUDGET_MS,
-        "a failing one-pass capture search over 128 KB took {ms:.1} ms, more \
-         than {BUDGET_MS} ms. Each candidate is costing a full attempt, so the \
-         search is quadratic in the input."
+        ratio <= MAX_RATIO,
+        "a failing capture search cost {ratio:.1}x the same failing find \
+         ({:.1} ms against {:.1} ms), more than {MAX_RATIO}x. Each candidate is \
+         costing a full one-pass attempt, so the search is quadratic in the input.",
+        captures * 1000.0,
+        find * 1000.0
     );
 }

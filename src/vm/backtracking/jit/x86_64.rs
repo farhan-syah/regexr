@@ -659,6 +659,224 @@ impl BacktrackingCompiler {
         Ok(Some(count as usize))
     }
 
+    /// Emits an unbounded greedy repetition of a single byte class as one run.
+    ///
+    /// The general greedy loop pushes a 32-byte choice point *per iteration*, so
+    /// `[^'"]*` over a 30-byte string costs 30 pushes and 30 stack-limit checks —
+    /// the loop spends more on bookkeeping than on reading the input.
+    ///
+    /// A single byte class consumes exactly one byte, captures nothing, and can
+    /// never fail in a way that needs an inner choice point, so the whole run is
+    /// decided by a scan: read forward while the byte is a member, then push ONE
+    /// choice point recording where the run began. Backtracking gives a byte back
+    /// at a time from that record, which is the same sequence of attempts the
+    /// per-byte loop made.
+    ///
+    /// Only the unbounded forms take this path. A finite `max` needs a second
+    /// live register for the scan limit, and `{n,n}` is already handled by
+    /// [`Self::emit_exact_repetition`].
+    fn try_emit_greedy_class_run(
+        &mut self,
+        expr: &HirExpr,
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+    ) -> Result<bool> {
+        if !greedy || max.is_some() {
+            return Ok(false);
+        }
+        let set = match expr {
+            HirExpr::Class(class) => crate::literal::byte_class_set(&class.ranges, class.negated),
+            // A one-byte literal is a class with a single member.
+            HirExpr::Literal(bytes) if bytes.len() == 1 => {
+                crate::literal::byte_class_set(&[(bytes[0], bytes[0])], false)
+            }
+            _ => return Ok(false),
+        };
+
+        let table = self.asm.new_dynamic_label();
+        let retry = self.asm.new_dynamic_label();
+        let push = self.asm.new_dynamic_label();
+        let done = self.asm.new_dynamic_label();
+
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov r15, rcx              // r15 = where the run began
+            ; lea r14, [=>table]
+            ; scan:
+            ; cmp rcx, rsi
+            ; jae >scanned
+            ; movzx eax, BYTE [rdi + rcx]
+            ; cmp BYTE [r14 + rax], 0
+            ; je >scanned
+            ; inc rcx
+            ; jmp <scan
+            ; scanned:
+        );
+        self.byte_set_tables.push((table, set));
+
+        // The run is as long as it can be. Anything shorter than `min` is not a
+        // match at all, so there is nothing to record.
+        if min > 0 {
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov rax, rcx
+                ; sub rax, r15
+                ; cmp rax, min as i32
+                ; jb =>self.backtrack_label
+            );
+        }
+
+        dynasm!(self.asm
+            ; .arch x64
+            ; jmp =>push
+
+            ; =>retry
+            // The handler restored rcx = the length we last tried, r15 = the run
+            // start. Give one byte back; below the run start there is nothing
+            // left to try.
+            ; cmp rcx, r15
+            ; jbe =>self.backtrack_label
+            ; dec rcx
+        );
+
+        if min > 0 {
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov rax, rcx
+                ; sub rax, r15
+                ; cmp rax, min as i32
+                ; jb =>self.backtrack_label
+            );
+        }
+
+        // An enclosing group ends wherever this run now ends.
+        if let Some(capture) = self.current_capture {
+            let end_offset = (capture as i32) * 16 + 8;
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov QWORD [r12 + end_offset], rcx
+            );
+        }
+
+        dynasm!(self.asm
+            ; .arch x64
+            ; =>push
+            // One choice point for the whole run: [length tried, resume, start_pos, run start].
+            ; sub QWORD [rbp - 8], 1
+            ; jbe =>self.budget_exhausted_label
+            ; lea rax, [rbx + 40]
+            ; cmp rax, rbp
+            ; ja =>self.stack_exhausted_label
+            ; mov QWORD [rbx], rcx
+            ; lea rax, [=>retry]
+            ; mov QWORD [rbx + 8], rax
+            ; mov QWORD [rbx + 16], r13
+            ; mov QWORD [rbx + 24], r15
+            ; add rbx, 32
+            ; =>done
+        );
+        let _ = done;
+
+        Ok(true)
+    }
+
+    /// Consumes a leading run of single-byte matches before the general greedy
+    /// loop starts, recording the whole run as one choice point.
+    ///
+    /// `[^'"]` lowers to an ASCII class beside a UTF-8 trie, so it is not a bare
+    /// class and cannot take [`Self::try_emit_greedy_class_run`] — yet on ASCII
+    /// text every iteration matches the class half. This scans that half at one
+    /// byte per iteration of a five-instruction loop and leaves the general loop
+    /// to start wherever the scan stopped, so the multi-byte half still works.
+    ///
+    /// The run's choice point is pushed *before* the general loop's, so
+    /// backtracking gives back the general loop's iterations first and only then
+    /// the run's bytes — the same order, longest first, that the per-iteration
+    /// loop produced on its own.
+    ///
+    /// Returns the label the backtrack handler resumes at, to be emitted once
+    /// the general loop's body is behind us.
+    fn emit_run_prologue(&mut self, expr: &HirExpr) -> Result<Option<dynasmrt::DynamicLabel>> {
+        let Some(set) = crate::literal::single_byte_run_set(expr) else {
+            return Ok(None);
+        };
+
+        let table = self.asm.new_dynamic_label();
+        let retry = self.asm.new_dynamic_label();
+
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov r14, rcx              // r14 = where the run began
+            ; lea r15, [=>table]        // dead once the loop below zeroes it
+            ; scan:
+            ; cmp rcx, rsi
+            ; jae >scanned
+            ; movzx eax, BYTE [rdi + rcx]
+            ; cmp BYTE [r15 + rax], 0
+            ; je >scanned
+            ; inc rcx
+            ; jmp <scan
+            ; scanned:
+            // One choice point for the run: [length tried, resume, start_pos, run start].
+            ; sub QWORD [rbp - 8], 1
+            ; jbe =>self.budget_exhausted_label
+            ; lea rax, [rbx + 40]
+            ; cmp rax, rbp
+            ; ja =>self.stack_exhausted_label
+            ; mov QWORD [rbx], rcx
+            ; lea rax, [=>retry]
+            ; mov QWORD [rbx + 8], rax
+            ; mov QWORD [rbx + 16], r13
+            ; mov QWORD [rbx + 24], r14
+            ; add rbx, 32
+        );
+        self.byte_set_tables.push((table, set));
+
+        Ok(Some(retry))
+    }
+
+    /// Emits the resume path for [`Self::emit_run_prologue`]: give one byte of
+    /// the run back and carry on from where the repetition ends.
+    fn emit_run_retry(&mut self, retry: dynasmrt::DynamicLabel, loop_done: dynasmrt::DynamicLabel) {
+        dynasm!(self.asm
+            ; .arch x64
+            ; jmp >past
+            ; =>retry
+            // The handler restored rcx = the length last tried and r15 = the run
+            // start. Below the run start there is nothing left to give back.
+            ; cmp rcx, r15
+            ; jbe =>self.backtrack_label
+            ; dec rcx
+        );
+
+        // An enclosing group now ends where the shortened run ends.
+        if let Some(capture) = self.current_capture {
+            let end_offset = (capture as i32) * 16 + 8;
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov QWORD [r12 + end_offset], rcx
+            );
+        }
+
+        dynasm!(self.asm
+            ; .arch x64
+            ; sub QWORD [rbp - 8], 1
+            ; jbe =>self.budget_exhausted_label
+            ; lea rax, [rbx + 40]
+            ; cmp rax, rbp
+            ; ja =>self.stack_exhausted_label
+            ; mov QWORD [rbx], rcx
+            ; lea rax, [=>retry]
+            ; mov QWORD [rbx + 8], rax
+            ; mov QWORD [rbx + 16], r13
+            ; mov QWORD [rbx + 24], r15
+            ; add rbx, 32
+            ; jmp =>loop_done
+            ; past:
+        );
+    }
+
     /// Emits code for repetition (*, +, ?, {n,m}).
     ///
     /// OPTIMIZED: Exact repetitions {n} use a tight loop without backtracking.
@@ -679,6 +897,20 @@ impl BacktrackingCompiler {
                 return self.emit_exact_repetition(expr, min);
             }
         }
+
+        if self.try_emit_greedy_class_run(expr, min, max, greedy)? {
+            return Ok(());
+        }
+
+        // A run of single-byte matches consumed up front, so the general loop
+        // below starts wherever the scan stopped. `None` when the body has no
+        // such bytes, or when the general loop's own minimum count would be
+        // wrong about a run it did not make.
+        let run_retry = if greedy && min == 0 && max.is_none() {
+            self.emit_run_prologue(expr)?
+        } else {
+            None
+        };
 
         // Use r15 as iteration counter
         dynasm!(self.asm
@@ -883,6 +1115,12 @@ impl BacktrackingCompiler {
                     ; jmp =>loop_start
                 );
             }
+        }
+
+        // Reached once the general loop has given back everything it matched;
+        // the run below it hands its bytes back one at a time from here.
+        if let Some(retry) = run_retry {
+            self.emit_run_retry(retry, loop_done);
         }
 
         dynasm!(self.asm
