@@ -275,6 +275,11 @@ impl OnePass {
         let mut slots = vec![None; self.slot_count];
         let mut match_slots = vec![None; self.slot_count];
         let mut match_end: Option<usize> = None;
+        // A recorded match whose snapshot has not been taken yet. It is deferred
+        // until `slots` is about to change, so a greedy tail like `(.+)` — which
+        // re-reaches its match at every byte while writing no slots — copies
+        // once rather than once per byte.
+        let mut pending: Option<(ActionSpan, usize)> = None;
 
         let mut closure = self.closures.first()?;
         let mut pos = start;
@@ -284,8 +289,7 @@ impl OnePass {
             let mut limit = u32::MAX;
             for candidate in &closure.matches {
                 if self.guards_hold(candidate.guards, input, pos) {
-                    match_slots.copy_from_slice(&slots);
-                    self.apply(&mut match_slots, candidate.actions, pos);
+                    pending = Some((candidate.actions, pos));
                     match_end = Some(pos);
                     limit = candidate.order;
                     break;
@@ -312,9 +316,24 @@ impl OnePass {
                 break;
             };
 
-            self.apply(&mut slots, transition.actions, pos);
+            if transition.actions.len != 0 {
+                // `slots` is about to change, so a deferred snapshot has to be
+                // taken from their current values first.
+                // `slots` is about to change, so a deferred snapshot has to be
+                // taken from their current values first.
+                if let Some((actions, at)) = pending.take() {
+                    match_slots.copy_from_slice(&slots);
+                    self.apply(&mut match_slots, actions, at);
+                }
+                self.apply(&mut slots, transition.actions, pos);
+            }
             closure = target;
             pos += 1;
+        }
+
+        if let Some((actions, at)) = pending.take() {
+            match_slots.copy_from_slice(&slots);
+            self.apply(&mut match_slots, actions, at);
         }
 
         let end = match_end?;
@@ -746,10 +765,24 @@ mod tests {
             r"(?:(a)\b)+",
             r"^(a)|^(b)",
             r"\b(a+)$",
+            // A greedy tail re-reaches its match at every byte, which is what
+            // the snapshot-skipping in `captures_at` keys on.
+            r"(a)(.+)",
+            r"(a+)(b*)",
+            r"(\w)(\w*)",
+            r"(a)|(ab)",
+            r"(a)b(c)?",
+            r"((a)(b*))c*",
+            // Consecutive match ends whose capture actions differ, with no slot
+            // write on the transition between them.
+            r"a((x)|(y))?",
+            r"(a)((b)|(c))?",
+            r"(a)(b)?(c)?",
         ];
         const INPUTS: &[&str] = &[
             "", "a", "aa", "aaa", "b", "ab", "ba", "a b", " a ", "x=1", "=", "1", "12", "abc",
-            "abc def", "_", "a\n", "\n", "aab", "x", "xy", "a1", "1a",
+            "abc def", "_", "a\n", "\n", "aab", "x", "xy", "a1", "1a", "abbbb", "abcabc", "aXbXcX",
+            "azzz", "abbc", "abcc", "ax", "ay", "abc", "ac", "a",
         ];
 
         let mut compiled = 0usize;
