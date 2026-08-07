@@ -6,14 +6,17 @@
 //! the generated one has its own stack frame, its own slot representation and
 //! its own deferred-snapshot bookkeeping — none of which any other test targets.
 //!
-//! The oracle is the `regex` crate, so this checks both implementations against
-//! something outside the crate rather than against each other. It runs in every
+//! The oracle is PCRE2, so this checks both implementations against something
+//! outside the crate rather than against each other. It runs in every
 //! configuration; without the feature it is checking the interpreter, which is
 //! also worth doing.
 //!
-//! Haystacks are ASCII on purpose: regexr's `\w`/`\b` are ASCII-only by design
-//! and the `regex` crate's are Unicode, so non-ASCII subjects would report a
-//! deliberate dialect choice as a failure. `pcre2_conformance` covers non-ASCII.
+//! PCRE2 rather than the `regex` crate because half of these patterns are
+//! anchored: regexr's `$` matches before a trailing newline, as PCRE and Python
+//! do, while the `regex` crate's is strict end-of-haystack. Against that oracle
+//! every `$` pattern on a newline-terminated subject would report a deliberate
+//! dialect choice as a failure. PCRE2 runs with UCP off, which also gives `\w`
+//! and `\b` the ASCII meanings regexr gives them.
 
 /// Capture patterns that reach the one-pass engine, chosen for the paths the
 /// generated code has that the interpreter's shape hides: groups that close on a
@@ -36,6 +39,21 @@ const PATTERNS: &[&str] = &[
     r"(\d)(\d)(\d)(\d)(\d)(\d)",
     r"a(\d+)?b",
     r"(ab)+c",
+    // Guarded: each assertion is evaluated at the position its transition fires,
+    // so the compiled engine has to reproduce `Guard::holds` exactly, and the
+    // priority limit a guarded match sets becomes a run-time value.
+    r"^(\d+)-(\d+)$",
+    r"\b(\w+)\b",
+    r"^(\w+)",
+    r"(\w+)$",
+    r"\B(\w)",
+    r"(?m)^(\w+)$",
+    r"\b(\d+)\b-(\w+)",
+    r"^(a+)$",
+    r"^(a+?)$",
+    r"\b(\w)(\w*)\b",
+    r"(?m)(\w+)$",
+    r"^(.+)$",
 ];
 
 const HAYSTACKS: &[&str] = &[
@@ -61,6 +79,15 @@ const HAYSTACKS: &[&str] = &[
     "   ",
     "9",
     "a",
+    "12-34",
+    "word",
+    "two words here",
+    "a\nbb\nccc",
+    "aaa",
+    "aaa\n",
+    "x9y\n",
+    "\n",
+    "trailing\n",
 ];
 
 fn groups(text: &str, caps: Option<regexr::Captures<'_>>) -> Option<Vec<Option<(usize, usize)>>> {
@@ -72,7 +99,15 @@ fn groups(text: &str, caps: Option<regexr::Captures<'_>>) -> Option<Vec<Option<(
     })
 }
 
-fn their_groups(caps: Option<regex::Captures<'_>>) -> Option<Vec<Option<(usize, usize)>>> {
+fn oracle(pattern: &str) -> pcre2::bytes::Regex {
+    pcre2::bytes::RegexBuilder::new()
+        .utf(true)
+        .ucp(false)
+        .build(pattern)
+        .expect("PCRE2 supports the pattern")
+}
+
+fn their_groups(caps: Option<pcre2::bytes::Captures<'_>>) -> Option<Vec<Option<(usize, usize)>>> {
     caps.map(|caps| {
         (0..caps.len())
             .map(|index| caps.get(index).map(|m| (m.start(), m.end())))
@@ -88,11 +123,11 @@ fn one_pass_capture_groups_agree_with_an_independent_engine() {
 
     for pattern in PATTERNS {
         let ours = regexr::Regex::new(pattern).expect("pattern is supported");
-        let theirs = regex::Regex::new(pattern).expect("pattern is supported");
+        let theirs = oracle(pattern);
 
         for haystack in HAYSTACKS {
             let a = groups(haystack, ours.captures(haystack));
-            let b = their_groups(theirs.captures(haystack));
+            let b = their_groups(theirs.captures(haystack.as_bytes()).expect("scan succeeds"));
             compared += 1;
             if a != b {
                 divergences.push(format!(
@@ -120,7 +155,7 @@ fn one_pass_capture_sequences_agree_with_an_independent_engine() {
 
     for pattern in PATTERNS {
         let ours = regexr::Regex::new(pattern).expect("pattern is supported");
-        let theirs = regex::Regex::new(pattern).expect("pattern is supported");
+        let theirs = oracle(pattern);
 
         for haystack in HAYSTACKS {
             let a: Vec<_> = ours
@@ -132,8 +167,9 @@ fn one_pass_capture_sequences_agree_with_an_independent_engine() {
                 })
                 .collect();
             let b: Vec<_> = theirs
-                .captures_iter(haystack)
+                .captures_iter(haystack.as_bytes())
                 .map(|caps| {
+                    let caps = caps.expect("scan succeeds");
                     (0..caps.len())
                         .map(|index| caps.get(index).map(|m| (m.start(), m.end())))
                         .collect::<Vec<_>>()
@@ -164,9 +200,9 @@ fn one_pass_capture_sequences_agree_with_an_independent_engine() {
 fn a_long_greedy_tail_reports_the_last_position() {
     let text = format!("head {}", "z".repeat(64 * 1024));
     let ours = regexr::Regex::new(r"(head) (z+)").unwrap();
-    let theirs = regex::Regex::new(r"(head) (z+)").unwrap();
+    let theirs = oracle(r"(head) (z+)");
 
     let a = groups(&text, ours.captures(&text));
-    let b = their_groups(theirs.captures(&text));
+    let b = their_groups(theirs.captures(text.as_bytes()).expect("scan succeeds"));
     assert_eq!(a, b, "a 64 KB greedy tail must report the same groups");
 }

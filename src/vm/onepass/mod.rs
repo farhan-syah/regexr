@@ -52,7 +52,9 @@
 //! guards hold sets the limit, and a transition after that limit is dead — the
 //! same rule the PikeVM applies, resolved per position instead of once.
 
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+mod aarch64;
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod jit;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod x86_64;
@@ -248,7 +250,7 @@ pub struct OnePass {
     slot_count: usize,
     /// The same machine compiled to native code, when the target and the
     /// pattern allow it. See [`jit::OnePassJit`].
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     jit: Option<jit::OnePassJit>,
 }
 
@@ -335,13 +337,13 @@ impl OnePass {
             actions,
             guards,
             slot_count: nfa.capture_count as usize + 1,
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit: None,
         };
 
         // Compiled from the finished tables, so the emitter reads exactly what
         // the interpreter would have walked.
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let one_pass = Self {
             jit: jit::OnePassJit::compile(&one_pass),
             ..one_pass
@@ -384,7 +386,7 @@ impl OnePass {
             return false;
         }
 
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(ref jit) = self.jit {
             return jit.captures_at_into(input, start, match_slots);
         }
@@ -709,6 +711,39 @@ mod tests {
 
     fn compile(pattern: &str) -> Option<OnePass> {
         OnePass::compile(&build_nfa(pattern))
+    }
+
+    /// A non-greedy exit under an assertion must still report the PikeVM's slots.
+    ///
+    /// This is the shape where the priority limit becomes a run-time value: the
+    /// exit is reached before the loop-back in DFS order, and a guard on it means
+    /// the closure walk does not stop there, so the lower-priority transition is
+    /// recorded too. Engine selection sends non-greedy patterns elsewhere, so
+    /// nothing reaches these through the public API — which is why they are
+    /// asserted here, on the engine built directly.
+    #[test]
+    fn a_guarded_match_kills_lower_priority_transitions() {
+        for pattern in [r"(a+?)$", r"(a*?)$", r"(\w+?)\b", r"(a+?)\b", r"(?m)(a+?)$"] {
+            let nfa = build_nfa(pattern);
+            let one_pass = OnePass::compile(&nfa)
+                .unwrap_or_else(|| panic!("{pattern} should be one-pass, or this test is vacuous"));
+            let vm = PikeVm::new(build_nfa(pattern));
+
+            for input in ["", "a", "aa", "aaa", "aaa\n", "aab", "ab ab"] {
+                let bytes = input.as_bytes();
+                let Some(expected) = vm.captures(bytes) else {
+                    continue;
+                };
+                let Some((start, _)) = expected[0] else {
+                    continue;
+                };
+                assert_eq!(
+                    one_pass.captures_at(bytes, start),
+                    Some(expected),
+                    "pattern {pattern:?} input {input:?}: the limit did not prune"
+                );
+            }
+        }
     }
 
     /// Asserts that the one-pass slots equal the PikeVM's for every input, at the

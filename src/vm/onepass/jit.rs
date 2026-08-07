@@ -20,7 +20,10 @@ use dynasmrt::ExecutableBuffer;
 use super::OnePass;
 
 /// The generated entry point: `(input, len, start, slots) -> match end or -1`.
+#[cfg(target_arch = "x86_64")]
 pub(super) type MatchFn = unsafe extern "sysv64" fn(*const u8, usize, usize, *mut i64) -> i64;
+#[cfg(target_arch = "aarch64")]
+pub(super) type MatchFn = unsafe extern "C" fn(*const u8, usize, usize, *mut i64) -> i64;
 
 /// A finalized code buffer and its entry point.
 pub(super) struct Compiled {
@@ -63,10 +66,15 @@ impl OnePassJit {
                 slot_count: one_pass.slot_count,
             })
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            let _ = one_pass;
-            None
+            if !super::aarch64::is_supported(one_pass) {
+                return None;
+            }
+            Some(Self {
+                compiled: super::aarch64::compile(one_pass)?,
+                slot_count: one_pass.slot_count,
+            })
         }
     }
 

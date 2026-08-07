@@ -24,7 +24,7 @@
 
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
 
-use super::{Action, OnePass, NO_TRANSITION};
+use super::{Action, Guard, GuardSpan, OnePass, NO_TRANSITION};
 
 /// Offsets of the locals, in bytes below `rbp`.
 const MATCH_END: i32 = 8;
@@ -32,7 +32,10 @@ const PENDING_STUB: i32 = 16;
 const PENDING_POS: i32 = 24;
 const OUT_PTR: i32 = 32;
 const START_POS: i32 = 40;
-const LOCALS: i32 = 48;
+/// The live priority limit: a transition ordered after the match that fired at
+/// this position is dead. Reset on entry to every closure.
+const LIMIT: i32 = 48;
+const LOCALS: i32 = 56;
 
 /// Compiles `one_pass` to native code, or returns `None` when it is not a shape
 /// this emitter handles.
@@ -85,23 +88,37 @@ pub(super) fn compile(one_pass: &OnePass) -> Option<super::jit::Compiled> {
     // Emitted after every block, so the tables and stubs are data and code the
     // fall-through never reaches.
     let mut tables: Vec<(dynasmrt::DynamicLabel, [u8; 256])> = Vec::new();
+    // Built on demand: only a pattern with `\b` or `\B` needs it.
+    let mut word_table: Option<dynasmrt::DynamicLabel> = None;
     let mut match_stubs: Vec<(dynasmrt::DynamicLabel, super::ActionSpan)> = Vec::new();
 
     for (index, closure) in one_pass.closures.iter().enumerate() {
         dynasm!(asm ; .arch x64 ; =>*closures.get(index)?);
 
-        // Every match here is unconditional (the driver refuses guards), so the
-        // first one always fires: record it and defer its snapshot.
-        if let Some(item) = closure.matches.first() {
-            let stub = asm.new_dynamic_label();
-            match_stubs.push((stub, item.actions));
-            dynasm!(asm
-                ; .arch x64
-                ; mov [rbp - MATCH_END], rbx
-                ; mov [rbp - PENDING_POS], rbx
-                ; lea rax, [=>stub]
-                ; mov [rbp - PENDING_STUB], rax
-            );
+        // The first match whose assertions hold records a candidate end and
+        // kills every item ordered after it, transitions included.
+        dynasm!(asm ; .arch x64 ; mov DWORD [rbp - LIMIT], -1);
+        if !closure.matches.is_empty() {
+            let recorded = asm.new_dynamic_label();
+            for item in &closure.matches {
+                let next = asm.new_dynamic_label();
+                emit_guards(&mut asm, one_pass, item.guards, next, &mut word_table)?;
+
+                let stub = asm.new_dynamic_label();
+                match_stubs.push((stub, item.actions));
+                let order = i32::try_from(item.order).ok()?;
+                dynasm!(asm
+                    ; .arch x64
+                    ; mov [rbp - MATCH_END], rbx
+                    ; mov [rbp - PENDING_POS], rbx
+                    ; lea rax, [=>stub]
+                    ; mov [rbp - PENDING_STUB], rax
+                    ; mov DWORD [rbp - LIMIT], order
+                    ; jmp =>recorded
+                    ; =>next
+                );
+            }
+            dynasm!(asm ; .arch x64 ; =>recorded);
         }
 
         let table = asm.new_dynamic_label();
@@ -129,6 +146,19 @@ pub(super) fn compile(one_pass: &OnePass) -> Option<super::jit::Compiled> {
 
         for (transition, stub) in closure.transitions.iter().zip(&stubs) {
             dynasm!(asm ; .arch x64 ; =>*stub);
+            // Transitions are disjoint on bytes, so one that is dead or whose
+            // assertion fails has no alternative to fall back to.
+            //
+            // The limit is only ever below a transition's order when a *guarded*
+            // match outranks it, which needs a non-greedy exit — a guarded match
+            // does not cut the closure walk short, so the loop-back behind it is
+            // still recorded. No test reaches the branch, because the byte that
+            // satisfies a boundary or end guard is not one the loop it competes
+            // with can consume. It mirrors `captures_at_into`, which is the
+            // specification, and is kept so the two cannot drift.
+            let order = i32::try_from(transition.order).ok()?;
+            dynasm!(asm ; .arch x64 ; cmp DWORD [rbp - LIMIT], order ; jb =>done);
+            emit_guards(&mut asm, one_pass, transition.guards, done, &mut word_table)?;
             if transition.actions.len != 0 {
                 emit_flush(&mut asm, slot_len)?;
                 emit_actions(&mut asm, one_pass, transition.actions, false)?;
@@ -184,10 +214,109 @@ pub(super) fn compile(one_pass: &OnePass) -> Option<super::jit::Compiled> {
     for (label, table) in &tables {
         dynasm!(asm ; .arch x64 ; =>*label ; .bytes table);
     }
+    if let Some(label) = word_table {
+        let mut members = [0u8; 256];
+        for (byte, entry) in members.iter_mut().enumerate() {
+            *entry = u8::from(crate::hir::unicode::is_word_byte(byte as u8));
+        }
+        dynasm!(asm ; .arch x64 ; =>label ; .bytes members);
+    }
 
     let code = asm.finalize().ok()?;
     let run = unsafe { std::mem::transmute::<*const u8, super::jit::MatchFn>(code.ptr(entry)) };
     Some(super::jit::Compiled { code, run })
+}
+
+/// Emits every assertion on a path, branching to `fail` if one does not hold.
+///
+/// Each is decided at the current position, in `rbx`, against the same rules as
+/// `Guard::holds` — a divergence here would be a divergence between the compiled
+/// engine and the interpreted one, so they are written to mirror it line for
+/// line.
+fn emit_guards(
+    asm: &mut dynasmrt::x64::Assembler,
+    one_pass: &OnePass,
+    span: GuardSpan,
+    fail: dynasmrt::DynamicLabel,
+    word_table: &mut Option<dynasmrt::DynamicLabel>,
+) -> Option<()> {
+    if span.is_empty() {
+        return Some(());
+    }
+    let range = span.start as usize..span.start as usize + span.len as usize;
+    for guard in one_pass.guards.get(range)? {
+        match *guard {
+            // pos == 0
+            Guard::StartOfText => dynasm!(asm
+                ; .arch x64
+                ; test rbx, rbx
+                ; jnz =>fail
+            ),
+            // pos == len, or the one position before a trailing newline
+            Guard::EndOfText => dynasm!(asm
+                ; .arch x64
+                ; cmp rbx, r13
+                ; je >held
+                ; lea rax, [rbx + 1]
+                ; cmp rax, r13
+                ; jne =>fail
+                ; cmp BYTE [r12 + rbx], 0x0a
+                ; jne =>fail
+                ; held:
+            ),
+            // pos == 0, or just after a newline
+            Guard::StartOfLine => dynasm!(asm
+                ; .arch x64
+                ; test rbx, rbx
+                ; jz >held
+                ; mov rax, rbx
+                ; dec rax
+                ; cmp BYTE [r12 + rax], 0x0a
+                ; jne =>fail
+                ; held:
+            ),
+            // pos == len, or just before a newline
+            Guard::EndOfLine => dynasm!(asm
+                ; .arch x64
+                ; cmp rbx, r13
+                ; je >held
+                ; cmp BYTE [r12 + rbx], 0x0a
+                ; jne =>fail
+                ; held:
+            ),
+            Guard::WordBoundary | Guard::NotWordBoundary => {
+                let table = *word_table.get_or_insert_with(|| asm.new_dynamic_label());
+                let boundary = matches!(*guard, Guard::WordBoundary);
+                // rax = whether the byte before pos is a word byte, rdx = the
+                // same for the byte at pos. `\b` holds when they differ.
+                dynasm!(asm
+                    ; .arch x64
+                    ; lea rdi, [=>table]
+                    ; xor eax, eax
+                    ; test rbx, rbx
+                    ; jz >no_before
+                    ; mov rdx, rbx
+                    ; dec rdx
+                    ; movzx edx, BYTE [r12 + rdx]
+                    ; movzx eax, BYTE [rdi + rdx]
+                    ; no_before:
+                    ; xor edx, edx
+                    ; cmp rbx, r13
+                    ; jae >no_after
+                    ; movzx ecx, BYTE [r12 + rbx]
+                    ; movzx edx, BYTE [rdi + rcx]
+                    ; no_after:
+                    ; cmp eax, edx
+                );
+                if boundary {
+                    dynasm!(asm ; .arch x64 ; je =>fail);
+                } else {
+                    dynasm!(asm ; .arch x64 ; jne =>fail);
+                }
+            }
+        }
+    }
+    Some(())
 }
 
 /// Takes the deferred snapshot, if one is outstanding.
@@ -271,8 +400,7 @@ fn emit_actions(
 /// closure's limit is a constant, so the tables below are decided here rather
 /// than re-derived per byte.
 pub(super) fn is_supported(one_pass: &OnePass) -> bool {
-    one_pass.guards.is_empty()
-        && one_pass.closures.len() <= MAX_CLOSURES
+    one_pass.closures.len() <= MAX_CLOSURES
         && one_pass.slot_count <= MAX_SLOTS
         && one_pass
             .closures
