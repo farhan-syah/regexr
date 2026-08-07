@@ -166,58 +166,82 @@ pub(crate) fn count_assertions_in_steps(steps: &[PatternStep]) -> AssertionTally
 /// rather than the JIT, because the JIT's emitted backtracking is unreliable for
 /// the shape. Two shapes are deferred:
 ///
-/// - a greedy quantifier together with a lookaround (the quantifier must give
-///   characters back until the assertion holds, e.g. `[\r\n]+(?=\S)`), and
-/// - two or more greedy quantifiers (adjacent greedy needs nested backtracking,
-///   e.g. `\S+\S+\S`).
+/// - a greedy quantifier together with a *separate* lookaround step (the
+///   quantifier must give characters back until the assertion holds), and
+/// - two or more quantifiers (adjacent greedy needs nested backtracking, e.g.
+///   `\S+\S+\S`).
 ///
-/// The interpreter (`TaggedNfa::find`) handles both correctly via its
-/// boundary-backtracking + recursion, and it is the engine the tiktoken hot path
-/// already uses (the JIT defers all Unicode-class greedy+lookaround to it), so
-/// deferring these byte-class shapes costs nothing on real workloads.
+/// A `Greedy*Lookahead` step is neither: the quantifier and its assertion are
+/// emitted as one unit that backtracks the one against the other, so `\w+(?=x)`
+/// is JIT-compiled rather than deferred. `tests/tagged_jit_agreement.rs` holds
+/// the differential coverage for that.
+///
+/// The interpreter (`TaggedNfa::find`) handles every shape correctly via its
+/// boundary-backtracking + recursion, so deferring costs correctness nothing.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn jit_must_defer(steps: &[PatternStep]) -> bool {
-    let (greedy, lookaround) = count_greedy_and_lookaround(steps);
-    greedy >= 2 || (greedy >= 1 && lookaround >= 1)
+    let counts = count_step_kinds(steps);
+    let quantifiers = counts.greedy + counts.combined;
+    // Nested backtracking across two quantifiers, of any kind.
+    if quantifiers >= 2 {
+        return true;
+    }
+    // A quantifier and a lookaround the generic step sequencing has to satisfy
+    // by giving characters back — the shape the emitted backtracking gets wrong.
+    // A `Greedy*Lookahead` step on its own is not this case: its emitter owns
+    // both halves and backtracks the quantifier against its own assertion, so
+    // `\w+(?=x)` is compiled rather than deferred.
+    quantifiers >= 1 && counts.lookaround >= 1
+}
+
+/// Step kinds that decide whether the JIT can emit a program (see
+/// [`jit_must_defer`]).
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[derive(Default, Clone, Copy)]
+struct StepKinds {
+    /// Greedy quantifiers with no attached assertion.
+    greedy: usize,
+    /// `Greedy*Lookahead`: quantifier and assertion emitted as one unit.
+    combined: usize,
+    /// Lookarounds that stand alone as their own step.
+    lookaround: usize,
 }
 
 /// Returns `(greedy_quantifier_count, lookaround_count)` over a step program,
 /// recursing into `Alt` branches (taking the per-branch max, since only one
 /// branch executes). A combined `Greedy*Lookahead` counts as both.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn count_greedy_and_lookaround(steps: &[PatternStep]) -> (usize, usize) {
-    let mut greedy = 0;
-    let mut look = 0;
+fn count_step_kinds(steps: &[PatternStep]) -> StepKinds {
+    let mut counts = StepKinds::default();
     for step in steps {
         match step {
             PatternStep::GreedyPlus(_)
             | PatternStep::GreedyStar(_)
             | PatternStep::GreedyCodepointPlus(_)
             | PatternStep::NonGreedyPlus(_, _)
-            | PatternStep::NonGreedyStar(_, _) => greedy += 1,
+            | PatternStep::NonGreedyStar(_, _) => counts.greedy += 1,
             PatternStep::GreedyPlusLookahead(_, _, _)
-            | PatternStep::GreedyStarLookahead(_, _, _) => {
-                greedy += 1;
-                look += 1;
-            }
+            | PatternStep::GreedyStarLookahead(_, _, _) => counts.combined += 1,
             PatternStep::PositiveLookahead(_)
             | PatternStep::NegativeLookahead(_)
             | PatternStep::PositiveLookbehind(_, _)
-            | PatternStep::NegativeLookbehind(_, _) => look += 1,
+            | PatternStep::NegativeLookbehind(_, _) => counts.lookaround += 1,
             PatternStep::Alt(branches) => {
-                let (mut bg, mut bl) = (0, 0);
-                for b in branches {
-                    let (g, l) = count_greedy_and_lookaround(b);
-                    bg = bg.max(g);
-                    bl = bl.max(l);
+                let mut worst = StepKinds::default();
+                for branch in branches {
+                    let branch_counts = count_step_kinds(branch);
+                    worst.greedy = worst.greedy.max(branch_counts.greedy);
+                    worst.combined = worst.combined.max(branch_counts.combined);
+                    worst.lookaround = worst.lookaround.max(branch_counts.lookaround);
                 }
-                greedy += bg;
-                look += bl;
+                counts.greedy += worst.greedy;
+                counts.combined += worst.combined;
+                counts.lookaround += worst.lookaround;
             }
             _ => {}
         }
     }
-    (greedy, look)
+    counts
 }
 
 /// Extracts pattern steps from an NFA for fast matching.
