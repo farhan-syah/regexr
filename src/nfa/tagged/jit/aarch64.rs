@@ -511,19 +511,31 @@ impl TaggedNfaJitCompiler {
 
         // Non-ASCII path: call helper function
         // Note: contains() already handles negation internally, so we just check if result is false
+        //
+        // x9/x10/x11 are caller-saved, and the greedy-plus and greedy-star
+        // lookahead emitters hold their backtracking floor and saved position
+        // there across the inner steps, so they are preserved around the call.
+        // The function pointer goes in x16 (IP0), the register the ABI reserves
+        // for exactly this, rather than in x9 — which would destroy the floor
+        // before the call even ran. Saved in pairs to keep the 16-byte stack
+        // alignment `blr` requires.
         dynasm!(self.asm
             ; .arch aarch64
+            ; stp x9, x10, [sp, #-16]!
+            ; str x11, [sp, #-16]!
             // Load cpclass pointer into x1
             ; movz x1, #cls_lo
             ; movk x1, #cls_16, lsl #16
             ; movk x1, #cls_32, lsl #32
             ; movk x1, #cls_48, lsl #48
-            // Load function pointer into x9
-            ; movz x9, #fn_lo
-            ; movk x9, #fn_16, lsl #16
-            ; movk x9, #fn_32, lsl #32
-            ; movk x9, #fn_48, lsl #48
-            ; blr x9
+            // Load function pointer into x16 (IP0)
+            ; movz x16, #fn_lo
+            ; movk x16, #fn_16, lsl #16
+            ; movk x16, #fn_32, lsl #32
+            ; movk x16, #fn_48, lsl #48
+            ; blr x16
+            ; ldr x11, [sp], #16
+            ; ldp x9, x10, [sp], #16
             ; cbz w0, =>fail_label
             ; b =>check_done
         );
@@ -1471,7 +1483,16 @@ impl TaggedNfaJitCompiler {
                 PatternStep::EndOfText => {
                     self.emit_end_of_text(la_mismatch)?;
                 }
-                _ => {}
+                // Anything else must NOT be skipped: dropping a step here drops
+                // the assertion it encodes and the lookahead silently succeeds.
+                // Refuse the whole compile so the engine falls back to the
+                // interpreter, which handles every step.
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::Jit("Unsupported pattern step in greedy+lookahead".to_string()),
+                        "",
+                    ));
+                }
             }
         }
         dynasm!(self.asm ; .arch aarch64 ; b =>la_match ; =>la_mismatch);
@@ -1518,7 +1539,14 @@ impl TaggedNfaJitCompiler {
                 PatternStep::EndOfText => {
                     self.emit_end_of_text(la_mismatch)?;
                 }
-                _ => {}
+                // See the note in `emit_greedy_plus_with_lookahead`: skipping a
+                // step here would silently drop the assertion.
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::Jit("Unsupported pattern step in greedy*+lookahead".to_string()),
+                        "",
+                    ));
+                }
             }
         }
         dynasm!(self.asm ; .arch aarch64 ; b =>la_match ; =>la_mismatch);

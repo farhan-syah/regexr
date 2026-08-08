@@ -39,6 +39,13 @@ const PATTERNS: &[&str] = &[
     r"\d+(?=px\b)",
     r"\w+(?=\.)",
     r"[^,]+(?=,)",
+    // Lookaheads whose body is a Unicode class, so the assertion needs a
+    // codepoint check rather than a byte one. On a non-ASCII follower that check
+    // is a call, and the greedy loop keeps its backtracking floor in a
+    // caller-saved register across it.
+    r"a+(?!\S)",
+    r"a+(?=\S)",
+    r"\w+(?!\p{L})",
     // The tokenizer pattern this engine was built for.
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
 ];
@@ -77,6 +84,11 @@ const INPUTS: &[&str] = &[
     "a,b,,c",
     "file.name.ext",
     "\u{4e2d}\u{6587} \u{3042}",
+    // A greedy run ending against a multi-byte character, which is what sends
+    // the lookahead's codepoint check down its calling path.
+    "aa\u{4e2d}",
+    "e.aae00 a\u{4e2d}\u{4e2d}\n",
+    "a\u{3000}",
     "MiXeD CaSe 42",
 ];
 

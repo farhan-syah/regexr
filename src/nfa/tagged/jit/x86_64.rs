@@ -1989,11 +1989,11 @@ impl TaggedNfaJitCompiler {
         );
         self.emit_is_word_char(curr_word, curr_not_word);
 
-        // curr_is_word = true (stored in r9b)
+        // curr_is_word = true (stored in r11b)
         dynasm!(self.asm
             ; .arch x64
             ; =>curr_word
-            ; mov r9b, 1
+            ; mov r11b, 1
             ; jmp =>boundary_match
         );
 
@@ -2001,14 +2001,14 @@ impl TaggedNfaJitCompiler {
         dynasm!(self.asm
             ; .arch x64
             ; =>curr_not_word
-            ; xor r9d, r9d                 // r9b = 0
+            ; xor r11d, r11d               // r11b = 0
         );
 
-        // Check XOR of r8b and r9b
+        // Check XOR of r8b and r11b
         dynasm!(self.asm
             ; .arch x64
             ; =>boundary_match
-            ; xor r8b, r9b                 // r8b = prev_word XOR curr_word
+            ; xor r8b, r11b                // r8b = prev_word XOR curr_word
         );
 
         if is_boundary {
@@ -3974,6 +3974,12 @@ impl TaggedNfaJitCompiler {
     /// - Jumps to fail_label
     ///
     /// Clobbers: rax, rcx, r8, r9
+    /// Scratch is `rax`, `rcx`, `r8` and `r11`, plus `r10` saved and restored
+    /// around the 4-byte path. Deliberately **not** `r9`: the greedy-plus and
+    /// greedy-star lookahead emitters hold their backtracking floor there across
+    /// the inner steps, so decoding a multi-byte codepoint inside a lookahead
+    /// would overwrite the floor with byte fragments and let backtracking run
+    /// below the first repetition.
     fn emit_utf8_decode(&mut self, fail_label: dynasmrt::DynamicLabel) -> Result<()> {
         use dynasmrt::DynasmLabelApi;
 
@@ -4037,8 +4043,8 @@ impl TaggedNfaJitCompiler {
             ; jge =>fail_label    // Not enough bytes
 
             // Load second byte, check it's a continuation (0x80-0xBF)
-            ; movzx r9d, BYTE [rbx + r8]
-            ; mov ecx, r9d
+            ; movzx r11d, BYTE [rbx + r8]
+            ; mov ecx, r11d
             ; and ecx, 0xC0
             ; cmp ecx, 0x80
             ; jne =>fail_label    // Not a continuation byte
@@ -4046,8 +4052,8 @@ impl TaggedNfaJitCompiler {
             // Decode: cp = (b0 & 0x1F) << 6 | (b1 & 0x3F)
             ; and eax, 0x1F       // eax = b0 & 0x1F
             ; shl eax, 6          // eax = (b0 & 0x1F) << 6
-            ; and r9d, 0x3F       // r9d = b1 & 0x3F
-            ; or eax, r9d         // eax = codepoint
+            ; and r11d, 0x3F      // r11d = b1 & 0x3F
+            ; or eax, r11d        // eax = codepoint
             ; mov ecx, 2
             ; jmp =>done
         );
@@ -4062,8 +4068,8 @@ impl TaggedNfaJitCompiler {
             ; jge =>fail_label    // Not enough bytes
 
             // Check continuation bytes
-            ; movzx r9d, BYTE [rbx + r14 + 1]
-            ; mov ecx, r9d
+            ; movzx r11d, BYTE [rbx + r14 + 1]
+            ; mov ecx, r11d
             ; and ecx, 0xC0
             ; cmp ecx, 0x80
             ; jne =>fail_label
@@ -4077,9 +4083,9 @@ impl TaggedNfaJitCompiler {
             // Decode: cp = (b0 & 0x0F) << 12 | (b1 & 0x3F) << 6 | (b2 & 0x3F)
             ; and eax, 0x0F       // eax = b0 & 0x0F
             ; shl eax, 12         // eax = (b0 & 0x0F) << 12
-            ; and r9d, 0x3F       // r9d = b1 & 0x3F
-            ; shl r9d, 6          // r9d = (b1 & 0x3F) << 6
-            ; or eax, r9d         // eax |= (b1 & 0x3F) << 6
+            ; and r11d, 0x3F      // r11d = b1 & 0x3F
+            ; shl r11d, 6         // r11d = (b1 & 0x3F) << 6
+            ; or eax, r11d        // eax |= (b1 & 0x3F) << 6
             ; and r8d, 0x3F       // r8d = b2 & 0x3F
             ; or eax, r8d         // eax = codepoint
             ; mov ecx, 3
@@ -4096,8 +4102,8 @@ impl TaggedNfaJitCompiler {
             ; jge =>fail_label    // Not enough bytes
 
             // Check continuation bytes
-            ; movzx r9d, BYTE [rbx + r14 + 1]
-            ; mov ecx, r9d
+            ; movzx r11d, BYTE [rbx + r14 + 1]
+            ; mov ecx, r11d
             ; and ecx, 0xC0
             ; cmp ecx, 0x80
             ; jne =>fail_label
@@ -4118,9 +4124,9 @@ impl TaggedNfaJitCompiler {
             // Decode: cp = (b0 & 0x07) << 18 | (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)
             ; and eax, 0x07       // eax = b0 & 0x07
             ; shl eax, 18         // eax = (b0 & 0x07) << 18
-            ; and r9d, 0x3F       // r9d = b1 & 0x3F
-            ; shl r9d, 12         // r9d = (b1 & 0x3F) << 12
-            ; or eax, r9d
+            ; and r11d, 0x3F      // r11d = b1 & 0x3F
+            ; shl r11d, 12        // r11d = (b1 & 0x3F) << 12
+            ; or eax, r11d
             ; and r8d, 0x3F       // r8d = b2 & 0x3F
             ; shl r8d, 6          // r8d = (b2 & 0x3F) << 6
             ; or eax, r8d
@@ -4154,7 +4160,12 @@ impl TaggedNfaJitCompiler {
     ///
     /// On success: falls through
     /// On failure: jumps to fail_label
-    /// Clobbers: rax, rcx, rdi, rsi, caller-saved registers
+    ///
+    /// Clobbers rax, rcx and the argument registers. Non-ASCII code points go
+    /// through a real call, so `r9`, `r10` and `r11` are saved and restored
+    /// around it: they are caller-saved, and the greedy-plus and greedy-star
+    /// lookahead emitters hold their backtracking floor and saved position there
+    /// across the inner steps.
     fn emit_codepoint_class_membership_check(
         &mut self,
         cpclass: &CodepointClass,
@@ -4218,6 +4229,15 @@ impl TaggedNfaJitCompiler {
         #[cfg(target_os = "windows")]
         dynasm!(self.asm
             ; .arch x64
+            // r9/r10/r11 are caller-saved and this is a real call, so the callee
+            // may destroy them. The lookahead emitters keep live state there
+            // (see the note above), and only this slow path can reach a call at
+            // all — the ASCII bitmap below never leaves the JIT. The fourth slot
+            // is padding so the pushes leave the stack alignment unchanged.
+            ; push r9
+            ; push r10
+            ; push r11
+            ; sub rsp, 8
             // eax already contains codepoint
             // Windows x64: args in RCX, RDX
             ; mov ecx, eax                    // rcx = codepoint (zero-extended)
@@ -4226,6 +4246,10 @@ impl TaggedNfaJitCompiler {
             ; mov rax, QWORD check_fn_ptr     // Load function pointer
             ; call rax                        // Call check_membership
             ; add rsp, 32                     // Restore stack
+            ; add rsp, 8
+            ; pop r11
+            ; pop r10
+            ; pop r9
 
             // rax (al) = result: true (1) if in class, false (0) if not
             ; test al, al
@@ -4236,12 +4260,25 @@ impl TaggedNfaJitCompiler {
         #[cfg(not(target_os = "windows"))]
         dynasm!(self.asm
             ; .arch x64
+            // r9/r10/r11 are caller-saved and this is a real call, so the callee
+            // may destroy them. The lookahead emitters keep live state there
+            // (see the note above), and only this slow path can reach a call at
+            // all — the ASCII bitmap below never leaves the JIT. The fourth slot
+            // is padding so the pushes leave the stack alignment unchanged.
+            ; push r9
+            ; push r10
+            ; push r11
+            ; sub rsp, 8
             // eax already contains codepoint
             // System V ABI: args in RDI, RSI
             ; mov edi, eax                    // rdi = codepoint (zero-extended)
             ; mov rsi, QWORD cpclass_ptr as i64  // rsi = cpclass pointer
             ; mov rax, QWORD check_fn_ptr     // Load function pointer
             ; call rax                        // Call check_membership
+            ; add rsp, 8
+            ; pop r11
+            ; pop r10
+            ; pop r9
 
             // rax (al) = result: true (1) if in class, false (0) if not
             ; test al, al
