@@ -135,7 +135,10 @@ impl PikeVm {
     /// thread per position into the same priority queue. Threads seeded earlier
     /// carry a smaller `seq` and therefore outrank later ones, which is exactly
     /// leftmost-first: a match from an earlier start always preempts a later one.
-    /// A backreference pattern is the one exception: see below.
+    ///
+    /// A match beginning at `from` short-circuits that sweep entirely, since no
+    /// match can start earlier. A backreference pattern is the one case that
+    /// cannot use the sweep at all: see below.
     pub fn captures_unanchored_with_context(
         &self,
         input: &[u8],
@@ -168,7 +171,24 @@ impl PikeVm {
             return None;
         }
 
-        self.run(input, ctx, from, true)
+        // A match that starts exactly at `from` is the leftmost one there can
+        // be, so settle that with a single anchored run before paying for the
+        // sweep. The sweep seeds a start thread at every position it advances
+        // over until a match registers, and a greedy pattern only registers one
+        // after consuming its whole run — so on input that matches at nearly
+        // every position, which is what a tokenizer's split pattern does, those
+        // seeds are all redundant and all simulated. Failing here costs one
+        // anchored attempt that the sweep would have made as its first thread
+        // anyway.
+        if crate::nfa::is_utf8_boundary(input, from) {
+            if let Some(caps) = self.run(input, ctx, from, false) {
+                return Some(caps);
+            }
+        }
+        if from == input.len() {
+            return None;
+        }
+        self.run(input, ctx, from + 1, true)
     }
 
     /// Schedules a fresh start thread at `pos`.
