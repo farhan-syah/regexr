@@ -58,6 +58,14 @@ pub struct HirTranslator {
     /// Tracks codepoint ranges during class translation for potential fast matching.
     /// Set during translate_class, consumed by translate if pattern is a simple class.
     current_class_codepoints: Option<(Vec<(u32, u32)>, bool)>,
+    /// Whether something *other than* class lowering already pins this pattern
+    /// to a codepoint-capable engine — see [`pins_codepoint_engine`].
+    ///
+    /// Read from the AST once, before translation, rather than from
+    /// [`HirProps`]: those flags are filled in as translation proceeds, and a
+    /// class is usually lowered before the construct that pins the engine has
+    /// been reached (`\s+(?!\S)` lowers `\s` before it sees the lookahead).
+    engine_already_pinned: bool,
 }
 
 impl HirTranslator {
@@ -68,6 +76,7 @@ impl HirTranslator {
             flags: Flags::default(),
             max_backref: 0,
             current_class_codepoints: None,
+            engine_already_pinned: false,
         }
     }
 
@@ -79,6 +88,7 @@ impl HirTranslator {
     /// [`Self::translate`] under a caller-chosen expansion ceiling.
     pub fn translate_with_limit(&mut self, ast: &Ast, limit: u32) -> Result<Hir> {
         self.flags = ast.flags;
+        self.engine_already_pinned = pins_codepoint_engine(&ast.expr);
         let expr = self.translate_expr(&ast.expr)?;
 
         // Validate backreferences: all referenced groups must exist
@@ -658,7 +668,14 @@ impl HirTranslator {
         // match at a partial codepoint, and unlike the codepoint node it does not
         // pin the whole pattern to the PikeVM — a small class like `\s` would
         // otherwise drag every pattern containing it onto the slowest engine.
-        if utf8_sequences.len() > MAX_TRIE_SEQUENCES {
+        // Unless the pattern is pinned there regardless, in which case the trie
+        // has nothing to win and the codepoint node is the cheaper node. Only a
+        // class with multi-byte members has that choice to make: a pure-ASCII
+        // one is a plain byte class either way, and routing it through a
+        // codepoint node would strand it on the slower engines for nothing.
+        if utf8_sequences.len() > MAX_TRIE_SEQUENCES
+            || (self.engine_already_pinned && !utf8_sequences.is_empty())
+        {
             return self.build_unicode_codepoint_class(byte_ranges, utf8_sequences, negated);
         }
 
@@ -703,7 +720,13 @@ impl HirTranslator {
     /// The bound is on the number of UTF-8 sequences, which is what the NFA and
     /// DFA actually pay for — a code-point count would reject `[^\s]`, whose
     /// complement spans most of Unicode yet expands to only a few sequences.
+    ///
+    /// Also `None` once the engine is pinned regardless — see
+    /// [`pins_codepoint_engine`].
     fn lower_complement_to_bytes(&self, excluded: &[(u32, u32)]) -> Option<HirExpr> {
+        if self.engine_already_pinned {
+            return None;
+        }
         let complement = compile_utf8_complement(excluded);
         if complement.len() > MAX_TRIE_SEQUENCES {
             return None;
@@ -1132,8 +1155,79 @@ fn leading_range_atoms(sequences: &[Utf8Sequence]) -> Vec<(u8, u8)> {
 
 /// Largest UTF-8 expansion a class may have before it becomes a codepoint node
 /// instead. Past this the trie costs more NFA states than the codepoint check
-/// costs in engine restrictions; below it the byte automaton wins outright.
+/// costs in engine restrictions; below it the byte automaton wins outright —
+/// but only when the trie can actually buy a faster engine, which is what
+/// [`pins_codepoint_engine`] decides.
 const MAX_TRIE_SEQUENCES: usize = 64;
+
+/// Whether something other than class lowering already confines the pattern to
+/// an engine that runs codepoint nodes natively.
+///
+/// A byte trie costs NFA states and buys exactly one thing: eligibility for the
+/// byte engines, which cannot execute a codepoint node. A lookaround or a
+/// non-greedy quantifier pins the pattern to the tagged NFA or PikeVM, which run
+/// codepoint nodes directly, so there the eligibility is unreachable and the
+/// extra states are pure cost — the class stays a codepoint node.
+///
+/// Deliberately narrower than the full set of early returns in
+/// [`select_engine_from_hir`](crate::engine::selector::select_engine_from_hir):
+/// an alternation also routes to PikeVM, but its classes still feed literal
+/// prefilters and the JIT's own selection path, so leaving those lowered to
+/// bytes measures better than pinning them. Read off the AST because the HIR
+/// equivalents are not populated yet. A lookaround pins the engine whatever it
+/// contains, so its body needs no further inspection.
+///
+/// A backreference runs the other way. Selection tests it first and routes to
+/// the backtracker, which cannot execute a codepoint node at all — so a
+/// backreference anywhere makes byte lowering mandatory, whatever else the
+/// pattern contains.
+fn pins_codepoint_engine(expr: &Expr) -> bool {
+    !contains_backref(expr) && pins_without_backref(expr)
+}
+
+fn pins_without_backref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alt(branches) => branches.iter().any(pins_without_backref),
+        Expr::Lookaround(_) => true,
+        Expr::Repeat(repeat) => !repeat.greedy || pins_without_backref(&repeat.expr),
+        Expr::Concat(exprs) => exprs.iter().any(pins_without_backref),
+        Expr::Group(group) => pins_without_backref(&group.expr),
+        Expr::Backref(_)
+        | Expr::Empty
+        | Expr::Literal(_)
+        | Expr::Class(_)
+        | Expr::Anchor(_)
+        | Expr::Dot
+        | Expr::GraphemeCluster
+        | Expr::UnicodeProperty { .. }
+        | Expr::PerlClass(_)
+        | Expr::LineBreak
+        | Expr::AnyExceptNewline => false,
+    }
+}
+
+/// Whether a backreference appears anywhere, including inside a lookaround
+/// body — the backtracker compiles the whole pattern, lookarounds and all.
+fn contains_backref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Backref(_) => true,
+        Expr::Alt(branches) => branches.iter().any(contains_backref),
+        Expr::Concat(exprs) => exprs.iter().any(contains_backref),
+        Expr::Repeat(repeat) => contains_backref(&repeat.expr),
+        Expr::Group(group) => contains_backref(&group.expr),
+        Expr::Lookaround(lookaround) => contains_backref(&lookaround.expr),
+        Expr::Empty
+        | Expr::Literal(_)
+        | Expr::Class(_)
+        | Expr::Anchor(_)
+        | Expr::Dot
+        | Expr::GraphemeCluster
+        | Expr::UnicodeProperty { .. }
+        | Expr::PerlClass(_)
+        | Expr::LineBreak
+        | Expr::AnyExceptNewline => false,
+    }
+}
 
 /// The scalar values a class covers, as merged codepoint ranges.
 fn class_codepoint_ranges(
