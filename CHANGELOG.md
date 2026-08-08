@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.3.1] - 2026-08-08
+
+### Fixed
+
+- A small Unicode class stays a codepoint node when a lookaround or non-greedy quantifier already pins the engine. 0.3.0 lowered it to a byte trie regardless, running a tokenizer's split pattern an order of magnitude slower than 0.2.2.
+- The tagged-NFA JIT reported a corrupt match for a greedy quantifier before a lookaround over a Unicode class, such as `a+(?!\S)` on a non-ASCII follower.
+- The AArch64 tagged-NFA JIT silently dropped lookaround steps it does not implement; it now defers to the interpreter.
+
+### Changed
+
+- The PikeVM tries an anchored match at the search start before its unanchored sweep.
+
 ## [0.3.0] - 2026-08-08
 
 ### Added
