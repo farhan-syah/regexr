@@ -30,10 +30,14 @@ pub struct Teddy {
     patterns: Vec<Vec<u8>>,
     /// Nibble lookup table for low nibbles of first byte.
     /// Each bit position corresponds to a pattern ID.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Plain data shared by both vector paths — AVX2 duplicates it into a
+    /// 32-byte register below, NEON feeds it to `vqtbl1q_u8` as-is — so it is
+    /// gated on having *a* vector path rather than on x86 specifically.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     lo_nibble_table: [u8; 16],
     /// Nibble lookup table for high nibbles of first byte.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     hi_nibble_table: [u8; 16],
     /// Pre-computed SIMD lookup table for low nibbles (cached to avoid rebuilding).
     #[cfg(target_arch = "x86_64")]
@@ -62,9 +66,10 @@ impl Teddy {
             return None;
         }
 
-        #[cfg(target_arch = "x86_64")]
+        // The nibble tables are the same for every vector path, so they are
+        // built once here and the architecture only decides what consumes them.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            // Build nibble tables
             let mut lo_nibble_table = [0u8; 16];
             let mut hi_nibble_table = [0u8; 16];
 
@@ -82,13 +87,19 @@ impl Teddy {
                 patterns,
                 lo_nibble_table,
                 hi_nibble_table,
+                // The 32-byte duplicated tables and the AVX2 probe are shapes
+                // only the AVX2 path needs; NEON reads the 16-byte tables
+                // directly and has nothing to detect.
+                #[cfg(target_arch = "x86_64")]
                 lo_simd_table: std::sync::OnceLock::new(),
+                #[cfg(target_arch = "x86_64")]
                 hi_simd_table: std::sync::OnceLock::new(),
+                #[cfg(target_arch = "x86_64")]
                 use_avx2: is_x86_feature_detected!("avx2"),
             })
         }
 
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         Some(Self { patterns })
     }
 
@@ -116,6 +127,13 @@ impl Teddy {
             return None;
         }
 
+        // SAFETY: NEON is mandatory on ARMv8-A, so unlike AVX2 there is nothing
+        // to detect and no `use_avx2`-style flag to carry. Placed first and
+        // cfg-gated as a statement so this is the whole body on aarch64 and the
+        // scalar tail is compiled out rather than left unreachable.
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { self.find_neon_from(haystack, pos) };
+
         #[cfg(target_arch = "x86_64")]
         {
             if self.use_avx2 {
@@ -125,7 +143,8 @@ impl Teddy {
         }
 
         // Scalar fallback
-        self.find_scalar_from(haystack, pos)
+        #[cfg(not(target_arch = "aarch64"))]
+        return self.find_scalar_from(haystack, pos);
     }
 
     /// Finds all matches in the haystack.
@@ -137,6 +156,90 @@ impl Teddy {
             haystack,
             pos: 0,
         }
+    }
+
+    /// NEON-accelerated Teddy search starting from a position.
+    ///
+    /// The same filter as [`Teddy::find_avx2_from`] — look up each byte's low
+    /// and high nibble in a 16-entry table of pattern bitmasks, AND them, and
+    /// verify wherever the result is non-zero — with two simplifications AVX2
+    /// does not get:
+    ///
+    /// * `vqtbl1q_u8` is a true 16-byte table lookup across the whole register,
+    ///   so the table is used as-is. `_mm256_shuffle_epi8` works within two
+    ///   128-bit lanes, which is why the AVX2 path duplicates its table into
+    ///   both halves (`build_simd_table_cached`).
+    /// * `vshrq_n_u8` shifts each byte, giving the high nibble directly. AVX2
+    ///   has no 8-bit shift, hence its `_mm256_srli_epi16` plus a mask.
+    ///
+    /// Nibbles are 0..=15 by construction, so the out-of-range-index-yields-zero
+    /// behaviour of `vqtbl1q_u8` is never reached.
+    ///
+    /// # Safety
+    /// Loads are bounded by `offset + 16 <= len`; the tail goes to the scalar
+    /// search rather than a masked load.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn find_neon_from(&self, haystack: &[u8], start_pos: usize) -> Option<(usize, usize)> {
+        use std::arch::aarch64::*;
+
+        let len = haystack.len();
+        if start_pos >= len {
+            return None;
+        }
+
+        let lo_table = vld1q_u8(self.lo_nibble_table.as_ptr());
+        let hi_table = vld1q_u8(self.hi_nibble_table.as_ptr());
+        let lo_mask = vdupq_n_u8(0x0F);
+
+        let ptr = haystack.as_ptr();
+        let mut offset = start_pos;
+
+        while offset + 16 <= len {
+            let data = vld1q_u8(ptr.add(offset));
+
+            let lo_nibbles = vandq_u8(data, lo_mask);
+            let hi_nibbles = vshrq_n_u8(data, 4);
+
+            let lo_matches = vqtbl1q_u8(lo_table, lo_nibbles);
+            let hi_matches = vqtbl1q_u8(hi_table, hi_nibbles);
+
+            // A lane is a candidate when both nibble lookups agree on at least
+            // one pattern bit.
+            let candidates = vandq_u8(lo_matches, hi_matches);
+
+            // `vceqzq_u8` marks the ZERO lanes, so invert to mark the candidates,
+            // then narrow to four bits per lane (see `neon::first_match_lane`).
+            let nonzero = vmvnq_u8(vceqzq_u8(candidates));
+            let mut remaining = vget_lane_u64(
+                vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(nonzero), 4)),
+                0,
+            );
+
+            while remaining != 0 {
+                let lane = (remaining.trailing_zeros() / 4) as usize;
+                // Clear this lane's whole nibble — `x & (x - 1)` clears one bit,
+                // and each lane occupies four.
+                remaining &= !(0xFu64 << (lane * 4));
+
+                let pos = offset + lane;
+                let byte = *haystack.get_unchecked(pos);
+                let pattern_mask = self.lo_nibble_table[(byte & 0x0F) as usize]
+                    & self.hi_nibble_table[(byte >> 4) as usize];
+
+                for (pat_idx, pattern) in self.patterns.iter().enumerate() {
+                    if (pattern_mask & (1 << pat_idx)) != 0
+                        && pos + pattern.len() <= len
+                        && haystack[pos..pos + pattern.len()] == *pattern
+                    {
+                        return Some((pat_idx, pos));
+                    }
+                }
+            }
+
+            offset += 16;
+        }
+
+        self.find_scalar_from(&haystack[offset..], offset)
     }
 
     /// AVX2-accelerated Teddy search.
