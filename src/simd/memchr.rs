@@ -7,6 +7,13 @@
 ///
 /// Uses AVX2 SIMD when available, falls back to scalar otherwise.
 pub fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    // SAFETY: NEON is mandatory on ARMv8-A, so there is nothing to detect.
+    // Placed first and cfg-gated as a statement so that on aarch64 this is the
+    // whole body — the scalar tail below is compiled out rather than left
+    // unreachable, which would warn under `-D warnings`.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { super::neon::memchr_neon(needle, haystack) };
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -15,8 +22,10 @@ pub fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
 
-    // Scalar fallback
-    memchr_scalar(needle, haystack)
+    // Scalar fallback. Compiled out on aarch64, where the NEON return above
+    // is the whole body.
+    #[cfg(not(target_arch = "aarch64"))]
+    return memchr_scalar(needle, haystack);
 }
 
 /// AVX2-accelerated memchr implementation.
@@ -58,6 +67,11 @@ unsafe fn memchr_avx2(needle: u8, haystack: &[u8]) -> Option<usize> {
 }
 
 /// Scalar implementation of memchr.
+///
+/// Kept even where no dispatch path reaches it — on aarch64 the NEON return is
+/// the whole body — because it is the reference the differential tests compare
+/// the vectorized paths against.
+#[allow(dead_code)]
 #[inline]
 fn memchr_scalar(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
@@ -67,6 +81,13 @@ fn memchr_scalar(needle: u8, haystack: &[u8]) -> Option<usize> {
 ///
 /// Uses AVX2 SIMD when available.
 pub fn memchr2(needle1: u8, needle2: u8, haystack: &[u8]) -> Option<usize> {
+    // SAFETY: NEON is mandatory on ARMv8-A, so there is nothing to detect.
+    // Placed first and cfg-gated as a statement so that on aarch64 this is the
+    // whole body — the scalar tail below is compiled out rather than left
+    // unreachable, which would warn under `-D warnings`.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { super::neon::memchr2_neon(needle1, needle2, haystack) };
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -75,8 +96,9 @@ pub fn memchr2(needle1: u8, needle2: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
 
-    // Scalar fallback
-    haystack.iter().position(|&b| b == needle1 || b == needle2)
+    // Scalar fallback. Compiled out on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    return haystack.iter().position(|&b| b == needle1 || b == needle2);
 }
 
 /// AVX2-accelerated memchr2 implementation.
@@ -126,6 +148,13 @@ unsafe fn memchr2_avx2(needle1: u8, needle2: u8, haystack: &[u8]) -> Option<usiz
 ///
 /// Uses AVX2 SIMD when available.
 pub fn memchr3(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -> Option<usize> {
+    // SAFETY: NEON is mandatory on ARMv8-A, so there is nothing to detect.
+    // Placed first and cfg-gated as a statement so that on aarch64 this is the
+    // whole body — the scalar tail below is compiled out rather than left
+    // unreachable, which would warn under `-D warnings`.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { super::neon::memchr3_neon(needle1, needle2, needle3, haystack) };
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -134,10 +163,11 @@ pub fn memchr3(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -> Option
         }
     }
 
-    // Scalar fallback
-    haystack
+    // Scalar fallback. Compiled out on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    return haystack
         .iter()
-        .position(|&b| b == needle1 || b == needle2 || b == needle3)
+        .position(|&b| b == needle1 || b == needle2 || b == needle3);
 }
 
 /// AVX2-accelerated memchr3 implementation.
@@ -189,6 +219,13 @@ unsafe fn memchr3_avx2(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -
 ///
 /// Uses AVX2 SIMD when available.
 pub fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    // SAFETY: NEON is mandatory on ARMv8-A, so there is nothing to detect.
+    // Placed first and cfg-gated as a statement so that on aarch64 this is the
+    // whole body — the scalar tail below is compiled out rather than left
+    // unreachable, which would warn under `-D warnings`.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { super::neon::memrchr_neon(needle, haystack) };
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -197,8 +234,9 @@ pub fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
 
-    // Scalar fallback
-    haystack.iter().rposition(|&b| b == needle)
+    // Scalar fallback. Compiled out on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    return haystack.iter().rposition(|&b| b == needle);
 }
 
 /// AVX2-accelerated reverse memchr implementation.
@@ -246,6 +284,13 @@ unsafe fn memrchr_avx2(needle: u8, haystack: &[u8]) -> Option<usize> {
 /// Uses AVX2 SIMD range comparison when available.
 /// This is much faster than calling memchr 10 times for digits (0-9).
 pub fn memchr_range(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
+    // SAFETY: NEON is mandatory on ARMv8-A, so there is nothing to detect.
+    // Placed first and cfg-gated as a statement so that on aarch64 this is the
+    // whole body — the scalar tail below is compiled out rather than left
+    // unreachable, which would warn under `-D warnings`.
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { super::neon::memchr_range_neon(lo, hi, haystack) };
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -254,8 +299,9 @@ pub fn memchr_range(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
 
-    // Scalar fallback
-    haystack.iter().position(|&b| b >= lo && b <= hi)
+    // Scalar fallback. Compiled out on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    return haystack.iter().position(|&b| b >= lo && b <= hi);
 }
 
 /// AVX2-accelerated range search.

@@ -1,7 +1,8 @@
 //! SIMD acceleration module for high-performance pattern matching.
 //!
-//! This module provides AVX2-accelerated string search routines with automatic
-//! fallback to scalar implementations when AVX2 is not available.
+//! This module provides vectorized string search routines: AVX2 on x86-64,
+//! NEON on aarch64, and a scalar fallback everywhere else (and on x86-64 CPUs
+//! without AVX2).
 //!
 //! # Features
 //!
@@ -10,8 +11,9 @@
 //!
 //! # Performance
 //!
-//! When AVX2 is available, these routines process 32 bytes per iteration, providing
-//! significant speedup over scalar implementations for long haystacks.
+//! AVX2 processes 32 bytes per iteration and NEON 16, against one byte for the
+//! scalar fallback. NEON needs no runtime detection: it is mandatory in
+//! ARMv8-A, so `#[cfg(target_arch = "aarch64")]` is the whole of the check.
 //!
 //! # Example
 //!
@@ -32,6 +34,7 @@
 mod avx2;
 mod fallback;
 mod memchr;
+mod neon;
 mod teddy;
 
 #[cfg(test)]
@@ -43,7 +46,12 @@ pub use self::teddy::{Teddy, TeddyIter, MAX_PATTERNS, MAX_PATTERN_LEN};
 /// Returns true if AVX2 SIMD instructions are available at runtime.
 ///
 /// This checks the CPU features at runtime and returns true if AVX2 is supported.
-/// When AVX2 is not available, all SIMD functions fall back to scalar implementations.
+///
+/// **Not a test for "is there any SIMD".** It answers only for AVX2, and so
+/// returns `false` on aarch64, where NEON is always used regardless. Nothing in
+/// this crate dispatches on it — each function selects its own path — and new
+/// code must not start, or it would route aarch64 to the scalar fallback while
+/// a NEON implementation sat unused.
 #[inline]
 pub fn is_avx2_available() -> bool {
     #[cfg(target_arch = "x86_64")]

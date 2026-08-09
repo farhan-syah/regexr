@@ -274,3 +274,128 @@ mod integration_tests {
         assert_eq!(memchr3(b'o', b'X', b'Y', haystack), Some(pos_o));
     }
 }
+
+/// The vectorized paths must agree with the scalar definitions, byte for byte.
+///
+/// This is the gate for the NEON port: it is written against the *public*
+/// entry points, so on aarch64 it exercises NEON, on an AVX2 x86-64 machine it
+/// exercises AVX2, and on anything else the scalar fallback — one test, whichever
+/// path the target actually selects.
+///
+/// The cases are the ones a vector loop gets wrong: haystacks shorter than one
+/// register, a match only in the trailing partial chunk, a match exactly on the
+/// final byte, and no match at all (which is where an off-by-one reads past the
+/// end).
+mod differential {
+    use super::super::*;
+
+    fn scalar_memchr(n: u8, h: &[u8]) -> Option<usize> {
+        h.iter().position(|&b| b == n)
+    }
+    fn scalar_memchr2(a: u8, b: u8, h: &[u8]) -> Option<usize> {
+        h.iter().position(|&x| x == a || x == b)
+    }
+    fn scalar_memchr3(a: u8, b: u8, c: u8, h: &[u8]) -> Option<usize> {
+        h.iter().position(|&x| x == a || x == b || x == c)
+    }
+    fn scalar_memrchr(n: u8, h: &[u8]) -> Option<usize> {
+        h.iter().rposition(|&b| b == n)
+    }
+    fn scalar_range(lo: u8, hi: u8, h: &[u8]) -> Option<usize> {
+        h.iter().position(|&b| b >= lo && b <= hi)
+    }
+
+    /// Deterministic pseudo-random bytes — no dev-dependency, and a failure is
+    /// reproducible from the seed alone.
+    fn haystack(seed: u64, len: usize, alphabet: u8) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8 % alphabet
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_entry_point_agrees_with_its_scalar_definition() {
+        // Lengths straddling the 16-byte NEON and 32-byte AVX2 vector widths,
+        // including one under each and one just past each boundary.
+        for len in [0usize, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 257] {
+            for seed in 0..8u64 {
+                // A small alphabet makes matches common; a large one makes the
+                // no-match path common. Both are load-bearing.
+                for alphabet in [4u8, 251] {
+                    let h = haystack(seed, len, alphabet);
+                    for needle in [0u8, 1, 3, 250] {
+                        assert_eq!(
+                            memchr(needle, &h),
+                            scalar_memchr(needle, &h),
+                            "memchr({needle}) len={len} seed={seed} alphabet={alphabet}"
+                        );
+                        assert_eq!(
+                            memrchr(needle, &h),
+                            scalar_memrchr(needle, &h),
+                            "memrchr({needle}) len={len} seed={seed} alphabet={alphabet}"
+                        );
+                    }
+                    assert_eq!(
+                        memchr2(1, 2, &h),
+                        scalar_memchr2(1, 2, &h),
+                        "memchr2 len={len}"
+                    );
+                    assert_eq!(
+                        memchr3(1, 2, 3, &h),
+                        scalar_memchr3(1, 2, 3, &h),
+                        "memchr3 len={len}"
+                    );
+                    assert_eq!(
+                        memchr_range(2, 3, &h),
+                        scalar_range(2, 3, &h),
+                        "memchr_range len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A match placed at each position in turn, so an off-by-one in the vector
+    /// loop or in the scalar tail is caught wherever it hides.
+    #[test]
+    fn a_single_match_is_found_at_every_offset() {
+        const NEEDLE: u8 = 0xAA;
+        for len in [1usize, 16, 17, 32, 33, 48, 70] {
+            for at in 0..len {
+                let mut h = vec![0u8; len];
+                h[at] = NEEDLE;
+                assert_eq!(memchr(NEEDLE, &h), Some(at), "memchr len={len} at={at}");
+                assert_eq!(memrchr(NEEDLE, &h), Some(at), "memrchr len={len} at={at}");
+                assert_eq!(
+                    memchr_range(NEEDLE, NEEDLE, &h),
+                    Some(at),
+                    "range len={len} at={at}"
+                );
+            }
+            // And nothing is found when nothing is there.
+            let empty = vec![0u8; len];
+            assert_eq!(memchr(NEEDLE, &empty), None, "memchr no-match len={len}");
+            assert_eq!(memrchr(NEEDLE, &empty), None, "memrchr no-match len={len}");
+        }
+    }
+
+    /// `memrchr` must return the LAST match, which is the one thing a
+    /// forward-scanning implementation would still pass every other test with.
+    #[test]
+    fn memrchr_returns_the_last_match_not_the_first() {
+        const NEEDLE: u8 = 0x7F;
+        for len in [8usize, 16, 33, 64, 70] {
+            let mut h = vec![0u8; len];
+            h[0] = NEEDLE;
+            h[len - 1] = NEEDLE;
+            assert_eq!(memrchr(NEEDLE, &h), Some(len - 1), "len={len}");
+            assert_eq!(memchr(NEEDLE, &h), Some(0), "len={len}");
+        }
+    }
+}
