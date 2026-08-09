@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.3.2] - 2026-08-09
+
+### Changed
+
+- Literal prefiltering is NEON-accelerated on AArch64, which previously ran the scalar path.
+
 ## [0.3.1] - 2026-08-08
 
 ### Fixed
