@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.4.0] - 2026-08-13
+
+### Fixed
+
+- A lookbehind holds when *any* path through its inner pattern ends at the current position, not only the path that pattern prefers. `(?<=..?)b` failed on `ab` and `(?<!..?)b` matched it; `(?<=\w\w?)x` and `(?<=a.*)x` failed likewise, and `(?<=ab|a)b` failed on `ab` because only the longer branch was tried.
+- A zero-width assertion at the end of a lookaround is part of it. `(?<=a\b)`, `(?<=a$)`, `(?=a$)` and `(?!a\b)` evaluated as `(?<=a)`, `(?=a)` and `(?!a)`, so `(?<=a$)b` matched `ab` and `x(?=a$)` matched `xab`. `\b`, `$`, `\Z` and multiline `$` were all affected, in positive and negative lookahead and lookbehind alike.
+- `find` and `captures` no longer disagree on those patterns, in either direction: on `ax`, `(?<=a\b)x` reported a match from `find` and none from `captures`; on `xab`, `x(?!a\b)` reported none from `find` and a match from `captures`.
+- An assertion following a quantifier is no longer lost to it: `a*(?=b)(?=c)` matched `ab`, ignoring the second lookahead.
+- A greedy byte class no longer loses match priority to a Unicode class that crosses several bytes in one step. `[^\s]*\p{N}` matched only the leading `½` of `½½` rather than the whole input; any greedy byte class followed by a class able to consume a multi-byte codepoint it could have taken itself was affected.
+
+### Added
+
+- `Nfa::compute_max_match_len`, `Nfa::needs_left_context` and `Nfa::compute_splits_codepoints`, with the `Nfa::max_match_len` and `Nfa::splits_codepoints` fields they fill in.
+- `PikeVm::matches_ending_at`, which reports whether any match ends at a given position.
+- `nfa::at_line_start` and `nfa::at_line_end`, now the single definition of multiline `^`/`$` for every engine.
+- `nfa::utf8_automata::utf8_width` and `UTF8_WIDTH_BOUNDARIES`.
+
+### Removed
+
+- `StepExtractor::calc_min_len`.
+
+### Changed
+
+- Evaluating a bounded lookbehind is linear in the input where it was quadratic: the search for a start position is confined to the longest match its inner pattern admits.
+- `Nfa` carries two further public fields, so constructing one with a struct literal no longer compiles. `Nfa::new` is unaffected.
+
 ## [0.3.2] - 2026-08-09
 
 ### Changed
