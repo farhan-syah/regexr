@@ -207,18 +207,27 @@ fn greedy_with_attached_lookahead_is_jit_compiled() {
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 fn lookaround_with_trailing_assertion_is_jit_compiled() {
-    for pattern in [
+    // Word boundaries and the start anchor are emitted by both backends. The
+    // end/line anchors inside a *lookbehind* are x86-64 only: the AArch64
+    // lookbehind refuses them, because emitting them there produced code that
+    // faulted at run time (`(?<=a\Z)x?`). Refusing keeps those patterns on the
+    // interpreter, which is correct — so this asserts the coverage each backend
+    // actually has rather than the coverage we would like it to have.
+    let mut patterns = vec![
         r"(?<=a\b)x",
         r"(?<=a\B)x",
         r"(?<!a\b)x",
-        r"(?<=a$)b",
-        r"(?<!a$)x",
+        r"(?<=^a)x",
         r"x(?=a\b)",
         r"x(?=a\B)",
         r"x(?!a\b)",
         r"x(?=a$)",
         r"\w(?=\w\b)",
-    ] {
+    ];
+    if cfg!(target_arch = "x86_64") {
+        patterns.extend([r"(?<=a$)b", r"(?<!a$)x"]);
+    }
+    for pattern in patterns {
         let jitted = RegexBuilder::new(pattern).jit(true).build().unwrap();
         assert_eq!(
             jitted.engine_name(),

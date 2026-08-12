@@ -886,34 +886,29 @@ impl TaggedNfaJitCompiler {
                     self.emit_range_check(&bc.ranges, inner_mismatch)?;
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
                 }
-                // The walk position lives in x22 here — the same register the
-                // top-level assertions read — so these reuse them unchanged and
-                // consume nothing.
-                PatternStep::WordBoundary => {
-                    self.emit_word_boundary_check(inner_mismatch, true)?;
-                }
-                PatternStep::NotWordBoundary => {
-                    self.emit_word_boundary_check(inner_mismatch, false)?;
-                }
-                PatternStep::StartOfText => {
-                    dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>inner_mismatch);
-                }
-                PatternStep::EndOfText => {
-                    self.emit_end_of_text(inner_mismatch)?;
-                }
-                PatternStep::StartOfLine => {
-                    let at_start = self.asm.new_dynamic_label();
-                    dynasm!(self.asm ; .arch aarch64 ; cbz x22, =>at_start ; sub x1, x22, 1 ; ldrb w0, [x19, x1] ; cmp w0, 0x0A ; b.ne =>inner_mismatch ; =>at_start);
-                }
-                PatternStep::EndOfLine => {
-                    let at_end = self.asm.new_dynamic_label();
-                    dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.eq =>at_end ; ldrb w0, [x19, x22] ; cmp w0, 0x0A ; b.ne =>inner_mismatch ; =>at_end);
-                }
-                _ => {
+                // The walk position is x22 here, but x9 holds the real match
+                // position this restores on the way out — so these go through
+                // the guarded helper rather than calling the clobbering
+                // word-boundary check directly.
+                //
+                // The end/line anchors are deliberately excluded: emitting them
+                // here makes shapes like `(?<=a\Z)x?` JIT-compile into code that
+                // faults at run time on AArch64. Refusing keeps those on the
+                // interpreter, which is correct, and confines this backend to
+                // the assertions the conformance corpus actually covers.
+                PatternStep::EndOfText | PatternStep::StartOfLine | PatternStep::EndOfLine => {
                     return Err(Error::new(
                         ErrorKind::Jit("Unsupported lookbehind step".to_string()),
                         "",
                     ))
+                }
+                other => {
+                    if !self.emit_assertion_at_x22(other, inner_mismatch)? {
+                        return Err(Error::new(
+                            ErrorKind::Jit("Unsupported lookbehind step".to_string()),
+                            "",
+                        ));
+                    }
                 }
             }
         }
@@ -1481,17 +1476,20 @@ impl TaggedNfaJitCompiler {
         Ok(())
     }
 
-    /// Emits one zero-width assertion from a lookahead inner, tested at the
-    /// scan position in x22, jumping to `mismatch` when it does not hold.
+    /// Emits one zero-width assertion tested at the position in x22, jumping to
+    /// `mismatch` when it does not hold.
     ///
     /// Returns `false` for a step that is not a zero-width assertion, leaving
     /// the caller to refuse the compile — silently skipping one would drop the
     /// assertion and let the lookahead succeed where it must not.
     ///
-    /// The greedy+lookahead emitters keep the backtrack floor in x9 and the
-    /// restore position in x10, and `emit_word_boundary_check` clobbers both, so
-    /// they are saved across it on every exit path.
-    fn emit_lookahead_assertion_at_x22(
+    /// `emit_word_boundary_check` clobbers w9 and w10, and every caller keeps
+    /// something live in them — the greedy emitters their backtrack floor and
+    /// restore position, `emit_lookbehind_check` the real match position it
+    /// restores x22 from on the way out. Both are saved across it on every exit
+    /// path, including the failing one; letting x9 go would hand the caller a
+    /// match whose end precedes its start.
+    fn emit_assertion_at_x22(
         &mut self,
         step: &PatternStep,
         mismatch: dynasmrt::DynamicLabel,
@@ -1563,7 +1561,7 @@ impl TaggedNfaJitCompiler {
                 // Refuse the whole compile so the engine falls back to the
                 // interpreter, which handles every step.
                 other => {
-                    if !self.emit_lookahead_assertion_at_x22(other, la_mismatch)? {
+                    if !self.emit_assertion_at_x22(other, la_mismatch)? {
                         return Err(Error::new(
                             ErrorKind::Jit(
                                 "Unsupported pattern step in greedy+lookahead".to_string(),
@@ -1618,7 +1616,7 @@ impl TaggedNfaJitCompiler {
                 // See the note in `emit_greedy_plus_with_lookahead`: skipping a
                 // step here would silently drop the assertion.
                 other => {
-                    if !self.emit_lookahead_assertion_at_x22(other, la_mismatch)? {
+                    if !self.emit_assertion_at_x22(other, la_mismatch)? {
                         return Err(Error::new(
                             ErrorKind::Jit(
                                 "Unsupported pattern step in greedy*+lookahead".to_string(),
