@@ -28,7 +28,7 @@ Each release must have a non-empty section here before it can be tagged — `.gi
 ### Changed
 
 - Evaluating a bounded lookbehind is linear in the input where it was quadratic: the search for a start position is confined to the longest match its inner pattern admits.
-- `Nfa` carries two further public fields, so constructing one with a struct literal no longer compiles. `Nfa::new` is unaffected.
+- `Nfa` is `#[non_exhaustive]` and carries two further public fields, so it can no longer be built with a struct literal from outside the crate; use `Nfa::new`. Later fields will not be breaking.
 
 ## [0.3.2] - 2026-08-09
 

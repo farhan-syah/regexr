@@ -8,7 +8,13 @@ use std::sync::Arc;
 pub type StateId = u32;
 
 /// An NFA (Nondeterministic Finite Automaton).
+///
+/// Marked `#[non_exhaustive]`: the analyses this carries grow as engines learn
+/// to ask new questions of a pattern, and each new field would otherwise break
+/// every caller constructing one with a struct literal. Build with [`Nfa::new`]
+/// and fill the fields in, which is what the builder already does.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Nfa {
     /// All states in the NFA.
     pub states: Vec<NfaState>,
