@@ -811,6 +811,37 @@ impl TaggedNfaJitCompiler {
                         ; =>ok
                     );
                 }
+                // The scan position is x9 here, not x22, so these read x9
+                // directly and consume nothing.
+                PatternStep::StartOfText => {
+                    let not_at = if positive { fail_label } else { inner_match };
+                    dynasm!(self.asm ; .arch aarch64 ; cbnz x9, =>not_at);
+                }
+                PatternStep::StartOfLine => {
+                    let not_at = if positive { fail_label } else { inner_match };
+                    let at_start = self.asm.new_dynamic_label();
+                    dynasm!(self.asm ; .arch aarch64 ; cbz x9, =>at_start ; sub x1, x9, 1 ; ldrb w0, [x19, x1] ; cmp w0, 0x0A ; b.ne =>not_at ; =>at_start);
+                }
+                PatternStep::EndOfLine => {
+                    let not_at = if positive { fail_label } else { inner_match };
+                    let at_end = self.asm.new_dynamic_label();
+                    dynasm!(self.asm ; .arch aarch64 ; cmp x9, x20 ; b.eq =>at_end ; ldrb w0, [x19, x9] ; cmp w0, 0x0A ; b.ne =>not_at ; =>at_end);
+                }
+                // `emit_word_boundary_check` reads x22 and clobbers w9, so the
+                // scan position is swapped in and both registers restored on
+                // every exit — including the failing one, which the outer match
+                // loop continues from.
+                PatternStep::WordBoundary | PatternStep::NotWordBoundary => {
+                    let not_at = if positive { fail_label } else { inner_match };
+                    let is_boundary = matches!(step, PatternStep::WordBoundary);
+                    let bad = self.asm.new_dynamic_label();
+                    let ok = self.asm.new_dynamic_label();
+                    dynasm!(self.asm ; .arch aarch64 ; stp x9, x22, [sp, #-16]! ; mov x22, x9);
+                    self.emit_word_boundary_check(bad, is_boundary)?;
+                    dynasm!(self.asm ; .arch aarch64 ; ldp x9, x22, [sp], #16 ; b =>ok);
+                    dynasm!(self.asm ; .arch aarch64 ; =>bad ; ldp x9, x22, [sp], #16 ; b =>not_at);
+                    dynasm!(self.asm ; .arch aarch64 ; =>ok);
+                }
                 _ => {
                     return Err(Error::new(
                         ErrorKind::Jit("Complex lookahead".to_string()),
@@ -854,6 +885,29 @@ impl TaggedNfaJitCompiler {
                     dynasm!(self.asm ; .arch aarch64 ; ldrb w0, [x19, x22]);
                     self.emit_range_check(&bc.ranges, inner_mismatch)?;
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
+                }
+                // The walk position lives in x22 here — the same register the
+                // top-level assertions read — so these reuse them unchanged and
+                // consume nothing.
+                PatternStep::WordBoundary => {
+                    self.emit_word_boundary_check(inner_mismatch, true)?;
+                }
+                PatternStep::NotWordBoundary => {
+                    self.emit_word_boundary_check(inner_mismatch, false)?;
+                }
+                PatternStep::StartOfText => {
+                    dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>inner_mismatch);
+                }
+                PatternStep::EndOfText => {
+                    self.emit_end_of_text(inner_mismatch)?;
+                }
+                PatternStep::StartOfLine => {
+                    let at_start = self.asm.new_dynamic_label();
+                    dynasm!(self.asm ; .arch aarch64 ; cbz x22, =>at_start ; sub x1, x22, 1 ; ldrb w0, [x19, x1] ; cmp w0, 0x0A ; b.ne =>inner_mismatch ; =>at_start);
+                }
+                PatternStep::EndOfLine => {
+                    let at_end = self.asm.new_dynamic_label();
+                    dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.eq =>at_end ; ldrb w0, [x19, x22] ; cmp w0, 0x0A ; b.ne =>inner_mismatch ; =>at_end);
                 }
                 _ => {
                     return Err(Error::new(
@@ -1427,6 +1481,50 @@ impl TaggedNfaJitCompiler {
         Ok(())
     }
 
+    /// Emits one zero-width assertion from a lookahead inner, tested at the
+    /// scan position in x22, jumping to `mismatch` when it does not hold.
+    ///
+    /// Returns `false` for a step that is not a zero-width assertion, leaving
+    /// the caller to refuse the compile — silently skipping one would drop the
+    /// assertion and let the lookahead succeed where it must not.
+    ///
+    /// The greedy+lookahead emitters keep the backtrack floor in x9 and the
+    /// restore position in x10, and `emit_word_boundary_check` clobbers both, so
+    /// they are saved across it on every exit path.
+    fn emit_lookahead_assertion_at_x22(
+        &mut self,
+        step: &PatternStep,
+        mismatch: dynasmrt::DynamicLabel,
+    ) -> Result<bool> {
+        use dynasmrt::DynasmLabelApi;
+        match step {
+            PatternStep::EndOfText => self.emit_end_of_text(mismatch)?,
+            PatternStep::StartOfText => {
+                dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>mismatch);
+            }
+            PatternStep::StartOfLine => {
+                let at_start = self.asm.new_dynamic_label();
+                dynasm!(self.asm ; .arch aarch64 ; cbz x22, =>at_start ; sub x1, x22, 1 ; ldrb w0, [x19, x1] ; cmp w0, 0x0A ; b.ne =>mismatch ; =>at_start);
+            }
+            PatternStep::EndOfLine => {
+                let at_end = self.asm.new_dynamic_label();
+                dynasm!(self.asm ; .arch aarch64 ; cmp x22, x20 ; b.eq =>at_end ; ldrb w0, [x19, x22] ; cmp w0, 0x0A ; b.ne =>mismatch ; =>at_end);
+            }
+            PatternStep::WordBoundary | PatternStep::NotWordBoundary => {
+                let is_boundary = matches!(step, PatternStep::WordBoundary);
+                let bad = self.asm.new_dynamic_label();
+                let ok = self.asm.new_dynamic_label();
+                dynasm!(self.asm ; .arch aarch64 ; stp x9, x10, [sp, #-16]!);
+                self.emit_word_boundary_check(bad, is_boundary)?;
+                dynasm!(self.asm ; .arch aarch64 ; ldp x9, x10, [sp], #16 ; b =>ok);
+                dynasm!(self.asm ; .arch aarch64 ; =>bad ; ldp x9, x10, [sp], #16 ; b =>mismatch);
+                dynasm!(self.asm ; .arch aarch64 ; =>ok);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn emit_greedy_plus_with_lookahead(
         &mut self,
         ranges: &[ByteRange],
@@ -1460,18 +1558,19 @@ impl TaggedNfaJitCompiler {
                     self.emit_range_check(&bc.ranges, la_mismatch)?;
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
                 }
-                PatternStep::EndOfText => {
-                    self.emit_end_of_text(la_mismatch)?;
-                }
                 // Anything else must NOT be skipped: dropping a step here drops
                 // the assertion it encodes and the lookahead silently succeeds.
                 // Refuse the whole compile so the engine falls back to the
                 // interpreter, which handles every step.
-                _ => {
-                    return Err(Error::new(
-                        ErrorKind::Jit("Unsupported pattern step in greedy+lookahead".to_string()),
-                        "",
-                    ));
+                other => {
+                    if !self.emit_lookahead_assertion_at_x22(other, la_mismatch)? {
+                        return Err(Error::new(
+                            ErrorKind::Jit(
+                                "Unsupported pattern step in greedy+lookahead".to_string(),
+                            ),
+                            "",
+                        ));
+                    }
                 }
             }
         }
@@ -1516,16 +1615,17 @@ impl TaggedNfaJitCompiler {
                     self.emit_range_check(&bc.ranges, la_mismatch)?;
                     dynasm!(self.asm ; .arch aarch64 ; add x22, x22, 1);
                 }
-                PatternStep::EndOfText => {
-                    self.emit_end_of_text(la_mismatch)?;
-                }
                 // See the note in `emit_greedy_plus_with_lookahead`: skipping a
                 // step here would silently drop the assertion.
-                _ => {
-                    return Err(Error::new(
-                        ErrorKind::Jit("Unsupported pattern step in greedy*+lookahead".to_string()),
-                        "",
-                    ));
+                other => {
+                    if !self.emit_lookahead_assertion_at_x22(other, la_mismatch)? {
+                        return Err(Error::new(
+                            ErrorKind::Jit(
+                                "Unsupported pattern step in greedy*+lookahead".to_string(),
+                            ),
+                            "",
+                        ));
+                    }
                 }
             }
         }
