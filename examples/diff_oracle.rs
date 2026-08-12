@@ -200,4 +200,10 @@ fn main() {
     eprintln!(
         "checked={checked} jit_disagrees_with_ref={jit_bad} interp_disagrees_with_ref={nojit_bad}"
     );
+
+    // Exit non-zero on any divergence so this is usable as a CI gate rather than
+    // something a human has to read the output of.
+    if jit_bad > 0 || nojit_bad > 0 {
+        std::process::exit(1);
+    }
 }

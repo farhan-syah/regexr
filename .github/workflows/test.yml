@@ -24,6 +24,8 @@
 #                    where the dynasm `.arch` directives regress
 #   msrv           — the MSRV declared in Cargo.toml, read from the manifest so
 #                    the job and the published contract cannot drift apart
+#   fuzz           — differential oracle against the reference matcher, on
+#                    fixed seeds so a failure is reproducible
 #   audit          — cargo-deny: advisories, licences, sources, banned crates
 
 name: Test
@@ -292,6 +294,60 @@ jobs:
       # MSRV — not the one that ships.
       - name: Check MSRV (all features)
         run: cargo check --features full --lib --locked
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # The engines are checked against `regexr::reference`, the executable spec, on
+  # randomly generated patterns and inputs. Every correctness bug this suite has
+  # caught recently was found here first — the unit tests encode the cases we
+  # already know about, this finds the ones we do not.
+  #
+  # Seeds are fixed rather than random: a red build has to be reproducible
+  # locally with the seed from the log, and a job that fails on a different
+  # pattern every run gets ignored. Widen coverage by adding seeds, not by
+  # randomising them.
+  fuzz:
+    name: Differential Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: fuzz
+
+      # Release mode: the oracle runs both engine builds over every case, and a
+      # debug build is too slow to cover a useful number of them.
+      - name: Build differential oracle
+        run: cargo build --release --features full --example diff_oracle
+
+      # The oracle exits non-zero when any engine disagrees with the reference.
+      # Its stdout carries a `VAL` sample line for roughly one case in forty, so
+      # it goes to a file and only the divergence records are echoed on failure.
+      - name: Differential oracle (fixed seeds)
+        run: |
+          set -uo pipefail
+          status=0
+          for seed in 7 99 2024; do
+            echo "::group::seed ${seed}"
+            if ! ./target/release/examples/diff_oracle 20000 "${seed}" \
+                 > "oracle-${seed}.out"; then
+              status=1
+              echo "::error::engine/reference divergence on seed ${seed}"
+              grep '^REC' "oracle-${seed}.out" | head -40
+            fi
+            echo "::endgroup::"
+          done
+          exit "${status}"
+
+      - name: Upload oracle output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diff-oracle-output
+          path: oracle-*.out
 
   # ─────────────────────────────────────────────────────────────────────────
   # `--exclude-dev`: the bench suite links the engines it measures against,
