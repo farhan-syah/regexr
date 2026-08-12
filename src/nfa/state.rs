@@ -25,6 +25,13 @@ pub struct Nfa {
     /// Precomputed epsilon closures for each state (optional optimization).
     /// When present, `epsilon_closure()` uses these instead of computing on-the-fly.
     pub epsilon_closures: Option<Vec<BTreeSet<StateId>>>,
+    /// Whether any byte transition can match a UTF-8 continuation byte, and so
+    /// leave a thread part-way through a multi-byte codepoint. See
+    /// [`Nfa::compute_splits_codepoints`].
+    ///
+    /// Defaults to `true`: a construction path that never fills this in gets the
+    /// careful behaviour, not the fast one.
+    pub splits_codepoints: bool,
     /// Upper bound, in bytes, on what a match of this NFA can consume — `None`
     /// when unbounded. See [`Nfa::compute_max_match_len`].
     ///
@@ -45,6 +52,7 @@ impl Nfa {
             has_backrefs: false,
             has_lookaround: false,
             epsilon_closures: None,
+            splits_codepoints: true,
             max_match_len: None,
         }
     }
@@ -183,6 +191,22 @@ impl Nfa {
                 | NfaInstruction::NegativeLookahead(ref inner),
             ) => inner.needs_left_context(),
             _ => false,
+        })
+    }
+
+    /// Whether a byte transition in this NFA can match a UTF-8 continuation
+    /// byte (`0x80..=0xBF`), which is what lets a thread sit part-way through a
+    /// multi-byte codepoint.
+    ///
+    /// Matching only ever starts on a codepoint boundary and a codepoint-class
+    /// transition lands on one, so when this is false every thread is always on
+    /// a boundary — and a codepoint transition may then cross its bytes in a
+    /// single step without any byte-wise thread to keep in sync with.
+    pub fn compute_splits_codepoints(&self) -> bool {
+        self.states.iter().any(|s| {
+            s.transitions
+                .iter()
+                .any(|(range, _)| range.start <= 0xBF && range.end >= 0x80)
         })
     }
 

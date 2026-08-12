@@ -193,3 +193,37 @@ fn requesting_jit_never_downgrades_the_engine() {
         }
     }
 }
+
+// =============================================================================
+// Byte-Wise Quantifiers Crossing Multi-Byte Codepoints
+// =============================================================================
+//
+// A `CodepointClass` transition consumes up to four bytes at once while a byte
+// class walks the same span one byte at a time. Both threads must stay
+// comparable on pattern priority, or the one taking bigger strides wins a
+// contest it should lose and the match comes out short.
+
+#[test]
+fn byte_class_star_outranks_a_codepoint_class_it_could_consume() {
+    // `[^\s]*` should take the first `½`, leaving the second for `\p{N}`.
+    let re = regexr::Regex::new(r"[^\s]*\p{N}").unwrap();
+    assert_eq!(re.find("\u{BD}\u{BD}").map(|m| m.end()), Some(4));
+    assert_eq!(re.find("\u{BD}\u{BD}\u{BD}").map(|m| m.end()), Some(6));
+    assert_eq!(re.find("\u{BD}1").map(|m| m.end()), Some(3));
+    // Single-byte codepoints were never affected; keep them covered.
+    assert_eq!(re.find("12").map(|m| m.end()), Some(2));
+}
+
+#[test]
+fn byte_class_star_crossing_three_byte_codepoints() {
+    let re = regexr::Regex::new(r"[^\s]*\p{L}").unwrap();
+    assert_eq!(re.find("\u{E9}\u{E9}").map(|m| m.end()), Some(4));
+    assert_eq!(re.find("\u{4E2D}\u{4E2D}").map(|m| m.end()), Some(6));
+}
+
+#[test]
+fn plus_quantifier_before_a_codepoint_class_is_unaffected() {
+    // `+` consumes before the codepoint class can start, so no contest arises.
+    let re = regexr::Regex::new(r"[^\s]+\p{N}").unwrap();
+    assert_eq!(re.find("\u{BD}\u{BD}").map(|m| m.end()), Some(4));
+}

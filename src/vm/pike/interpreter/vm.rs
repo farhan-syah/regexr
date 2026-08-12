@@ -150,14 +150,21 @@ impl PikeVm {
 
                 while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
                     let pt = ctx.future_threads.pop().unwrap();
-                    self.add_thread(ctx, pt.thread, input, pos);
+                    if pt.thread.pending_skip > 0 {
+                        // Mid-codepoint: nothing to expand, but it still takes
+                        // its place in the priority order so the truncation
+                        // below can preempt it like any other thread.
+                        ctx.current_threads.push(pt.thread);
+                    } else {
+                        self.add_thread(ctx, pt.thread, input, pos);
+                    }
                 }
 
                 if pos == end
-                    && ctx
-                        .current_threads
-                        .iter()
-                        .any(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false))
+                    && ctx.current_threads.iter().any(|t| {
+                        t.pending_skip == 0
+                            && self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false)
+                    })
                 {
                     return true;
                 }
@@ -377,7 +384,14 @@ impl PikeVm {
                 // into `current_threads`, preserving that order.
                 while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
                     let pt = ctx.future_threads.pop().unwrap();
-                    self.add_thread(ctx, pt.thread, input, pos);
+                    if pt.thread.pending_skip > 0 {
+                        // Mid-codepoint: nothing to expand, but it still takes
+                        // its place in the priority order so the truncation
+                        // below can preempt it like any other thread.
+                        ctx.current_threads.push(pt.thread);
+                    } else {
+                        self.add_thread(ctx, pt.thread, input, pos);
+                    }
                 }
 
                 // The first (highest-priority) thread to reach a match wins at
@@ -385,10 +399,10 @@ impl PikeVm {
                 // higher-priority thread that is still consuming may overwrite
                 // this match at a later position (it comes from a more-preferred
                 // path — and, unanchored, from a start at or before this one).
-                let match_idx = ctx
-                    .current_threads
-                    .iter()
-                    .position(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false));
+                let match_idx = ctx.current_threads.iter().position(|t| {
+                    t.pending_skip == 0
+                        && self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false)
+                });
                 if let Some(i) = match_idx {
                     matched = Some((ctx.current_threads[i], pos));
                 }
@@ -456,6 +470,11 @@ impl PikeVm {
         let byte = input.get(pos).copied();
         sched.clear();
         for thread in threads {
+            // A thread part-way through a codepoint just crosses one more byte.
+            if thread.pending_skip > 0 {
+                sched.push((pos + 1, thread.step_mid_codepoint()));
+                continue;
+            }
             let state = match self.nfa.get(thread.state) {
                 Some(s) => s,
                 None => continue,
@@ -470,7 +489,20 @@ impl PikeVm {
             if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
                 if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
                     if cpclass.contains(cp) {
-                        sched.push((pos + len, thread.clone_with_state(*target)));
+                        // Advance one byte at a time. Landing directly on
+                        // `pos + len` would let this thread overtake byte-wise
+                        // threads walking the same span — see `Thread::pending_skip`.
+                        // When nothing in this NFA can walk into the middle of a
+                        // codepoint there is no such thread to stay in step with,
+                        // so cross it in one go.
+                        if len == 1 || !self.nfa.splits_codepoints {
+                            sched.push((pos + len, thread.clone_with_state(*target)));
+                        } else {
+                            sched.push((
+                                pos + 1,
+                                thread.clone_mid_codepoint(*target, (len - 1) as u8),
+                            ));
+                        }
                     }
                 }
             }

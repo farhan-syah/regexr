@@ -106,6 +106,15 @@ const PATTERNS: &[&str] = &[
     r"(?=\B)x",
     r"(?=^\p{L})x",
     r"(?!^\p{L})x",
+    // A byte-class quantifier walking the same span a codepoint class crosses
+    // in one stride: both threads must stay comparable on priority.
+    r"[^\s]*\p{N}",
+    r"[^\s]*\p{L}",
+    r"\S*\p{N}",
+    r"\S+\p{N}+",
+    r"[^\s]+[^\r\n\p{L}\p{N}]*",
+    r"\S{1,3}\p{L}",
+    r"[^\s]{1,3}\p{N}?",
     // The real tiktoken split patterns.
     CL100K,
     O200K,

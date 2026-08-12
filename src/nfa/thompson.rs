@@ -45,6 +45,7 @@ impl NfaBuilder {
 
         // Needs the finished graph, including the match state marked above.
         self.nfa.max_match_len = self.nfa.compute_max_match_len();
+        self.nfa.splits_codepoints = self.nfa.compute_splits_codepoints();
 
         Ok(std::mem::take(&mut self.nfa))
     }

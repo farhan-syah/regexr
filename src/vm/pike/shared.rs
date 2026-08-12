@@ -187,6 +187,21 @@ pub struct Thread {
     /// start. An unanchored pass keeps threads from many different start
     /// positions in flight at once, so the start cannot be a property of the run.
     pub start: usize,
+    /// Bytes of a codepoint transition still to be crossed before this thread
+    /// arrives in `state`. Zero means it is on a codepoint boundary and behaves
+    /// normally; while non-zero the thread occupies `state` but is not expanded
+    /// and cannot match.
+    ///
+    /// A `CodepointClass` consumes up to four bytes, and crossing them in one
+    /// scheduling step let a thread overtake byte-wise threads walking the same
+    /// span — `seq` measures scheduling order, so bigger strides collected
+    /// smaller `seq` and won a priority contest they should have lost. Walking
+    /// the codepoint one byte at a time keeps every thread on the same clock.
+    ///
+    /// Kept as a single byte alongside `state` rather than as a separate pending
+    /// target so the struct stays its original size: threads are copied on every
+    /// scheduling step, and widening them costs more than the fix saves.
+    pub pending_skip: u8,
 }
 
 impl Thread {
@@ -198,6 +213,7 @@ impl Thread {
             capture_head: None,
             capture_count,
             start,
+            pending_skip: 0,
         }
     }
 
@@ -205,7 +221,33 @@ impl Thread {
     /// index, so nothing is allocated and no refcount is touched.
     #[inline]
     pub fn clone_with_state(&self, state: StateId) -> Self {
-        Self { state, ..*self }
+        Self {
+            state,
+            pending_skip: 0,
+            ..*self
+        }
+    }
+
+    /// Copies this thread as one part-way through a codepoint: it takes up
+    /// `target` immediately but idles there for `skip` further bytes.
+    #[inline]
+    pub fn clone_mid_codepoint(&self, target: StateId, skip: u8) -> Self {
+        Self {
+            state: target,
+            pending_skip: skip,
+            ..*self
+        }
+    }
+
+    /// Advances a mid-codepoint thread by one byte; it becomes a normal thread
+    /// once the last byte is crossed.
+    #[inline]
+    pub fn step_mid_codepoint(&self) -> Self {
+        debug_assert!(self.pending_skip > 0);
+        Self {
+            pending_skip: self.pending_skip - 1,
+            ..*self
+        }
     }
 
     /// Records a capture start event. O(1) amortised — one arena push.
