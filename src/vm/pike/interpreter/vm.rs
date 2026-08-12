@@ -90,7 +90,7 @@ impl PikeVm {
     /// Returns true if *any* match of this NFA ends exactly at `end`.
     ///
     /// This is the question a lookbehind asks, and it is not the question
-    /// [`PikeVm::match_at`] answers. `match_at` reports the single
+    /// `match_at` answers. That one reports the single
     /// leftmost-greedy end for one start, so a pattern that could also stop
     /// earlier — `..?`, `\w\w?`, `a|ab` — hides every alternative end behind its
     /// preferred one.
