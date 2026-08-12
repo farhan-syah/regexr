@@ -136,6 +136,17 @@ impl BacktrackingCompiler {
         // Data, so it follows every reachable instruction.
         self.emit_byte_set_tables();
 
+        // `Assembler::finalize` panics if committing the final chunk fails; its
+        // own docs say to commit first. An out-of-range branch surfaces here —
+        // reachable on AArch64, where a conditional branch spans only ±1 MB —
+        // and must refuse the JIT rather than abort the process.
+        self.asm.commit().map_err(|e| {
+            Error::new(
+                ErrorKind::Jit(format!("Failed to commit JIT code: {e:?}")),
+                "",
+            )
+        })?;
+
         // Finalize the code
         let code = self
             .asm

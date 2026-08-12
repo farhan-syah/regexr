@@ -40,6 +40,9 @@ impl ShiftOrJitCompiler {
         let mut ops = dynasmrt::aarch64::Assembler::new().ok()?;
         let find_offset = Self::emit_find(&mut ops, shift_or, masks_ptr, follow_ptr);
 
+        // `finalize` panics on a failed final commit; commit first so an
+        // out-of-range branch declines the JIT instead.
+        ops.commit().ok()?;
         let code = ops.finalize().ok()?;
 
         Some(JitShiftOr::new(

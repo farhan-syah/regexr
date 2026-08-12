@@ -6115,12 +6115,22 @@ impl TaggedNfaJitCompiler {
 
     /// Finalizes compilation and returns the TaggedNfaJit.
     fn finalize(
-        self,
+        mut self,
         find_offset: dynasmrt::AssemblyOffset,
         captures_offset: dynasmrt::AssemblyOffset,
         find_needs_ctx: bool,
         fallback_steps: Option<Vec<PatternStep>>,
     ) -> Result<TaggedNfaJit> {
+        // `Assembler::finalize` panics if committing the final chunk fails; its
+        // own docs say to commit first. An out-of-range branch surfaces here —
+        // reachable on AArch64, where a conditional branch spans only ±1 MB —
+        // and must refuse the JIT rather than abort the process.
+        self.asm.commit().map_err(|e| {
+            Error::new(
+                ErrorKind::Jit(format!("Failed to commit JIT code: {e:?}")),
+                "",
+            )
+        })?;
         let code = self.asm.finalize().map_err(|e| {
             Error::new(
                 ErrorKind::Jit(format!("Failed to finalize JIT code: {:?}", e)),

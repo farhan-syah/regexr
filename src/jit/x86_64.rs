@@ -148,6 +148,17 @@ pub fn compile_states(
     // Emit no-match epilogue (with start position tracking for unanchored)
     emit_no_match(&mut asm, no_match_label, dfa.has_word_boundary)?;
 
+    // `Assembler::finalize` panics if committing the final chunk fails; its
+    // own docs say to commit first to handle that. A branch whose target ended
+    // up out of range surfaces here, and must refuse the JIT rather than abort
+    // the process.
+    asm.commit().map_err(|e| {
+        Error::new(
+            ErrorKind::Jit(format!("Failed to commit assembly: {e:?}")),
+            "",
+        )
+    })?;
+
     // Finalize and get executable buffer (W^X compliant)
     let code = asm.finalize().map_err(|_| {
         Error::new(

@@ -222,6 +222,9 @@ pub(super) fn compile(one_pass: &OnePass) -> Option<super::jit::Compiled> {
         dynasm!(asm ; .arch x64 ; =>label ; .bytes members);
     }
 
+    // `finalize` panics on a failed final commit; commit first so an
+    // out-of-range branch declines the JIT instead.
+    asm.commit().ok()?;
     let code = asm.finalize().ok()?;
     let run = unsafe { std::mem::transmute::<*const u8, super::jit::MatchFn>(code.ptr(entry)) };
     Some(super::jit::Compiled { code, run })

@@ -130,6 +130,16 @@ pub fn compile_states(
     // Emit no-match epilogue
     emit_no_match(&mut asm, no_match_label, dfa.has_word_boundary)?;
 
+    // See the note in the x86-64 backend: commit before finalizing so an
+    // out-of-range branch refuses the JIT instead of panicking. AArch64 makes
+    // this reachable — a conditional branch reaches only ±1 MB.
+    asm.commit().map_err(|e| {
+        Error::new(
+            ErrorKind::Jit(format!("Failed to commit assembly: {e:?}")),
+            "",
+        )
+    })?;
+
     // Finalize and get executable buffer
     let code = asm.finalize().map_err(|_| {
         Error::new(
