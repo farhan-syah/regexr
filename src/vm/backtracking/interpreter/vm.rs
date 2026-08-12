@@ -441,7 +441,7 @@ impl BacktrackingVm {
                 }
 
                 Op::StartLineAnchor => {
-                    if pos == 0 || input[pos - 1] == b'\n' {
+                    if crate::nfa::at_line_start(input, pos) {
                         pc += 1;
                     } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);
@@ -458,7 +458,7 @@ impl BacktrackingVm {
                 }
 
                 Op::EndLineAnchor => {
-                    if pos == input.len() || input[pos] == b'\n' {
+                    if crate::nfa::at_line_end(input, pos) {
                         pc += 1;
                     } else if !trail.pop(&mut pc, &mut pos, &mut run_start, slots, progress) {
                         return Ok(false);

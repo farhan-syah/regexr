@@ -62,6 +62,50 @@ const PATTERNS: &[&str] = &[
     // Backreferences (NFA continuation-state fix).
     r"(\p{L}+)\s\1",
     r"(\S)\1",
+    // Lookbehind whose inner pattern can end at more than one position: the
+    // assertion holds if *any* of those ends lands on the current position.
+    r"(?<=..?)x",
+    r"(?<!..?)x",
+    r"(?<=\w\w?)x",
+    r"(?<!\w\w?)x",
+    r"(?<=a|\sa)x",
+    r"(?<!a|\sa)x",
+    r"(?<=\p{N}{1,3})x",
+    r"(?<!\p{N}{1,3})x",
+    r"(?<=a.*)x",
+    r"(?<!a.*)x",
+    // Zero-width assertions inside a lookaround, in every position — leading,
+    // interior and trailing.
+    r"(?<=a\b)x",
+    r"(?<=a\B)x",
+    r"(?<!a\b)x",
+    r"(?<=a$)x",
+    r"(?<!a$)x",
+    r"(?<=^a)x",
+    r"(?<=\ba)x",
+    r"(?<=a\bb)x",
+    r"(?<=\w\b)x",
+    r"x(?=a\b)",
+    r"x(?=a\B)",
+    r"x(?!a\b)",
+    r"x(?=a$)",
+    r"x(?!a$)",
+    r"x(?=\ba)",
+    r"\w(?=\w\b)",
+    // A quantifier splits into "took some"/"took none"; every assertion after
+    // it belongs to both arms.
+    r"\p{L}*(?=\S)(?=\p{L})",
+    r"[^\s]*(?!\S)(?=a.*)",
+    r"\p{N}*(?=a)(?=\S)",
+    r"\p{L}*\b\b",
+    // Anchors and boundaries inside a lookaround read absolute position, which
+    // a search resuming at a later candidate must not hide.
+    r"(?=^)x",
+    r"(?!^)x",
+    r"(?=\b)x",
+    r"(?=\B)x",
+    r"(?=^\p{L})x",
+    r"(?!^\p{L})x",
     // The real tiktoken split patterns.
     CL100K,
     O200K,

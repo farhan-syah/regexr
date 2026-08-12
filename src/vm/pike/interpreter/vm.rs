@@ -87,6 +87,112 @@ impl PikeVm {
             .and_then(|caps| caps.first().and_then(|c| c.map(|(_, end)| end)))
     }
 
+    /// Returns true if *any* match of this NFA ends exactly at `end`.
+    ///
+    /// This is the question a lookbehind asks, and it is not the question
+    /// [`PikeVm::match_at`] answers. `match_at` reports the single
+    /// leftmost-greedy end for one start, so a pattern that could also stop
+    /// earlier — `..?`, `\w\w?`, `a|ab` — hides every alternative end behind its
+    /// preferred one.
+    ///
+    /// Starts are tried nearest-first against the FULL input, so an inner `\b`,
+    /// `^` or nested lookbehind still sees the bytes to the left of that start —
+    /// matching a detached slice would hide them.
+    ///
+    /// Only starts within [`Nfa::compute_max_match_len`] bytes of `end` can
+    /// reach it, so a bounded inner pattern examines a constant number of them
+    /// rather than every position in the input. Without that bound — an inner
+    /// `a*`, `a.*b` or backreference — the scan is the whole prefix, which is
+    /// what the assertion actually requires.
+    pub fn matches_ending_at(&self, input: &[u8], end: usize) -> bool {
+        if end > input.len() {
+            return false;
+        }
+        let earliest = self
+            .nfa
+            .max_match_len
+            .map_or(0, |max| end.saturating_sub(max));
+        let mut ctx = self.create_context();
+        (earliest..=end).rev().any(|start| {
+            crate::nfa::is_utf8_boundary(input, start)
+                && self.run_ending_at(input, &mut ctx, start, end)
+        })
+    }
+
+    /// Anchored simulation that reports whether some path from `start` reaches a
+    /// match state exactly at `end`.
+    ///
+    /// Unlike [`PikeVm::run`] this keeps every thread alive past a match: `run`
+    /// drops threads of lower priority than a match because leftmost-greedy has
+    /// already been decided there, but an existence question needs the ends that
+    /// preference would have discarded. Threads scheduled beyond `end` are
+    /// simply never visited, which also bounds the work to the span.
+    fn run_ending_at(
+        &self,
+        input: &[u8],
+        ctx: &mut PikeVmContext,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        ctx.reset();
+        ctx.ensure_state_capacity(self.nfa.states.len());
+
+        self.seed_start_thread(ctx, start, self.nfa.capture_count as usize);
+
+        let mut sched: Vec<(usize, Thread)> = Vec::new();
+        let mut pos = start;
+
+        while pos <= end {
+            if matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                // Fresh generation for per-position state deduplication.
+                ctx.generation = ctx.generation.wrapping_add(1);
+                ctx.current_threads.clear();
+
+                while matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                    let pt = ctx.future_threads.pop().unwrap();
+                    self.add_thread(ctx, pt.thread, input, pos);
+                }
+
+                if pos == end
+                    && ctx
+                        .current_threads
+                        .iter()
+                        .any(|t| self.nfa.get(t.state).map(|s| s.is_match).unwrap_or(false))
+                {
+                    return true;
+                }
+
+                self.schedule_consuming_successors(&ctx.current_threads, input, pos, &mut sched);
+                for (npos, th) in sched.drain(..) {
+                    // A successor past `end` can never end at `end`.
+                    if npos > end {
+                        continue;
+                    }
+                    let seq = ctx.seq_counter;
+                    ctx.seq_counter += 1;
+                    ctx.future_threads.push(PendingThread {
+                        pos: npos,
+                        seq,
+                        thread: th,
+                    });
+                }
+            }
+
+            // Threads scheduled back onto `pos` (zero-width backref jump) get
+            // another round before the position advances.
+            if matches!(ctx.future_threads.peek(), Some(pt) if pt.pos == pos) {
+                continue;
+            }
+
+            match ctx.future_threads.peek().map(|pt| pt.pos) {
+                Some(next) => pos = next,
+                None => break,
+            }
+        }
+
+        false
+    }
+
     /// Returns capture groups for a match known to start at position 0.
     ///
     /// This is more efficient than `captures()` when match bounds are already
@@ -289,33 +395,12 @@ impl PikeVm {
                 // Only threads strictly higher priority than the match advance.
                 let limit = match_idx.unwrap_or(ctx.current_threads.len());
 
-                // Schedule consuming successors in priority order so `seq` keeps
-                // reflecting pattern priority. A state may consume a byte
-                // (byte-range transitions) or a codepoint (`CodepointClass`).
-                let byte = input.get(pos).copied();
-                sched.clear();
-                for thread in &ctx.current_threads[..limit] {
-                    let state = match self.nfa.get(thread.state) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    if let Some(b) = byte {
-                        for (range, target) in &state.transitions {
-                            if range.contains(b) {
-                                sched.push((pos + 1, thread.clone_with_state(*target)));
-                            }
-                        }
-                    }
-                    if let Some(NfaInstruction::CodepointClass(cpclass, target)) =
-                        &state.instruction
-                    {
-                        if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
-                            if cpclass.contains(cp) {
-                                sched.push((pos + len, thread.clone_with_state(*target)));
-                            }
-                        }
-                    }
-                }
+                self.schedule_consuming_successors(
+                    &ctx.current_threads[..limit],
+                    input,
+                    pos,
+                    &mut sched,
+                );
                 for (npos, th) in sched.drain(..) {
                     let seq = ctx.seq_counter;
                     ctx.seq_counter += 1;
@@ -350,6 +435,46 @@ impl PikeVm {
             caps[0] = Some((thread.start, end));
             caps
         })
+    }
+
+    /// Collects the consuming successors of `threads` at `pos` into `sched`.
+    ///
+    /// A state consumes either a byte (its byte-range transitions) or a whole
+    /// codepoint (`CodepointClass`); both land in the same buffer so the caller
+    /// can assign `seq` to them in one pass and keep the queue ordered by
+    /// pattern priority. `threads` is a slice rather than the whole thread list
+    /// because the leftmost-greedy search passes only the prefix that outranks
+    /// the match it just found, while an existence search passes all of them.
+    #[inline]
+    fn schedule_consuming_successors(
+        &self,
+        threads: &[Thread],
+        input: &[u8],
+        pos: usize,
+        sched: &mut Vec<(usize, Thread)>,
+    ) {
+        let byte = input.get(pos).copied();
+        sched.clear();
+        for thread in threads {
+            let state = match self.nfa.get(thread.state) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(b) = byte {
+                for (range, target) in &state.transitions {
+                    if range.contains(b) {
+                        sched.push((pos + 1, thread.clone_with_state(*target)));
+                    }
+                }
+            }
+            if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
+                if let Some((cp, len)) = decode_utf8_codepoint(&input[pos..]) {
+                    if cpclass.contains(cp) {
+                        sched.push((pos + len, thread.clone_with_state(*target)));
+                    }
+                }
+            }
+        }
     }
 
     /// Epsilon closure for one seed thread at `pos`, adding all reachable states
@@ -470,17 +595,17 @@ impl PikeVm {
                 }
             }
             NfaInstruction::StartOfLine => {
-                if pos != 0 && input.get(pos - 1) != Some(&b'\n') {
-                    InstructionResult::Kill
-                } else {
+                if crate::nfa::at_line_start(input, pos) {
                     InstructionResult::Continue
+                } else {
+                    InstructionResult::Kill
                 }
             }
             NfaInstruction::EndOfLine => {
-                if pos != input.len() && input.get(pos) != Some(&b'\n') {
-                    InstructionResult::Kill
-                } else {
+                if crate::nfa::at_line_end(input, pos) {
                     InstructionResult::Continue
+                } else {
+                    InstructionResult::Kill
                 }
             }
             NfaInstruction::WordBoundary => {
@@ -580,12 +705,9 @@ impl PikeVm {
 
                 // Arc::clone is O(1) - just increments reference count
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                // A lookbehind `(?<=X)` requires X to end exactly at `pos`. Run the
-                // inner anchored at each candidate start against the FULL input, so
-                // an inner assertion (`\b`, `^`, another lookbehind) sees the bytes
-                // before that start — matching a detached slice would hide them.
-                let found = (0..=pos)
-                    .any(|lookback_start| inner_vm.match_at(input, lookback_start) == Some(pos));
+                // A lookbehind `(?<=X)` requires X to end exactly at `pos` — for
+                // *some* path through X, not just X's preferred one.
+                let found = inner_vm.matches_ending_at(input, pos);
 
                 // Cache the result
                 ctx.lookaround_cache.insert((state_id, pos), found);
@@ -608,10 +730,9 @@ impl PikeVm {
 
                 // Arc::clone is O(1) - just increments reference count
                 let inner_vm = PikeVm::from_arc(Arc::clone(inner_nfa));
-                // Same as the positive form: anchor the inner at each candidate
-                // start over the FULL input and require it to end exactly at `pos`.
-                let found = (0..=pos)
-                    .any(|lookback_start| inner_vm.match_at(input, lookback_start) == Some(pos));
+                // Same as the positive form: `(?<!X)` fails iff some path through
+                // X ends exactly at `pos`.
+                let found = inner_vm.matches_ending_at(input, pos);
 
                 // Cache the result (true = lookaround succeeded, i.e., inner did NOT match)
                 let result = !found;

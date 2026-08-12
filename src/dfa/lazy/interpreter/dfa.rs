@@ -494,7 +494,7 @@ impl LazyDfa {
 
         if start_only {
             let valid_start = if self.ctx.has_multiline_anchors {
-                start == 0 || (start > 0 && input[start - 1] == b'\n')
+                crate::nfa::at_line_start(input, start)
             } else {
                 start == 0
             };
@@ -997,11 +997,8 @@ impl LazyDfa {
                 matches!(instr, NfaInstruction::EndOfLine)
             });
 
-            if needs_end_of_line {
-                let at_end_of_line = pos == input.len() || input.get(pos) == Some(&b'\n');
-                if !at_end_of_line {
-                    return false;
-                }
+            if needs_end_of_line && !crate::nfa::at_line_end(input, pos) {
+                return false;
             }
         }
 

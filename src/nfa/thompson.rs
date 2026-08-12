@@ -43,6 +43,9 @@ impl NfaBuilder {
         }
         self.nfa.matches.push(fragment.end);
 
+        // Needs the finished graph, including the match state marked above.
+        self.nfa.max_match_len = self.nfa.compute_max_match_len();
+
         Ok(std::mem::take(&mut self.nfa))
     }
 

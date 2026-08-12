@@ -3,7 +3,7 @@
 //! Extracts pattern steps from NFA for fast step-based matching.
 
 use super::shared::PatternStep;
-use crate::nfa::{ByteClass, ByteRange, Nfa, NfaInstruction, StateId};
+use crate::nfa::{ByteClass, ByteRange, Nfa, NfaInstruction, NfaState, StateId};
 
 /// Combines greedy quantifiers followed by lookahead into combined variants.
 /// This is needed for both JIT and interpreter to handle backtracking correctly.
@@ -69,6 +69,13 @@ pub fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep
 /// DUPLICATE one assertion and DROP another (`a*(?=\S)$` keeps the lookahead in
 /// both branches but loses the `$`), and the two errors would cancel in a single
 /// total (2 == 1+1) yet differ per kind (lookahead 2≠1, anchor 0≠1).
+///
+/// The tally covers the *whole* assertion tree, descending into the interior of
+/// a lookaround as well as into `Alt` branches. Counting a lookaround as one
+/// opaque unit would make the comparison blind exactly where it is needed: an
+/// assertion dropped inside a lookaround's inner pattern (`(?<=a\b)` extracting
+/// as `(?<=a)`) cancels out on both sides and the guard passes a step program
+/// that no longer means what the pattern means.
 #[derive(Default, PartialEq, Eq)]
 pub(crate) struct AssertionTally {
     lookahead: usize,
@@ -76,6 +83,175 @@ pub(crate) struct AssertionTally {
     anchor: usize,
     word_boundary: usize,
     backref: usize,
+}
+
+impl AssertionTally {
+    fn add(&mut self, other: Self) {
+        self.lookahead += other.lookahead;
+        self.lookbehind += other.lookbehind;
+        self.anchor += other.anchor;
+        self.word_boundary += other.word_boundary;
+        self.backref += other.backref;
+    }
+}
+
+/// The exact number of bytes a step program consumes, or `None` when that is
+/// not the same for every path through it.
+///
+/// A lookbehind is checked by walking forwards from `pos - len`, so `len` has to
+/// be the *exact* width, not a lower bound: start too early and the walk ends
+/// past `pos`, start too late and it ends short. Using a minimum here would read
+/// as exact and silently mislocate the walk — a variable-width step must refuse
+/// extraction instead, which is what `None` makes the caller do.
+///
+/// The match is deliberately exhaustive. A new [`PatternStep`] variant then
+/// fails to compile here rather than falling into a default arm that guesses a
+/// width, which is the only way this stays honest as the step model grows.
+pub(crate) fn fixed_byte_len(steps: &[PatternStep]) -> Option<usize> {
+    let mut len = 0usize;
+    for step in steps {
+        let step_len = match step {
+            PatternStep::Byte(_) | PatternStep::ByteClass(_) => 1,
+            // A codepoint class is fixed-width only when every codepoint it
+            // admits encodes to the same number of UTF-8 bytes.
+            PatternStep::CodepointClass(cpclass, _) => fixed_utf8_width(cpclass)?,
+            // Zero-width: assertions and capture markers.
+            PatternStep::WordBoundary
+            | PatternStep::NotWordBoundary
+            | PatternStep::StartOfText
+            | PatternStep::EndOfText
+            | PatternStep::StartOfLine
+            | PatternStep::EndOfLine
+            | PatternStep::CaptureStart(_)
+            | PatternStep::CaptureEnd(_)
+            | PatternStep::PositiveLookahead(_)
+            | PatternStep::NegativeLookahead(_)
+            | PatternStep::PositiveLookbehind(_, _)
+            | PatternStep::NegativeLookbehind(_, _) => 0,
+            // Repetition, alternation and backreferences all admit more than one
+            // width.
+            PatternStep::GreedyPlus(_)
+            | PatternStep::GreedyStar(_)
+            | PatternStep::GreedyPlusLookahead(_, _, _)
+            | PatternStep::GreedyStarLookahead(_, _, _)
+            | PatternStep::NonGreedyPlus(_, _)
+            | PatternStep::NonGreedyStar(_, _)
+            | PatternStep::GreedyCodepointPlus(_)
+            | PatternStep::Alt(_)
+            | PatternStep::Backref(_) => return None,
+        };
+        len += step_len;
+    }
+    Some(len)
+}
+
+/// The fewest bytes a step program can consume.
+///
+/// Unlike [`fixed_byte_len`] this always answers, because a lower bound exists
+/// even for variable-width steps. It is used as a "can there be enough input
+/// left?" precheck, where under-counting only costs a wasted attempt — but
+/// over-counting would skip real matches, so every arm errs downwards.
+///
+/// Exhaustive for the same reason [`fixed_byte_len`] is: a new [`PatternStep`]
+/// must be classified here deliberately rather than defaulting to zero.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn min_byte_len(steps: &[PatternStep]) -> usize {
+    steps
+        .iter()
+        .map(|s| match s {
+            PatternStep::Byte(_) | PatternStep::ByteClass(_) => 1,
+            // A codepoint is 1..=4 bytes, so at least one.
+            PatternStep::CodepointClass(_, _) | PatternStep::GreedyCodepointPlus(_) => 1,
+            // A `+` runs at least once, a `*` may run not at all.
+            PatternStep::GreedyPlus(_) | PatternStep::GreedyPlusLookahead(_, _, _) => 1,
+            PatternStep::GreedyStar(_) | PatternStep::GreedyStarLookahead(_, _, _) => 0,
+            // Non-greedy quantifiers carry their continuation inside them.
+            PatternStep::NonGreedyPlus(_, suffix) => 1 + min_byte_len(std::slice::from_ref(suffix)),
+            PatternStep::NonGreedyStar(_, suffix) => min_byte_len(std::slice::from_ref(suffix)),
+            // The shortest branch bounds the alternation.
+            PatternStep::Alt(branches) => {
+                branches.iter().map(|b| min_byte_len(b)).min().unwrap_or(0)
+            }
+            // Zero-width: assertions, capture markers, and a backreference,
+            // whose length is unknown here and may be empty.
+            PatternStep::CaptureStart(_)
+            | PatternStep::CaptureEnd(_)
+            | PatternStep::WordBoundary
+            | PatternStep::NotWordBoundary
+            | PatternStep::StartOfText
+            | PatternStep::EndOfText
+            | PatternStep::StartOfLine
+            | PatternStep::EndOfLine
+            | PatternStep::PositiveLookahead(_)
+            | PatternStep::NegativeLookahead(_)
+            | PatternStep::PositiveLookbehind(_, _)
+            | PatternStep::NegativeLookbehind(_, _)
+            | PatternStep::Backref(_) => 0,
+        })
+        .sum()
+}
+
+/// The UTF-8 encoded width shared by every codepoint in `cpclass`, or `None` if
+/// they differ.
+fn fixed_utf8_width(cpclass: &crate::hir::CodepointClass) -> Option<usize> {
+    // A negated class admits codepoints from across the whole range, so it spans
+    // every encoded width.
+    if cpclass.negated || cpclass.ranges.is_empty() {
+        return None;
+    }
+    let width = crate::nfa::utf8_automata::utf8_width;
+    let mut common = None;
+    for &(start, end) in &cpclass.ranges {
+        // A range spanning an encoding boundary is itself variable-width.
+        if width(start) != width(end) {
+            return None;
+        }
+        match common {
+            None => common = Some(width(start)),
+            Some(w) if w == width(start) => {}
+            Some(_) => return None,
+        }
+    }
+    common
+}
+
+/// What an inner lookaround NFA's match state carries, for the linear walks
+/// that stop there.
+pub(crate) enum TerminalAssertion {
+    /// Nothing that affects whether the inner pattern matches.
+    Nothing,
+    /// A zero-width assertion that is still part of the inner pattern and must
+    /// be appended to its step list.
+    Step(PatternStep),
+    /// Something the linear step model cannot represent; extraction must refuse
+    /// so the caller falls back to the PikeVm.
+    Unsupported,
+}
+
+/// Reads the assertion an inner NFA's match state carries.
+///
+/// The inner extractors walk to the match state and stop, so without this the
+/// state's instruction is never read and a trailing assertion silently
+/// disappears — `(?<=a\b)` extracting as `(?<=a)`, `(?=a$)` as `(?=a)`. The two
+/// are different assertions, and dropping one turns an unsupported pattern into
+/// a wrong match rather than a fallback.
+pub(crate) fn terminal_assertion(state: &NfaState) -> TerminalAssertion {
+    match state.instruction {
+        None => TerminalAssertion::Nothing,
+        // Captures are not tracked while evaluating a lookaround.
+        Some(NfaInstruction::CaptureStart(_) | NfaInstruction::CaptureEnd(_)) => {
+            TerminalAssertion::Nothing
+        }
+        Some(NfaInstruction::WordBoundary) => TerminalAssertion::Step(PatternStep::WordBoundary),
+        Some(NfaInstruction::NotWordBoundary) => {
+            TerminalAssertion::Step(PatternStep::NotWordBoundary)
+        }
+        Some(NfaInstruction::StartOfText) => TerminalAssertion::Step(PatternStep::StartOfText),
+        Some(NfaInstruction::EndOfText) => TerminalAssertion::Step(PatternStep::EndOfText),
+        Some(NfaInstruction::StartOfLine) => TerminalAssertion::Step(PatternStep::StartOfLine),
+        Some(NfaInstruction::EndOfLine) => TerminalAssertion::Step(PatternStep::EndOfLine),
+        Some(_) => TerminalAssertion::Unsupported,
+    }
 }
 
 /// Whether an NFA contains any lookaround assertion.
@@ -96,18 +272,25 @@ fn nfa_has_lookaround(nfa: &Nfa) -> bool {
     })
 }
 
-/// Tallies zero-width assertions present in an NFA's own states. Inner
-/// lookaround NFAs are held behind `Arc` and are not part of `nfa.states`, so
-/// each top-level assertion is counted exactly once.
+/// Tallies zero-width assertions reachable from an NFA, including those inside
+/// lookaround inner NFAs (held behind `Arc`, so not part of `nfa.states`).
 pub(crate) fn count_assertions_in_nfa(nfa: &Nfa) -> AssertionTally {
     let mut t = AssertionTally::default();
     for s in &nfa.states {
         match s.instruction {
-            Some(NfaInstruction::PositiveLookahead(_) | NfaInstruction::NegativeLookahead(_)) => {
-                t.lookahead += 1
+            Some(
+                NfaInstruction::PositiveLookahead(ref inner)
+                | NfaInstruction::NegativeLookahead(ref inner),
+            ) => {
+                t.lookahead += 1;
+                t.add(count_assertions_in_nfa(inner));
             }
-            Some(NfaInstruction::PositiveLookbehind(_) | NfaInstruction::NegativeLookbehind(_)) => {
-                t.lookbehind += 1
+            Some(
+                NfaInstruction::PositiveLookbehind(ref inner)
+                | NfaInstruction::NegativeLookbehind(ref inner),
+            ) => {
+                t.lookbehind += 1;
+                t.add(count_assertions_in_nfa(inner));
             }
             Some(
                 NfaInstruction::StartOfText
@@ -126,19 +309,34 @@ pub(crate) fn count_assertions_in_nfa(nfa: &Nfa) -> AssertionTally {
 }
 
 /// Tallies zero-width assertions in a step program, recursing into `Alt`
-/// branches. A genuine alternation carries each assertion in exactly one branch,
-/// so summing branches reproduces the NFA tally; a quantifier `Alt` duplicates
+/// branches and into lookaround interiors.
+///
+/// A genuine alternation carries each assertion in exactly one branch, so
+/// summing branches reproduces the NFA tally; a quantifier `Alt` duplicates
 /// (and/or drops) assertions, producing a tally that differs from the NFA's.
+///
+/// Lookaround interiors are summed for the same reason one level down. The
+/// inner extractors walk to the inner NFA's match state and stop there, so an
+/// assertion compiled onto that state — the `\b` in `(?<=a\b)`, the `$` in
+/// `(?=a$)` — never reaches the step list. Descending here is what turns that
+/// loss into a tally mismatch, and so into a fallback to the PikeVm.
 pub(crate) fn count_assertions_in_steps(steps: &[PatternStep]) -> AssertionTally {
     let mut t = AssertionTally::default();
     for step in steps {
         match step {
-            PatternStep::PositiveLookahead(_)
-            | PatternStep::NegativeLookahead(_)
-            | PatternStep::GreedyPlusLookahead(_, _, _)
-            | PatternStep::GreedyStarLookahead(_, _, _) => t.lookahead += 1,
-            PatternStep::PositiveLookbehind(_, _) | PatternStep::NegativeLookbehind(_, _) => {
-                t.lookbehind += 1
+            PatternStep::PositiveLookahead(inner) | PatternStep::NegativeLookahead(inner) => {
+                t.lookahead += 1;
+                t.add(count_assertions_in_steps(inner));
+            }
+            PatternStep::GreedyPlusLookahead(_, inner, _)
+            | PatternStep::GreedyStarLookahead(_, inner, _) => {
+                t.lookahead += 1;
+                t.add(count_assertions_in_steps(inner));
+            }
+            PatternStep::PositiveLookbehind(inner, _)
+            | PatternStep::NegativeLookbehind(inner, _) => {
+                t.lookbehind += 1;
+                t.add(count_assertions_in_steps(inner));
             }
             PatternStep::StartOfText
             | PatternStep::EndOfText
@@ -148,12 +346,7 @@ pub(crate) fn count_assertions_in_steps(steps: &[PatternStep]) -> AssertionTally
             PatternStep::Backref(_) => t.backref += 1,
             PatternStep::Alt(branches) => {
                 for b in branches {
-                    let bt = count_assertions_in_steps(b);
-                    t.lookahead += bt.lookahead;
-                    t.lookbehind += bt.lookbehind;
-                    t.anchor += bt.anchor;
-                    t.word_boundary += bt.word_boundary;
-                    t.backref += bt.backref;
+                    t.add(count_assertions_in_steps(b));
                 }
             }
             _ => {}
@@ -374,22 +567,26 @@ impl<'a> StepExtractor<'a> {
                         steps.push(PatternStep::NegativeLookahead(inner_steps));
                     }
                     NfaInstruction::PositiveLookbehind(inner_nfa) => {
-                        // Lookbehind uses fixed-length matching, so don't allow GreedyStar/Plus
+                        // The lookbehind walk needs an exact width, not a
+                        // minimum — see `fixed_byte_len`.
                         let inner_steps = self.extract_lookbehind_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let min_len = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, min_len));
+                        let Some(width) = fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
                     }
                     NfaInstruction::NegativeLookbehind(inner_nfa) => {
-                        // Lookbehind uses fixed-length matching, so don't allow GreedyStar/Plus
                         let inner_steps = self.extract_lookbehind_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let min_len = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, min_len));
+                        let Some(width) = fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
                     }
                     NfaInstruction::CodepointClass(cpclass, target) => {
                         // Unicode codepoint class - check for greedy loop pattern
@@ -494,11 +691,11 @@ impl<'a> StepExtractor<'a> {
                 for &target in state.epsilon.iter() {
                     let mut branch_visited = visited.to_vec();
                     branch_visited[current as usize] = true;
-                    let branch_steps = self.extract_branch(target, &mut branch_visited);
-                    if branch_steps.is_empty() {
-                        // If any branch fails to extract, fall back
+                    let Some(branch_steps) = self.extract_branch(target, &mut branch_visited)
+                    else {
+                        // A branch this walk cannot represent: fall back.
                         return Vec::new();
-                    }
+                    };
                     alternatives.push(branch_steps);
                 }
                 steps.push(PatternStep::Alt(alternatives));
@@ -512,7 +709,7 @@ impl<'a> StepExtractor<'a> {
     }
 
     /// Extracts steps from a single branch of an alternation.
-    fn extract_branch(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
+    fn extract_branch(&self, start: StateId, visited: &mut [bool]) -> Option<Vec<PatternStep>> {
         let mut steps = Vec::new();
         let mut current = start;
         let mut iteration = 0;
@@ -521,22 +718,29 @@ impl<'a> StepExtractor<'a> {
             {
                 iteration += 1;
                 if iteration > 10000 {
-                    return Vec::new();
+                    return None;
                 }
             }
 
             if current as usize >= self.nfa.states.len() {
-                return Vec::new();
+                return None;
             }
 
             if visited[current as usize] {
-                return Vec::new();
+                return None;
             }
 
             let state = &self.nfa.states[current as usize];
 
-            // Match state = end of this branch
+            // Match state = end of this branch. An assertion compiled onto it is
+            // still part of the branch — `a*(?=b)(?=c)` puts the `(?=c)` here —
+            // so read it before stopping. See `terminal_assertion`.
             if state.is_match {
+                match terminal_assertion(state) {
+                    TerminalAssertion::Nothing => {}
+                    TerminalAssertion::Step(step) => steps.push(step),
+                    TerminalAssertion::Unsupported => return None,
+                }
                 break;
             }
 
@@ -561,21 +765,21 @@ impl<'a> StepExtractor<'a> {
                     NfaInstruction::PositiveLookahead(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
-                            return Vec::new();
+                            return None;
                         }
                         steps.push(PatternStep::PositiveLookahead(inner_steps));
                     }
                     NfaInstruction::NegativeLookahead(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
-                            return Vec::new();
+                            return None;
                         }
                         steps.push(PatternStep::NegativeLookahead(inner_steps));
                     }
                     NfaInstruction::CodepointClass(cpclass, target) => {
                         // Check for greedy loop pattern: CodepointClass -> epsilon state -> back to current
                         if (*target as usize) >= self.nfa.states.len() {
-                            return Vec::new();
+                            return None;
                         }
 
                         let target_state = &self.nfa.states[*target as usize];
@@ -608,7 +812,7 @@ impl<'a> StepExtractor<'a> {
                         continue;
                     }
                     _ => {
-                        return Vec::new();
+                        return None;
                     }
                 }
             }
@@ -617,7 +821,7 @@ impl<'a> StepExtractor<'a> {
             if !state.transitions.is_empty() {
                 let target = state.transitions[0].1;
                 if !state.transitions.iter().all(|(_, t)| *t == target) {
-                    return Vec::new();
+                    return None;
                 }
 
                 let ranges: Vec<ByteRange> = state.transitions.iter().map(|(r, _)| *r).collect();
@@ -683,7 +887,7 @@ impl<'a> StepExtractor<'a> {
 
                 // Not a greedy star, treat as alternation
                 if self.alternation_loops_back(current) {
-                    return Vec::new();
+                    return None;
                 }
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
@@ -698,14 +902,15 @@ impl<'a> StepExtractor<'a> {
                         any_valid = true;
                         continue;
                     }
-                    let branch_steps = self.extract_branch(target, &mut branch_visited);
-                    // Empty steps means either valid empty branch or extraction failure
-                    // We'll accept it as valid since we're dealing with alternations
+                    // A branch that cannot be represented is not an empty branch.
+                    // Treating the two alike lets the rest of the pattern vanish
+                    // from that arm while the step program still looks complete.
+                    let branch_steps = self.extract_branch(target, &mut branch_visited)?;
                     alternatives.push(branch_steps);
                     any_valid = true;
                 }
                 if !any_valid {
-                    return Vec::new();
+                    return None;
                 }
                 steps.push(PatternStep::Alt(alternatives));
                 break;
@@ -714,7 +919,7 @@ impl<'a> StepExtractor<'a> {
             // More than 2 epsilons - must be alternation
             if state.epsilon.len() > 2 {
                 if self.alternation_loops_back(current) {
-                    return Vec::new();
+                    return None;
                 }
                 let mut alternatives: Vec<Vec<PatternStep>> = Vec::new();
                 let mut any_valid = false;
@@ -728,23 +933,22 @@ impl<'a> StepExtractor<'a> {
                         any_valid = true;
                         continue;
                     }
-                    let branch_steps = self.extract_branch(target, &mut branch_visited);
-                    // Accept empty branches as valid for alternations
+                    let branch_steps = self.extract_branch(target, &mut branch_visited)?;
                     alternatives.push(branch_steps);
                     any_valid = true;
                 }
                 if !any_valid {
-                    return Vec::new();
+                    return None;
                 }
                 steps.push(PatternStep::Alt(alternatives));
                 break;
             }
 
             // Dead end - no transitions, no epsilon, not a match state
-            return Vec::new();
+            return None;
         }
 
-        steps
+        Some(steps)
     }
 
     fn extract_lookaround_steps(&self, inner_nfa: &Nfa) -> Vec<PatternStep> {
@@ -778,6 +982,11 @@ impl<'a> StepExtractor<'a> {
             let state = &inner_nfa.states[current as usize];
 
             if state.is_match {
+                match terminal_assertion(state) {
+                    TerminalAssertion::Nothing => {}
+                    TerminalAssertion::Step(step) => steps.push(step),
+                    TerminalAssertion::Unsupported => return Vec::new(),
+                }
                 break;
             }
 
@@ -942,23 +1151,34 @@ impl<'a> StepExtractor<'a> {
             let state = &inner_nfa.states[current as usize];
 
             if state.is_match {
+                match terminal_assertion(state) {
+                    TerminalAssertion::Nothing => {}
+                    TerminalAssertion::Step(step) => steps.push(step),
+                    TerminalAssertion::Unsupported => return Vec::new(),
+                }
                 break;
             }
 
-            // Handle instructions
-            if let Some(ref instr) = state.instruction {
-                match instr {
-                    NfaInstruction::WordBoundary => {
-                        steps.push(PatternStep::WordBoundary);
-                    }
-                    NfaInstruction::EndOfText => {
-                        steps.push(PatternStep::EndOfText);
-                    }
-                    NfaInstruction::StartOfText => {
-                        steps.push(PatternStep::StartOfText);
-                    }
-                    _ => return Vec::new(),
+            // A codepoint class consumes input, so it advances the walk rather
+            // than being appended as a zero-width step. `fixed_byte_len` refuses
+            // the whole lookbehind if the class is not fixed-width, so the
+            // interpreter's fixed-offset walk stays valid.
+            if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
+                steps.push(PatternStep::CodepointClass(cpclass.clone(), *target));
+                if visited[current as usize] {
+                    return Vec::new();
                 }
+                visited[current as usize] = true;
+                current = *target;
+                continue;
+            }
+
+            // Interior assertions translate the same way as a terminal one — the
+            // position in the walk does not change what the assertion means.
+            match terminal_assertion(state) {
+                TerminalAssertion::Nothing => {}
+                TerminalAssertion::Step(step) => steps.push(step),
+                TerminalAssertion::Unsupported => return Vec::new(),
             }
 
             if !state.transitions.is_empty() {
@@ -1077,29 +1297,106 @@ impl<'a> StepExtractor<'a> {
 
         None
     }
+}
 
-    /// Calculates the minimum length (in bytes) of input that a sequence of steps can match.
-    pub fn calc_min_len(steps: &[PatternStep]) -> usize {
-        let mut len = 0;
-        for step in steps {
-            match step {
-                PatternStep::Byte(_) => len += 1,
-                PatternStep::ByteClass(_) => len += 1,
-                PatternStep::GreedyPlus(_) => len += 1, // At least one
-                PatternStep::GreedyStar(_) => {}        // Zero or more
-                PatternStep::GreedyPlusLookahead(_, _, _) => len += 1,
-                PatternStep::GreedyStarLookahead(_, _, _) => {}
-                PatternStep::PositiveLookahead(_)
-                | PatternStep::NegativeLookahead(_)
-                | PatternStep::PositiveLookbehind(_, _)
-                | PatternStep::NegativeLookbehind(_, _) => {} // Zero-width
-                PatternStep::WordBoundary
-                | PatternStep::NotWordBoundary
-                | PatternStep::StartOfText
-                | PatternStep::EndOfText => {} // Zero-width
-                _ => {} // Other steps - conservatively assume 0
-            }
-        }
-        len
+#[cfg(test)]
+mod fixed_byte_len_tests {
+    use super::*;
+    use crate::hir::CodepointClass;
+
+    fn class(ranges: &[(u32, u32)], negated: bool) -> PatternStep {
+        PatternStep::CodepointClass(CodepointClass::new(ranges.to_vec(), negated), 0)
+    }
+
+    #[test]
+    fn consuming_steps_add_their_width() {
+        assert_eq!(fixed_byte_len(&[]), Some(0));
+        assert_eq!(
+            fixed_byte_len(&[PatternStep::Byte(b'a'), PatternStep::Byte(b'b')]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn assertions_and_capture_markers_are_zero_width() {
+        assert_eq!(
+            fixed_byte_len(&[
+                PatternStep::StartOfText,
+                PatternStep::Byte(b'a'),
+                PatternStep::WordBoundary,
+                PatternStep::NotWordBoundary,
+                PatternStep::EndOfText,
+                PatternStep::StartOfLine,
+                PatternStep::EndOfLine,
+                PatternStep::CaptureStart(1),
+                PatternStep::CaptureEnd(1),
+            ]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn codepoint_class_counts_its_utf8_width() {
+        // Greek: every codepoint encodes to two bytes.
+        assert_eq!(fixed_byte_len(&[class(&[(0x3B1, 0x3C9)], false)]), Some(2));
+        // CJK: three bytes.
+        assert_eq!(
+            fixed_byte_len(&[class(&[(0x4E00, 0x9FFF)], false)]),
+            Some(3)
+        );
+        // ASCII: one byte.
+        assert_eq!(
+            fixed_byte_len(&[class(&[(b'a' as u32, b'z' as u32)], false)]),
+            Some(1)
+        );
+        // Astral: four bytes.
+        assert_eq!(
+            fixed_byte_len(&[class(&[(0x1F600, 0x1F64F)], false)]),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn variable_width_codepoint_classes_are_refused() {
+        // A range straddling the 1/2-byte boundary.
+        assert_eq!(fixed_byte_len(&[class(&[(0x7F, 0x80)], false)]), None);
+        // Two ranges of differing width.
+        assert_eq!(
+            fixed_byte_len(&[class(&[(b'a' as u32, b'z' as u32), (0x3B1, 0x3C9)], false)]),
+            None
+        );
+        // A negated class admits codepoints of every width.
+        assert_eq!(fixed_byte_len(&[class(&[(0x3B1, 0x3C9)], true)]), None);
+        // An empty class matches nothing, so it has no width to report.
+        assert_eq!(fixed_byte_len(&[class(&[], false)]), None);
+    }
+
+    #[test]
+    fn variable_width_steps_are_refused() {
+        let bytes = ByteClass::new(vec![ByteRange::new(b'a', b'z')]);
+        assert_eq!(
+            fixed_byte_len(&[PatternStep::GreedyPlus(bytes.clone())]),
+            None
+        );
+        assert_eq!(
+            fixed_byte_len(&[PatternStep::GreedyStar(bytes.clone())]),
+            None
+        );
+        assert_eq!(fixed_byte_len(&[PatternStep::Backref(1)]), None);
+        assert_eq!(
+            fixed_byte_len(&[PatternStep::Alt(vec![
+                vec![PatternStep::Byte(b'a')],
+                vec![PatternStep::Byte(b'a'), PatternStep::Byte(b'b')],
+            ])]),
+            None
+        );
+    }
+
+    #[test]
+    fn one_refusal_refuses_the_whole_program() {
+        assert_eq!(
+            fixed_byte_len(&[PatternStep::Byte(b'a'), PatternStep::Backref(1)]),
+            None
+        );
     }
 }

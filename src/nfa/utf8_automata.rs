@@ -75,13 +75,7 @@ pub fn compile_utf8_range(start: u32, end: u32) -> Vec<Utf8Sequence> {
     let mut sequences = Vec::new();
 
     // Split the range at UTF-8 encoding boundaries
-    let boundaries = [
-        0x00,     // 1-byte start
-        0x80,     // 2-byte start
-        0x800,    // 3-byte start
-        0x10000,  // 4-byte start
-        0x110000, // End (one past max Unicode)
-    ];
+    let boundaries = UTF8_WIDTH_BOUNDARIES;
 
     let mut current = start;
 
@@ -323,6 +317,31 @@ fn compile_4byte_with_fixed_byte12(
     }
 
     sequences
+}
+
+/// The code points at which UTF-8 changes encoded width, plus one past the last
+/// valid code point: `UTF8_WIDTH_BOUNDARIES[n]` is the lowest code point that
+/// needs `n + 1` bytes.
+///
+/// Anything that reasons about encoded width reads it from here, so the four
+/// boundaries are stated once and cannot drift apart.
+pub const UTF8_WIDTH_BOUNDARIES: [u32; 5] = [0x00, 0x80, 0x800, 0x10000, 0x110000];
+
+/// How many bytes `cp` occupies once UTF-8 encoded.
+///
+/// Prefer this over [`encode_code_point`] when only the width is wanted — that
+/// one allocates a `Vec` to answer the same question.
+#[inline]
+pub fn utf8_width(cp: u32) -> usize {
+    if cp < UTF8_WIDTH_BOUNDARIES[1] {
+        1
+    } else if cp < UTF8_WIDTH_BOUNDARIES[2] {
+        2
+    } else if cp < UTF8_WIDTH_BOUNDARIES[3] {
+        3
+    } else {
+        4
+    }
 }
 
 /// Encodes a single code point to its UTF-8 byte sequence.

@@ -451,11 +451,8 @@ impl EagerDfa {
                 return false;
             }
 
-            if metadata.needs_end_of_line {
-                let at_end_of_line = pos == input.len() || input.get(pos) == Some(&b'\n');
-                if !at_end_of_line {
-                    return false;
-                }
+            if metadata.needs_end_of_line && !crate::nfa::at_line_end(input, pos) {
+                return false;
             }
         }
 

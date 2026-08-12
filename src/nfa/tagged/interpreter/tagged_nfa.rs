@@ -433,6 +433,12 @@ impl TaggedNfa {
                 }
                 Self::check_lookahead_recursive(rest, input, pos)
             }
+            PatternStep::NotWordBoundary => {
+                if crate::nfa::is_word_boundary(input, pos) {
+                    return false;
+                }
+                Self::check_lookahead_recursive(rest, input, pos)
+            }
             PatternStep::StartOfText => {
                 if pos != 0 {
                     return false;
@@ -441,6 +447,18 @@ impl TaggedNfa {
             }
             PatternStep::EndOfText => {
                 if !crate::nfa::at_end_or_before_final_newline(input, pos) {
+                    return false;
+                }
+                Self::check_lookahead_recursive(rest, input, pos)
+            }
+            PatternStep::StartOfLine => {
+                if !crate::nfa::at_line_start(input, pos) {
+                    return false;
+                }
+                Self::check_lookahead_recursive(rest, input, pos)
+            }
+            PatternStep::EndOfLine => {
+                if !crate::nfa::at_line_end(input, pos) {
                     return false;
                 }
                 Self::check_lookahead_recursive(rest, input, pos)
@@ -523,8 +541,28 @@ impl TaggedNfa {
                         return false;
                     }
                 }
+                PatternStep::NotWordBoundary => {
+                    if crate::nfa::is_word_boundary(input, p) {
+                        return false;
+                    }
+                }
                 PatternStep::StartOfText => {
                     if p != 0 {
+                        return false;
+                    }
+                }
+                PatternStep::EndOfText => {
+                    if !crate::nfa::at_end_or_before_final_newline(input, p) {
+                        return false;
+                    }
+                }
+                PatternStep::StartOfLine => {
+                    if !crate::nfa::at_line_start(input, p) {
+                        return false;
+                    }
+                }
+                PatternStep::EndOfLine => {
+                    if !crate::nfa::at_line_end(input, p) {
                         return false;
                     }
                 }

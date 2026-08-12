@@ -245,11 +245,8 @@ impl CompiledRegex {
             }
 
             // EndOfLine: must be at end of input OR before newline
-            if self.match_needs_end_of_line {
-                let at_end_of_line = end_pos == input.len() || input.get(end_pos) == Some(&b'\n');
-                if !at_end_of_line {
-                    return false;
-                }
+            if self.match_needs_end_of_line && !crate::nfa::at_line_end(input, end_pos) {
+                return false;
             }
         }
 
@@ -354,7 +351,7 @@ impl CompiledRegex {
         if self.has_start_anchor {
             let valid_start = if self.has_multiline_start_anchor {
                 // Multiline: valid at position 0 or after newline
-                start_pos == 0 || (start_pos > 0 && input[start_pos - 1] == b'\n')
+                crate::nfa::at_line_start(input, start_pos)
             } else {
                 // Non-multiline: only valid at position 0
                 start_pos == 0

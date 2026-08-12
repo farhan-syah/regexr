@@ -132,6 +132,115 @@ fn test_negative_lookbehind_find() {
 }
 
 // =============================================================================
+// Variable-Length Lookbehind
+// =============================================================================
+//
+// A lookbehind holds when *some* path through it ends at the current position,
+// not just the path the inner pattern prefers.
+
+#[test]
+fn test_negative_lookbehind_optional_dot() {
+    let re = regex(r"(?<!..?)b");
+    // "b" at 1 is preceded by one character, which `..?` matches.
+    assert!(!re.is_match("ab"));
+    // Nothing precedes "b", so neither branch can match.
+    assert!(re.is_match("b"));
+    // Two preceding characters: matched by the two-character branch.
+    assert!(!re.is_match("xxb"));
+}
+
+#[test]
+fn test_negative_lookbehind_optional_word() {
+    let re = regex(r"(?<!\w\w?)b");
+    assert!(!re.is_match("ab"));
+    assert!(!re.is_match("aab"));
+    assert!(re.is_match("b"));
+    // A non-word character cannot start either branch.
+    assert!(re.is_match(" b"));
+}
+
+#[test]
+fn test_positive_lookbehind_optional_dot() {
+    let re = regex(r"(?<=..?)b");
+    assert!(re.is_match("ab"));
+    assert!(re.is_match("xxb"));
+    assert!(!re.is_match("b"));
+}
+
+#[test]
+fn test_lookbehind_alternation_unequal_lengths() {
+    // The longer branch is preferred, so the shorter one must still be tried.
+    let re = regex(r"(?<=xa|a)b");
+    assert!(re.is_match("ab"));
+    assert!(re.is_match("xab"));
+    assert!(!re.is_match("yb"));
+
+    let re = regex(r"(?<!xa|a)b");
+    assert!(!re.is_match("ab"));
+    assert!(!re.is_match("xab"));
+    assert!(re.is_match("yb"));
+}
+
+#[test]
+fn test_lookbehind_bounded_repetition() {
+    let re = regex(r"(?<=\d{1,3})b");
+    assert!(re.is_match("1b"));
+    assert!(re.is_match("123b"));
+    assert!(!re.is_match("xb"));
+
+    let re = regex(r"(?<!\d{1,3})b");
+    assert!(!re.is_match("1b"));
+    assert!(!re.is_match("12b"));
+    assert!(re.is_match("xb"));
+}
+
+#[test]
+fn test_lookbehind_unbounded_repetition() {
+    let re = regex(r"(?<=a.*)b");
+    assert!(re.is_match("ab"));
+    assert!(re.is_match("axxxb"));
+    assert!(!re.is_match("xb"));
+
+    // `x{0,2}` can match empty, so it always ends at the current position.
+    let re = regex(r"(?<!x{0,2})y");
+    assert!(!re.is_match("y"));
+    assert!(!re.is_match("xxy"));
+}
+
+#[test]
+fn test_lookbehind_variable_length_keeps_left_context() {
+    // The inner `^` must see the real start of input, not a detached slice.
+    let re = regex(r"(?<=^a?)b");
+    assert!(re.is_match("ab"));
+    assert!(re.is_match("b"));
+    assert!(!re.is_match("xab"));
+
+    // The inner `\b` must see the byte before the lookbehind's start.
+    let re = regex(r"(?<=\bfo?)o");
+    assert!(re.is_match("foo"));
+    assert!(!re.is_match("xfoo"));
+}
+
+#[test]
+fn test_lookbehind_variable_length_multibyte() {
+    let re = regex(r"(?<=[αβ]?)γ");
+    assert!(re.is_match("αγ"));
+    assert!(re.is_match("γ"));
+
+    let re = regex(r"(?<![αβ]?)γ");
+    assert!(!re.is_match("αγ"));
+    assert!(!re.is_match("γ"));
+}
+
+#[test]
+fn test_lookbehind_variable_length_find_position() {
+    let re = regex(r"(?<!..?)b");
+    // Only the "b" with no preceding characters qualifies.
+    assert_eq!(re.find("b ab").map(|m| m.start()), Some(0));
+    assert!(re.find("ab b").is_none());
+}
+
+// =============================================================================
 // Combined Lookahead and Lookbehind
 // =============================================================================
 
@@ -219,4 +328,255 @@ fn stacked_lookbehinds_are_all_checked() {
 fn word_boundary_inside_a_lookbehind_sees_real_context() {
     let re = regex(r"(?<=\bfoo)bar");
     assert_eq!(re.find("foobar").map(|m| m.as_str()), Some("bar"));
+}
+
+// =============================================================================
+// Assertions at the Tail of a Lookaround
+// =============================================================================
+//
+// A zero-width assertion is part of the lookaround's inner pattern wherever it
+// sits, including as its last element. `(?<=a\b)` and `(?<=a)` are different
+// assertions, as are `(?=a$)` and `(?=a)`.
+
+#[test]
+fn test_lookbehind_trailing_word_boundary() {
+    let re = regex(r"(?<=a\b)x");
+    // No boundary between "a" and "x" — both are word characters.
+    assert!(!re.is_match("ax"));
+
+    let re = regex(r"(?<=a\b)-");
+    assert_eq!(re.find("a-").map(|m| m.start()), Some(1));
+}
+
+#[test]
+fn test_lookbehind_trailing_not_word_boundary() {
+    // `\b` and `\B` are opposites and must not compile to the same assertion.
+    let word_boundary = regex(r"(?<=a\b)x");
+    let not_word_boundary = regex(r"(?<=a\B)x");
+    assert!(!word_boundary.is_match("ax"));
+    assert!(not_word_boundary.is_match("ax"));
+}
+
+#[test]
+fn test_negative_lookbehind_trailing_word_boundary() {
+    let re = regex(r"(?<!a\b)x");
+    // `(?<=a\b)` does not hold here, so its negation does.
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+
+    let re = regex(r"(?<!a\b)-");
+    assert!(!re.is_match("a-"));
+}
+
+#[test]
+fn test_lookbehind_trailing_end_anchor() {
+    let re = regex(r"(?<=a$)b");
+    // "a" is not at the end of the text, so the lookbehind fails.
+    assert!(!re.is_match("ab"));
+
+    let re = regex(r"(?<=a$)");
+    assert!(!re.is_match("ab"));
+    assert_eq!(re.find("a").map(|m| m.start()), Some(1));
+
+    let re = regex(r"(?<!a$)x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+}
+
+#[test]
+fn test_lookbehind_trailing_absolute_end_anchor() {
+    let re = regex(r"(?<=a\Z)");
+    assert!(!re.is_match("ab"));
+    assert_eq!(re.find("a").map(|m| m.start()), Some(1));
+}
+
+#[test]
+fn test_lookbehind_trailing_line_anchor() {
+    let re = regex(r"(?m)(?<=a$)x");
+    assert!(!re.is_match("ax"));
+
+    let re = regex(r"(?m)(?<=a$)\nx");
+    assert_eq!(re.find("a\nx").map(|m| m.start()), Some(1));
+}
+
+#[test]
+fn test_lookahead_trailing_word_boundary() {
+    let re = regex(r"x(?=a\b)");
+    assert_eq!(re.find("xa").map(|m| m.start()), Some(0));
+    assert_eq!(re.find("xa-").map(|m| m.start()), Some(0));
+    // "a" is followed by another word character, so there is no boundary.
+    assert!(!re.is_match("xab"));
+}
+
+#[test]
+fn test_lookahead_trailing_not_word_boundary() {
+    let re = regex(r"x(?=a\B)");
+    assert!(re.is_match("xab"));
+    assert!(!re.is_match("xa"));
+}
+
+#[test]
+fn test_negative_lookahead_trailing_assertion() {
+    let re = regex(r"x(?!a\b)");
+    assert_eq!(re.find("xab").map(|m| m.start()), Some(0));
+    assert!(!re.is_match("xa"));
+
+    let re = regex(r"x(?!a$)");
+    assert_eq!(re.find("xab").map(|m| m.start()), Some(0));
+}
+
+#[test]
+fn test_lookahead_trailing_end_anchor() {
+    let re = regex(r"x(?=a$)");
+    assert_eq!(re.find("xa").map(|m| m.start()), Some(0));
+    assert!(!re.is_match("xab"));
+}
+
+#[test]
+fn test_lookahead_trailing_boundary_after_class() {
+    // The last word character of a run, found via a trailing `\b` in a lookahead.
+    let re = regex(r"\w(?=\w\b)");
+    assert_eq!(re.find("  111").map(|m| m.start()), Some(3));
+}
+
+#[test]
+fn test_find_and_captures_agree_on_tail_assertions() {
+    // `find` and `captures` must answer the same question. They are served by
+    // different engines internally, so a lookaround they disagree on means one
+    // of those engines is not evaluating the pattern.
+    for pattern in [
+        r"(?<=a\b)x",
+        r"(?<!a\b)x",
+        r"(?<=a$)b",
+        r"x(?=a\b)",
+        r"x(?!a\b)",
+        r"x(?=a$)",
+        r"x(?=a\B)",
+    ] {
+        let re = regex(pattern);
+        for haystack in ["ax", "abx", "xa", "xab", "a-", "ab"] {
+            let found = re.find(haystack).map(|m| (m.start(), m.end()));
+            let captured = re
+                .captures(haystack)
+                .map(|c| c.get(0).map(|m| (m.start(), m.end())).unwrap());
+            assert_eq!(
+                found, captured,
+                "find/captures disagree for {pattern:?} on {haystack:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lookbehind_fixed_width_codepoint_class() {
+    // Every codepoint in the class encodes to the same number of UTF-8 bytes,
+    // so the lookbehind knows exactly how far back to look.
+    let re = regex(r"(?<=[α-ω])x");
+    assert_eq!(re.find("αx").map(|m| m.start()), Some(2));
+    assert_eq!(re.find("αβx").map(|m| m.start()), Some(4));
+    assert!(!re.is_match("ax"));
+    assert!(!re.is_match("x"));
+
+    let re = regex(r"(?<![α-ω])x");
+    assert!(!re.is_match("αx"));
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert_eq!(re.find("x").map(|m| m.start()), Some(0));
+
+    // Three-byte encodings.
+    let re = regex(r"(?<=[\u{4E00}-\u{9FFF}])x");
+    assert_eq!(re.find("中x").map(|m| m.start()), Some(3));
+    assert!(!re.is_match("ax"));
+}
+
+#[test]
+fn test_lookbehind_variable_width_codepoint_class() {
+    // `\p{L}` spans one- through four-byte encodings, and a class mixing widths
+    // or a negated one does too. All must still be evaluated correctly.
+    let re = regex(r"(?<=\p{L})x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert_eq!(re.find("éx").map(|m| m.start()), Some(2));
+    assert_eq!(re.find("中x").map(|m| m.start()), Some(3));
+    assert!(!re.is_match("1x"));
+
+    let re = regex(r"(?<=[a-zα])x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert_eq!(re.find("αx").map(|m| m.start()), Some(2));
+
+    let re = regex(r"(?<![^α])x");
+    assert_eq!(re.find("αx").map(|m| m.start()), Some(2));
+    assert!(!re.is_match("ax"));
+}
+
+// =============================================================================
+// Lookaround After a Quantifier, and Anchors Inside a Lookaround
+// =============================================================================
+
+#[test]
+fn test_quantifier_followed_by_two_lookaheads() {
+    // A `*` splits into "took some"/"took none", and both arms must still carry
+    // every assertion that follows the quantifier.
+    let re = regex(r"a*(?=b)(?=c)");
+    assert!(!re.is_match("ab"));
+    assert!(!re.is_match("ac"));
+
+    let re = regex(r"x*(?=a)(?=b)");
+    assert!(!re.is_match("ab"));
+
+    let re = regex(r"[^\s]*(?!\S)(?=a.*)");
+    assert!(!re.is_match(""));
+    assert!(!re.is_match(" \u{4E2D}\u{A0}a,"));
+
+    let re = regex(r"\p{L}*(?=\S)(?=\p{L})");
+    assert_eq!(re.find("Z0").map(|m| (m.start(), m.end())), Some((0, 0)));
+}
+
+#[test]
+fn test_quantifier_followed_by_two_word_boundaries() {
+    // Same shape with `\b`: `\b` and `\b` are one assertion each, and neither
+    // may be lost to the quantifier split.
+    let re = regex(r"a*\b\b");
+    assert_eq!(re.find("ab").map(|m| (m.start(), m.end())), Some((0, 0)));
+}
+
+#[test]
+fn test_start_anchor_inside_a_lookaround() {
+    // `^` inside a lookaround reads absolute position, so a search that resumes
+    // at a later candidate must still see it as false there.
+    let re = regex(r"(?=^)x");
+    assert!(!re.is_match("ax"));
+    assert_eq!(re.find("x").map(|m| m.start()), Some(0));
+
+    let re = regex(r"(?!^)x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert!(!re.is_match("x"));
+
+    let re = regex(r"(?=\A)x");
+    assert!(!re.is_match("ax"));
+
+    let re = regex(r"(?=^[a-z])x");
+    assert!(!re.is_match("ax"));
+    assert!(!re.is_match("zzzzx"));
+
+    let re = regex(r"(?!^[a-z])x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert_eq!(re.find("abx").map(|m| m.start()), Some(2));
+}
+
+#[test]
+fn test_word_boundary_inside_a_lookahead_reads_left_context() {
+    // `\b` at the candidate position depends on the byte before it, which a
+    // search resuming there must not hide.
+    let re = regex(r"(?=\b)x");
+    assert!(!re.is_match("ax"));
+    assert_eq!(re.find("a x").map(|m| m.start()), Some(2));
+
+    let re = regex(r"(?=\B)x");
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert!(!re.is_match("a x"));
+}
+
+#[test]
+fn test_alternation_arms_each_keep_their_lookaround() {
+    // Two top-level arms, each ending in a lookaround whose inner pattern is
+    // itself an alternation with anchors.
+    let re = regex(r"\S+\p{N}?[^\s\p{L}\p{N}]*(?=$a|xa\Z)|[^\s]* +(?!\Z\p{L}^)");
+    assert!(!re.is_match("\u{3000}a,\u{B2}\t.\u{E9}\u{4E2D}\u{E9}"));
 }

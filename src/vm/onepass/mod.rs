@@ -60,7 +60,8 @@ pub mod jit;
 mod x86_64;
 
 use crate::nfa::{
-    at_end_or_before_final_newline, is_word_boundary, ByteRange, Nfa, NfaInstruction, StateId,
+    at_end_or_before_final_newline, at_line_end, at_line_start, is_word_boundary, ByteRange, Nfa,
+    NfaInstruction, StateId,
 };
 use std::collections::HashMap;
 
@@ -101,8 +102,8 @@ impl Guard {
         match self {
             Self::StartOfText => pos == 0,
             Self::EndOfText => at_end_or_before_final_newline(input, pos),
-            Self::StartOfLine => pos == 0 || input.get(pos.wrapping_sub(1)) == Some(&b'\n'),
-            Self::EndOfLine => pos == input.len() || input.get(pos) == Some(&b'\n'),
+            Self::StartOfLine => at_line_start(input, pos),
+            Self::EndOfLine => at_line_end(input, pos),
             Self::WordBoundary => is_word_boundary(input, pos),
             Self::NotWordBoundary => !is_word_boundary(input, pos),
         }

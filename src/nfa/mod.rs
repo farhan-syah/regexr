@@ -38,6 +38,20 @@ pub fn at_end_or_before_final_newline(input: &[u8], pos: usize) -> bool {
     pos == input.len() || (pos + 1 == input.len() && input[pos] == b'\n')
 }
 
+/// Whether `pos` satisfies multiline `^` (`NfaInstruction::StartOfLine`): the
+/// start of the input, or just after a newline.
+#[inline]
+pub fn at_line_start(input: &[u8], pos: usize) -> bool {
+    pos == 0 || input.get(pos - 1) == Some(&b'\n')
+}
+
+/// Whether `pos` satisfies multiline `$` (`NfaInstruction::EndOfLine`): the end
+/// of the input, or just before a newline.
+#[inline]
+pub fn at_line_end(input: &[u8], pos: usize) -> bool {
+    pos == input.len() || input.get(pos) == Some(&b'\n')
+}
+
 /// Whether `pos` satisfies `\b`: exactly one side of the position is a word
 /// byte. `\B` is its negation.
 ///

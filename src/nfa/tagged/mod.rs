@@ -29,7 +29,10 @@ pub use shared::{
 };
 pub use steps::{combine_greedy_with_lookahead, StepExtractor};
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use steps::{count_assertions_in_nfa, count_assertions_in_steps, jit_must_defer};
+pub(crate) use steps::{
+    count_assertions_in_nfa, count_assertions_in_steps, fixed_byte_len, jit_must_defer,
+    min_byte_len, terminal_assertion, TerminalAssertion,
+};
 
 // Engine facade
 mod engine;

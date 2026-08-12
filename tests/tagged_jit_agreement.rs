@@ -195,3 +195,35 @@ fn greedy_with_attached_lookahead_is_jit_compiled() {
         );
     }
 }
+
+/// A lookaround whose inner pattern ends in a zero-width assertion must reach
+/// the JIT.
+///
+/// The inner extractors walk to the inner NFA's match state, and an assertion
+/// compiled onto that state has to be read before they stop. If one is missed,
+/// the assertion tally no longer matches the NFA and the JIT correctly refuses —
+/// so these patterns silently drop to a slower engine rather than returning
+/// wrong answers. Assert the engine to catch that.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn lookaround_with_trailing_assertion_is_jit_compiled() {
+    for pattern in [
+        r"(?<=a\b)x",
+        r"(?<=a\B)x",
+        r"(?<!a\b)x",
+        r"(?<=a$)b",
+        r"(?<!a$)x",
+        r"x(?=a\b)",
+        r"x(?=a\B)",
+        r"x(?!a\b)",
+        r"x(?=a$)",
+        r"\w(?=\w\b)",
+    ] {
+        let jitted = RegexBuilder::new(pattern).jit(true).build().unwrap();
+        assert_eq!(
+            jitted.engine_name(),
+            "TaggedNfaJit",
+            "{pattern} is expressible as steps and should be JIT-compiled"
+        );
+    }
+}

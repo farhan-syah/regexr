@@ -374,7 +374,7 @@ impl TaggedNfaJitCompiler {
         let has_backrefs = Self::has_backref(&steps);
 
         // Calculate minimum pattern length (for initial bounds check)
-        let min_len = Self::calc_min_len(&steps);
+        let min_len = crate::nfa::tagged::min_byte_len(&steps);
 
         // =====================================================================
         // find_fn entry point
@@ -3326,20 +3326,60 @@ impl TaggedNfaJitCompiler {
                         self.emit_word_boundary_at_r9(inner_match, true)?;
                     }
                 }
-                PatternStep::EndOfText => {
+                PatternStep::NotWordBoundary => {
                     if positive {
-                        dynasm!(self.asm
-                            ; .arch x64
-                            ; cmp r9, r12
-                            ; jne =>fail_label
-                        );
+                        self.emit_word_boundary_at_r9(fail_label, false)?;
                     } else {
-                        dynasm!(self.asm
-                            ; .arch x64
-                            ; cmp r9, r12
-                            ; jne =>inner_match
-                        );
+                        self.emit_word_boundary_at_r9(inner_match, false)?;
                     }
+                }
+                PatternStep::EndOfText => {
+                    // `$`/`\Z`: end of input, or just before a final newline —
+                    // the same test `emit_end_of_text` applies at the top level,
+                    // here against the lookahead scan position in r9. Testing
+                    // only `r9 == len` would reject `x(?=a$)` on `"xa\n"`.
+                    let not_at_end = if positive { fail_label } else { inner_match };
+                    let ok = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; cmp r9, r12
+                        ; je =>ok                      // at end of input
+                        ; lea rax, [r9 + 1]
+                        ; cmp rax, r12
+                        ; jne =>not_at_end             // not exactly one byte from the end
+                        ; movzx eax, BYTE [rbx + r9]
+                        ; cmp al, BYTE 0x0Au8 as i8    // that byte must be '\n'
+                        ; jne =>not_at_end
+                        ; =>ok
+                    );
+                }
+                PatternStep::StartOfLine => {
+                    let not_at_start = if positive { fail_label } else { inner_match };
+                    let at_start = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; test r9, r9
+                        ; jz =>at_start                // start of input
+                        ; mov rax, r9
+                        ; dec rax
+                        ; movzx eax, BYTE [rbx + rax]
+                        ; cmp al, BYTE 0x0Au8 as i8    // else must follow a newline
+                        ; jne =>not_at_start
+                        ; =>at_start
+                    );
+                }
+                PatternStep::EndOfLine => {
+                    let not_at_end = if positive { fail_label } else { inner_match };
+                    let at_end = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; cmp r9, r12
+                        ; je =>at_end                  // end of input
+                        ; movzx eax, BYTE [rbx + r9]
+                        ; cmp al, BYTE 0x0Au8 as i8    // else must precede a newline
+                        ; jne =>not_at_end
+                        ; =>at_end
+                    );
                 }
                 PatternStep::StartOfText => {
                     if positive {
@@ -3856,6 +3896,50 @@ impl TaggedNfaJitCompiler {
                     dynasm!(self.asm
                         ; .arch x64
                         ; inc r14
+                    );
+                }
+                // Zero-width assertions test at the walk position (r14) and
+                // consume nothing, exactly as they do at the top level.
+                PatternStep::WordBoundary => {
+                    self.emit_word_boundary_check(inner_mismatch, true)?;
+                }
+                PatternStep::NotWordBoundary => {
+                    self.emit_word_boundary_check(inner_mismatch, false)?;
+                }
+                PatternStep::StartOfText => {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; test r14, r14
+                        ; jnz =>inner_mismatch
+                    );
+                }
+                PatternStep::EndOfText => {
+                    self.emit_end_of_text(inner_mismatch)?;
+                }
+                PatternStep::StartOfLine => {
+                    let at_start = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; test r14, r14
+                        ; jz =>at_start
+                        ; mov rax, r14
+                        ; dec rax
+                        ; movzx eax, BYTE [rbx + rax]
+                        ; cmp al, BYTE 0x0Au8 as i8
+                        ; jne =>inner_mismatch
+                        ; =>at_start
+                    );
+                }
+                PatternStep::EndOfLine => {
+                    let at_end = self.asm.new_dynamic_label();
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; cmp r14, r12
+                        ; je =>at_end
+                        ; movzx eax, BYTE [rbx + r14]
+                        ; cmp al, BYTE 0x0Au8 as i8
+                        ; jne =>inner_mismatch
+                        ; =>at_end
                     );
                 }
                 _ => {
@@ -4521,7 +4605,7 @@ impl TaggedNfaJitCompiler {
         use dynasmrt::DynasmLabelApi;
 
         let offset = self.asm.offset();
-        let min_len = Self::calc_min_len(steps);
+        let min_len = crate::nfa::tagged::min_byte_len(steps);
 
         // Count max capture group index
         // Note: capture indices are 1-based (group 0 is the full match)
@@ -5167,55 +5251,6 @@ impl TaggedNfaJitCompiler {
         }
     }
 
-    /// Calculates the minimum length of input needed to match a pattern.
-    fn calc_min_len(steps: &[PatternStep]) -> usize {
-        steps
-            .iter()
-            .map(|s| match s {
-                PatternStep::Byte(_) | PatternStep::ByteClass(_) => 1,
-                PatternStep::GreedyPlus(_) => 1,
-                PatternStep::GreedyStar(_) => 0,
-                // Greedy with lookahead: lookahead is zero-width, only repetition counts
-                PatternStep::GreedyPlusLookahead(_, _, _) => 1,
-                PatternStep::GreedyStarLookahead(_, _, _) => 0,
-                // Non-greedy plus needs at least 1 char for the repetition + the suffix
-                PatternStep::NonGreedyPlus(_, suffix) => {
-                    1 + Self::calc_min_len(&[(**suffix).clone()])
-                }
-                // Non-greedy star needs 0 for the repetition + the suffix
-                PatternStep::NonGreedyStar(_, suffix) => Self::calc_min_len(&[(**suffix).clone()]),
-                PatternStep::Alt(alternatives) => {
-                    // Minimum length is the minimum of all alternatives
-                    alternatives
-                        .iter()
-                        .map(|alt| Self::calc_min_len(alt))
-                        .min()
-                        .unwrap_or(0)
-                }
-                // Capture markers don't consume input
-                PatternStep::CaptureStart(_) | PatternStep::CaptureEnd(_) => 0,
-                // Unicode codepoint classes consume at least 1 byte
-                PatternStep::CodepointClass(_, _) => 1,
-                // Greedy codepoint repetition consumes at least 1 byte (UTF-8 codepoint is 1-4 bytes)
-                PatternStep::GreedyCodepointPlus(_) => 1,
-                // Word boundaries don't consume input - they're zero-width assertions
-                PatternStep::WordBoundary | PatternStep::NotWordBoundary => 0,
-                // Lookarounds don't consume input - they're zero-width assertions
-                PatternStep::PositiveLookahead(_)
-                | PatternStep::NegativeLookahead(_)
-                | PatternStep::PositiveLookbehind(_, _)
-                | PatternStep::NegativeLookbehind(_, _) => 0,
-                // Backrefs consume variable length (unknown at compile time, could be 0)
-                PatternStep::Backref(_) => 0,
-                // Anchors don't consume input - they're zero-width assertions
-                PatternStep::StartOfText
-                | PatternStep::EndOfText
-                | PatternStep::StartOfLine
-                | PatternStep::EndOfLine => 0,
-            })
-            .sum()
-    }
-
     /// Combines greedy quantifiers (GreedyPlus/GreedyStar) followed by lookahead
     /// into special combined variants that support backtracking.
     ///
@@ -5410,16 +5445,23 @@ impl TaggedNfaJitCompiler {
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let min_len = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, min_len));
+                        // The lookbehind walk starts at a fixed offset behind the
+                        // position, so it needs the exact width — a minimum would
+                        // mislocate it. See `fixed_byte_len`.
+                        let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
                     }
                     NfaInstruction::NegativeLookbehind(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let min_len = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, min_len));
+                        let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
                     }
                     // Word boundaries - can be JIT'd
                     NfaInstruction::WordBoundary => {
@@ -5635,8 +5677,15 @@ impl TaggedNfaJitCompiler {
 
             let state = &inner_nfa.states[current as usize];
 
-            // Check for match state
+            // Check for match state. An assertion compiled onto it is still part
+            // of the inner pattern (the `\b` in `(?=ing\b)`), so read it before
+            // stopping — see `terminal_assertion`.
             if state.is_match {
+                match crate::nfa::tagged::terminal_assertion(state) {
+                    crate::nfa::tagged::TerminalAssertion::Nothing => {}
+                    crate::nfa::tagged::TerminalAssertion::Step(step) => steps.push(step),
+                    crate::nfa::tagged::TerminalAssertion::Unsupported => return Vec::new(),
+                }
                 break;
             }
 
@@ -6117,20 +6166,10 @@ impl TaggedNfaJitCompiler {
 
         // The pattern needs left context (so `find_at(start>0)` must not slice) if
         // any instruction anchors to the text start, tests a word boundary, or is
-        // a lookbehind — all of which depend on absolute position / preceding bytes.
-        let needs_left_context = self.nfa.states.iter().any(|s| {
-            matches!(
-                s.instruction,
-                Some(
-                    NfaInstruction::StartOfText
-                        | NfaInstruction::StartOfLine
-                        | NfaInstruction::WordBoundary
-                        | NfaInstruction::NotWordBoundary
-                        | NfaInstruction::PositiveLookbehind(_)
-                        | NfaInstruction::NegativeLookbehind(_)
-                )
-            )
-        });
+        // a lookbehind — all of which depend on absolute position / preceding
+        // bytes. Lookaround interiors are searched too: `(?=^)x` reads left
+        // context even though nothing at the top level does.
+        let needs_left_context = self.nfa.needs_left_context();
 
         Ok(TaggedNfaJit::new(
             code,

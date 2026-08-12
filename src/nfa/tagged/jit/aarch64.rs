@@ -170,26 +170,6 @@ impl TaggedNfaJitCompiler {
             )
     }
 
-    fn calc_min_len(steps: &[PatternStep]) -> usize {
-        steps
-            .iter()
-            .map(|s| match s {
-                PatternStep::Byte(_) | PatternStep::ByteClass(_) => 1,
-                PatternStep::GreedyPlus(_) | PatternStep::GreedyPlusLookahead(_, _, _) => 1,
-                PatternStep::GreedyStar(_) | PatternStep::GreedyStarLookahead(_, _, _) => 0,
-                PatternStep::NonGreedyPlus(_, suf) => 1 + Self::calc_min_len(&[(**suf).clone()]),
-                PatternStep::NonGreedyStar(_, suf) => Self::calc_min_len(&[(**suf).clone()]),
-                PatternStep::Alt(alts) => alts
-                    .iter()
-                    .map(|a| Self::calc_min_len(a))
-                    .min()
-                    .unwrap_or(0),
-                PatternStep::CodepointClass(_, _) | PatternStep::GreedyCodepointPlus(_) => 1,
-                _ => 0,
-            })
-            .sum()
-    }
-
     fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep> {
         let mut result = Vec::with_capacity(steps.len());
         let mut i = 0;
@@ -951,7 +931,7 @@ impl TaggedNfaJitCompiler {
             }
         }
         let has_backrefs = Self::has_backref(&steps);
-        let min_len = Self::calc_min_len(&steps);
+        let min_len = crate::nfa::tagged::min_byte_len(&steps);
 
         let find_offset = self.asm.offset();
         if has_backrefs {
@@ -1562,7 +1542,7 @@ impl TaggedNfaJitCompiler {
     fn emit_captures_fn(&mut self, steps: &[PatternStep]) -> Result<dynasmrt::AssemblyOffset> {
         use dynasmrt::DynasmLabelApi;
         let offset = self.asm.offset();
-        let min_len = Self::calc_min_len(steps);
+        let min_len = crate::nfa::tagged::min_byte_len(steps);
         let max_cap_idx = steps
             .iter()
             .filter_map(|s| match s {
@@ -1908,16 +1888,23 @@ impl TaggedNfaJitCompiler {
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let ml = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, ml));
+                        // The lookbehind walk starts at a fixed offset behind the
+                        // position, so it needs the exact width — a minimum would
+                        // mislocate it. See `fixed_byte_len`.
+                        let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
                     }
                     NfaInstruction::NegativeLookbehind(inner) => {
                         let inner_steps = self.extract_lookaround_steps(inner);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let ml = Self::calc_min_len(&inner_steps);
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, ml));
+                        let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
+                            return Vec::new();
+                        };
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
                     }
                     NfaInstruction::WordBoundary => steps.push(PatternStep::WordBoundary),
                     NfaInstruction::NotWordBoundary => steps.push(PatternStep::NotWordBoundary),
@@ -2055,7 +2042,15 @@ impl TaggedNfaJitCompiler {
                 return Vec::new();
             }
             let state = &inner.states[current as usize];
+            // An assertion compiled onto the match state is still part of the
+            // inner pattern (the `\b` in `(?=ing\b)`), so read it before
+            // stopping — see `terminal_assertion`.
             if state.is_match {
+                match crate::nfa::tagged::terminal_assertion(state) {
+                    crate::nfa::tagged::TerminalAssertion::Nothing => {}
+                    crate::nfa::tagged::TerminalAssertion::Step(step) => steps.push(step),
+                    crate::nfa::tagged::TerminalAssertion::Unsupported => return Vec::new(),
+                }
                 break;
             }
             if let Some(ref instr) = state.instruction {
@@ -2354,19 +2349,9 @@ impl TaggedNfaJitCompiler {
         let state_count = self.nfa.states.len();
         let lookaround_count = self.liveness.lookaround_count;
         let stride = (capture_count as usize + 1) * 2;
-        let needs_left_context = self.nfa.states.iter().any(|s| {
-            matches!(
-                s.instruction,
-                Some(
-                    NfaInstruction::StartOfText
-                        | NfaInstruction::StartOfLine
-                        | NfaInstruction::WordBoundary
-                        | NfaInstruction::NotWordBoundary
-                        | NfaInstruction::PositiveLookbehind(_)
-                        | NfaInstruction::NegativeLookbehind(_)
-                )
-            )
-        });
+        // Lookaround interiors count too: `(?=^)x` reads left context even
+        // though nothing at the top level does. See `Nfa::needs_left_context`.
+        let needs_left_context = self.nfa.needs_left_context();
         Ok(TaggedNfaJit::new(
             code,
             find_fn,

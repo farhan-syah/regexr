@@ -43,12 +43,51 @@ const ATOMS: &[&str] = &[
 ];
 const QUANT: &[&str] = &["", "+", "*", "?", "{1,3}", "+?", "*?"];
 
+/// Zero-width assertions to place *inside* a lookaround, where the linear step
+/// extractors have to either represent them or refuse. A trailing one lands on
+/// the inner NFA's match state, the position a walk that stops there is most
+/// likely to skip.
+const INNER_ASSERT: &[&str] = &["", "", "", r"\b", r"\B", "$", "^", r"\Z"];
+
+/// Inner patterns for a lookbehind, spanning the shapes the engines route
+/// differently: fixed width, variable width via `?`, alternation of unequal
+/// lengths, bounded and unbounded repetition.
+const LOOKBEHIND_INNER: &[&str] = &[
+    "a",
+    "ab",
+    r"\p{L}",
+    r"[a-z]",
+    "a?",
+    "..?",
+    r"\p{L}\p{L}?",
+    r"a|xa",
+    r"\p{N}{1,3}",
+    "a.*",
+    "[α-ω]",
+];
+
 fn atom(r: &mut R) -> String {
     format!("{}{}", ATOMS[r.b(ATOMS.len())], QUANT[r.b(QUANT.len())])
 }
 fn seq(r: &mut R) -> String {
     (0..1 + r.b(3)).map(|_| atom(r)).collect()
 }
+
+/// A lookaround wrapping one of the inner shapes above, optionally with a
+/// trailing or leading assertion inside it.
+fn lookaround(r: &mut R) -> String {
+    let inner = LOOKBEHIND_INNER[r.b(LOOKBEHIND_INNER.len())];
+    let trailing = INNER_ASSERT[r.b(INNER_ASSERT.len())];
+    let leading = INNER_ASSERT[r.b(INNER_ASSERT.len())];
+    let body = format!("{leading}{inner}{trailing}");
+    match r.b(4) {
+        0 => format!("(?<={body})"),
+        1 => format!("(?<!{body})"),
+        2 => format!("(?={body})"),
+        _ => format!("(?!{body})"),
+    }
+}
+
 fn pat(r: &mut R) -> String {
     let mut p = String::new();
     if r.b(5) == 0 {
@@ -61,6 +100,14 @@ fn pat(r: &mut R) -> String {
                 1 => a.push_str(r"(?!\S)"),
                 2 => a.push_str(r"(?=\S)"),
                 _ => {}
+            }
+            // A lookaround before the sequence exercises lookbehind against real
+            // left context, and puts an inner assertion where a linear walk ends.
+            if r.b(4) == 0 {
+                a.insert_str(0, &lookaround(r));
+            }
+            if r.b(6) == 0 {
+                a.push_str(&lookaround(r));
             }
             a
         })

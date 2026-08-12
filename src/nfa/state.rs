@@ -25,6 +25,13 @@ pub struct Nfa {
     /// Precomputed epsilon closures for each state (optional optimization).
     /// When present, `epsilon_closure()` uses these instead of computing on-the-fly.
     pub epsilon_closures: Option<Vec<BTreeSet<StateId>>>,
+    /// Upper bound, in bytes, on what a match of this NFA can consume — `None`
+    /// when unbounded. See [`Nfa::compute_max_match_len`].
+    ///
+    /// Consumers must read `None` as "no bound available" and stay correct
+    /// without one, so a construction path that never fills this in only costs
+    /// speed.
+    pub max_match_len: Option<usize>,
 }
 
 impl Nfa {
@@ -38,7 +45,145 @@ impl Nfa {
             has_backrefs: false,
             has_lookaround: false,
             epsilon_closures: None,
+            max_match_len: None,
         }
+    }
+
+    /// The most bytes any match of this NFA can consume, or `None` if that is
+    /// unbounded.
+    ///
+    /// A lookbehind uses this to bound its search: `(?<=X)` at position `p` only
+    /// has to consider starts in `p - max_match_len ..= p`, which turns an
+    /// O(p)-starts scan into O(1) for the bounded inner patterns that nearly all
+    /// lookbehinds use. Being an *upper* bound is what makes it safe — a bound
+    /// that is too large only costs time.
+    ///
+    /// This is the longest path from the start state to a match state, counting
+    /// one byte per byte transition and four (the longest UTF-8 encoding) per
+    /// codepoint class. Any cycle reachable from the start, and any
+    /// backreference (whose length depends on captured text, not on the graph),
+    /// makes the answer unbounded.
+    ///
+    /// Iterative rather than recursive: state counts follow pattern size, and a
+    /// bounded repeat like `a{10000}` would otherwise recurse as deep.
+    pub fn compute_max_match_len(&self) -> Option<usize> {
+        const WHITE: u8 = 0;
+        const GRAY: u8 = 1;
+        const BLACK: u8 = 2;
+
+        let n = self.states.len();
+        if n == 0 {
+            return Some(0);
+        }
+        if self
+            .states
+            .iter()
+            .any(|s| matches!(s.instruction, Some(NfaInstruction::Backref(_))))
+        {
+            return None;
+        }
+
+        let mut color = vec![WHITE; n];
+        // `best[s]`: the longest byte path from `s` to a match state, or `None`
+        // when no match state is reachable from it.
+        let mut best: Vec<Option<usize>> = vec![None; n];
+
+        let start = self.start as usize;
+        if start >= n {
+            return Some(0);
+        }
+        color[start] = GRAY;
+        // (state, index of the next outgoing edge to visit)
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+
+        while let Some(&(sid, edge)) = stack.last() {
+            let state = &self.states[sid];
+            match Self::successor(state, edge) {
+                Some((target, weight)) => {
+                    let target = target as usize;
+                    if target >= n {
+                        stack.last_mut().unwrap().1 = edge + 1;
+                        continue;
+                    }
+                    match color[target] {
+                        // Back edge: the graph loops, so the length is unbounded.
+                        GRAY => return None,
+                        BLACK => {
+                            if let Some(reachable) = best[target] {
+                                let candidate = reachable.saturating_add(weight);
+                                best[sid] = Some(best[sid].map_or(candidate, |b| b.max(candidate)));
+                            }
+                            stack.last_mut().unwrap().1 = edge + 1;
+                        }
+                        // Descend, leaving `edge` in place so this child's value
+                        // is folded in when the walk returns to it.
+                        _ => {
+                            color[target] = GRAY;
+                            stack.push((target, 0));
+                        }
+                    }
+                }
+                None => {
+                    // A match state can stop here, consuming nothing more.
+                    if state.is_match {
+                        best[sid] = Some(best[sid].unwrap_or(0));
+                    }
+                    color[sid] = BLACK;
+                    stack.pop();
+                }
+            }
+        }
+
+        best[start]
+    }
+
+    /// The `edge`-th outgoing edge of `state` as `(target, bytes consumed)`,
+    /// or `None` once they are exhausted. Byte transitions come first, then
+    /// epsilons, then the codepoint-class transition an instruction may carry.
+    fn successor(state: &NfaState, edge: usize) -> Option<(StateId, usize)> {
+        if let Some(&(_, target)) = state.transitions.get(edge) {
+            return Some((target, 1));
+        }
+        let edge = edge - state.transitions.len();
+        if let Some(&target) = state.epsilon.get(edge) {
+            return Some((target, 0));
+        }
+        if edge == state.epsilon.len() {
+            if let Some(NfaInstruction::CodepointClass(_, target)) = &state.instruction {
+                // The widest UTF-8 encoding; an upper bound is all this needs.
+                return Some((*target, 4));
+            }
+        }
+        None
+    }
+
+    /// Whether matching this NFA depends on the text to the left of the start
+    /// position — an anchor to the text/line start, a word boundary, or a
+    /// lookbehind.
+    ///
+    /// An engine that searches by handing a *slice* beginning at the candidate
+    /// position must not do so when this holds: the slice's first byte would
+    /// look like the start of the text and like the start of a word.
+    ///
+    /// Lookaround interiors count. They are held behind `Arc` and so are absent
+    /// from `states`, but `(?=^)x` and `(?=\b)x` read left context just as
+    /// surely as a bare `^` or `\b` does.
+    pub fn needs_left_context(&self) -> bool {
+        self.states.iter().any(|s| match s.instruction {
+            Some(
+                NfaInstruction::StartOfText
+                | NfaInstruction::StartOfLine
+                | NfaInstruction::WordBoundary
+                | NfaInstruction::NotWordBoundary
+                | NfaInstruction::PositiveLookbehind(_)
+                | NfaInstruction::NegativeLookbehind(_),
+            ) => true,
+            Some(
+                NfaInstruction::PositiveLookahead(ref inner)
+                | NfaInstruction::NegativeLookahead(ref inner),
+            ) => inner.needs_left_context(),
+            _ => false,
+        })
     }
 
     /// Adds a new state and returns its ID.
@@ -351,5 +496,83 @@ mod tests {
         assert!(closure.contains(&0));
         assert!(closure.contains(&1));
         assert!(closure.contains(&2));
+    }
+}
+
+#[cfg(test)]
+mod max_match_len_tests {
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn bound(pattern: &str) -> Option<usize> {
+        let hir = translate(&parse(pattern).unwrap()).unwrap();
+        crate::nfa::compile(&hir).unwrap().max_match_len
+    }
+
+    #[test]
+    fn fixed_length_patterns_are_exact() {
+        assert_eq!(bound("a"), Some(1));
+        assert_eq!(bound("abc"), Some(3));
+        assert_eq!(bound("[a-z][0-9]"), Some(2));
+    }
+
+    #[test]
+    fn optional_and_alternation_take_the_longest_branch() {
+        assert_eq!(bound("ab?"), Some(2));
+        assert_eq!(bound("a|abc"), Some(3));
+        assert_eq!(bound("(?:ab|c)d"), Some(3));
+        assert_eq!(bound("a{2,4}"), Some(4));
+    }
+
+    #[test]
+    fn multibyte_literals_are_measured_in_bytes() {
+        // The bound guards a byte offset, so it counts bytes, not characters.
+        assert_eq!(bound("é"), Some("é".len()));
+    }
+
+    #[test]
+    fn repetition_is_unbounded() {
+        assert_eq!(bound("a*"), None);
+        assert_eq!(bound("a+"), None);
+        assert_eq!(bound("a.*b"), None);
+        assert_eq!(bound("(?:ab)+"), None);
+    }
+
+    #[test]
+    fn backreferences_are_unbounded() {
+        // Length depends on captured text, not on the graph.
+        assert_eq!(bound(r"(a)\1"), None);
+    }
+
+    #[test]
+    fn zero_width_assertions_add_nothing() {
+        assert_eq!(bound(r"\ba\b"), Some(1));
+        assert_eq!(bound(r"^a$"), Some(1));
+    }
+
+    #[test]
+    fn bound_is_an_upper_bound_on_real_matches() {
+        // Whatever the analysis reports must cover every match the engine finds.
+        for pattern in [
+            "a",
+            "ab?",
+            "a|abc",
+            "[a-z]{1,3}",
+            "é",
+            r"\w\w?",
+            "(?:ab|c)d",
+        ] {
+            let max = bound(pattern).expect("pattern is bounded");
+            let re = crate::Regex::new(pattern).unwrap();
+            for haystack in ["", "a", "ab", "abc", "abcd", "éa", "zzz", "c d"] {
+                if let Some(m) = re.find(haystack) {
+                    assert!(
+                        m.end() - m.start() <= max,
+                        "{pattern:?} matched {:?} in {haystack:?}, over the bound {max}",
+                        m.as_str()
+                    );
+                }
+            }
+        }
     }
 }
