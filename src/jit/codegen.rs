@@ -12,7 +12,7 @@
 //! - The find() method must select the correct start state based on the character
 //!   before the start position
 
-use crate::dfa::{CharClass, DfaStateId, LazyDfa};
+use crate::dfa::{CacheCeilingExceeded, CharClass, DfaStateId, LazyDfa};
 use crate::error::{Error, ErrorKind, Result};
 use dynasmrt::{AssemblyOffset, ExecutableBuffer};
 use std::sync::Mutex;
@@ -25,7 +25,21 @@ const SCAN_BUDGET_FACTOR: usize = 4;
 /// Largest DFA the ARM64 emitter will take, bounded by branch displacement and
 /// code size rather than by anything about the pattern.
 #[cfg(target_arch = "aarch64")]
-const MAX_ARM64_DFA_STATES: usize = 64;
+const MAX_JIT_DFA_STATES: usize = 64;
+
+/// Largest DFA the x86-64 emitter will take, bounded by memory and compile time
+/// rather than by branch range (`rel32` reaches ±2GB, so no jump here can fall
+/// out of range).
+///
+/// Each materialized state costs ~2KB for its `[Option<DfaStateId>; 256]`
+/// transition array — `Option<u32>` has no niche, so 8 bytes per entry — plus
+/// ~4KB of `state_labels` slots, since that `Vec` is indexed by the
+/// *premultiplied* ID: one new state adds `STRIDE` (256) slots at
+/// `size_of::<Option<DynamicLabel>>()` (16 bytes — `DynamicLabel` wraps a
+/// `usize`, so it has no niche either). At ~6KB per state this caps
+/// materialization at roughly 12MB.
+#[cfg(target_arch = "x86_64")]
+const MAX_JIT_DFA_STATES: usize = 2048;
 
 /// A JIT-compiled regex matcher.
 ///
@@ -414,20 +428,6 @@ impl JitCompiler {
         // Step 1: Materialize all reachable DFA states
         let materialized = self.materialize_dfa(dfa)?;
 
-        // The ARM64 emitter resolves branches within a limited displacement, so
-        // a large DFA — a wide Unicode class, typically — has to go elsewhere.
-        #[cfg(target_arch = "aarch64")]
-        if materialized.states.len() > MAX_ARM64_DFA_STATES {
-            return Err(Error::new(
-                ErrorKind::Jit(format!(
-                    "DFA too large for ARM64 JIT ({} states, max {})",
-                    materialized.states.len(),
-                    MAX_ARM64_DFA_STATES
-                )),
-                "",
-            ));
-        }
-
         // The generated code reports one end per start — the greedy one — and
         // checks the assertion there, so a `\b`/`\B`-gated match state is only
         // safe when no *shorter* end could satisfy what the greedy one fails.
@@ -536,72 +536,102 @@ impl JitCompiler {
         let has_multiline_anchors = dfa.has_multiline_anchors();
         let has_multiline_start_anchor = dfa.has_multiline_start_anchor();
 
-        // Get both start states if pattern has word boundaries
-        let start_nonword = dfa.get_start_state_for_class(CharClass::NonWord);
-        let start_word = if has_word_boundary {
-            Some(dfa.get_start_state_for_class(CharClass::Word))
-        } else {
-            None
-        };
+        // The whole walk runs under one suppression scope. State IDs are
+        // premultiplied indices, so a flush anywhere inside it would renumber
+        // the states already sitting in `queue`, in `visited` and in the
+        // recorded transition arrays — the walk would then follow IDs naming
+        // unrelated rows and bake a truncated DFA into machine code, silently.
+        let walk = dfa.with_flushes_suppressed(|dfa| {
+            // Get both start states if pattern has word boundaries
+            let start_nonword = dfa.get_start_state_for_class(CharClass::NonWord);
+            let start_word = if has_word_boundary {
+                Some(dfa.get_start_state_for_class(CharClass::Word))
+            } else {
+                None
+            };
 
-        let mut materialized = MaterializedDfa {
-            states: Vec::new(),
-            start: start_nonword,
-            start_word,
-            has_word_boundary,
-            has_anchors,
-            has_start_anchor,
-            has_end_anchor,
-            has_multiline_anchors,
-            has_multiline_start_anchor,
-        };
+            let mut materialized = MaterializedDfa {
+                states: Vec::new(),
+                start: start_nonword,
+                start_word,
+                has_word_boundary,
+                has_anchors,
+                has_start_anchor,
+                has_end_anchor,
+                has_multiline_anchors,
+                has_multiline_start_anchor,
+            };
 
-        let mut queue = vec![start_nonword];
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(start_nonword);
+            let mut queue = vec![start_nonword];
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(start_nonword);
 
-        // Also add the Word start state to the queue if present
-        if let Some(sw) = start_word {
-            if visited.insert(sw) {
-                queue.push(sw);
-            }
-        }
-
-        while let Some(state_id) = queue.pop() {
-            // Compute all 256 transitions at once using the optimized batch method
-            let transitions = dfa.compute_all_transitions(state_id);
-
-            // Add any new states to the queue
-            for byte in 0..=255u8 {
-                if let Some(next_state) = transitions[byte as usize] {
-                    if visited.insert(next_state) {
-                        queue.push(next_state);
-                    }
+            // Also add the Word start state to the queue if present
+            if let Some(sw) = start_word {
+                if visited.insert(sw) {
+                    queue.push(sw);
                 }
             }
 
-            let is_match = dfa.is_match(state_id);
-            let (needs_word_boundary, needs_not_word_boundary) =
-                dfa.get_state_boundary_requirements(state_id);
-            let (needs_end_of_text, needs_end_of_line) =
-                dfa.get_state_anchor_requirements(state_id);
+            while let Some(state_id) = queue.pop() {
+                // Bound on states *discovered*, not on states processed: a
+                // single state contributes up to 256 successors, so checking
+                // the processed count would let the walk overshoot the cap by
+                // a queue's worth of states before noticing.
+                if visited.len() > MAX_JIT_DFA_STATES {
+                    return Err(Error::new(
+                        ErrorKind::Jit(format!(
+                            "DFA too large for JIT (over {MAX_JIT_DFA_STATES} states)"
+                        )),
+                        "",
+                    ));
+                }
 
-            materialized.states.push(MaterializedState {
-                id: state_id,
-                transitions,
-                is_match,
-                needs_word_boundary,
-                needs_not_word_boundary,
-                needs_end_of_text,
-                needs_end_of_line,
-                prev_class: dfa.get_state_prev_class(state_id),
-            });
+                // Compute all 256 transitions at once using the optimized batch method
+                let transitions = dfa.compute_all_transitions(state_id);
+
+                // Add any new states to the queue
+                for byte in 0..=255u8 {
+                    if let Some(next_state) = transitions[byte as usize] {
+                        if visited.insert(next_state) {
+                            queue.push(next_state);
+                        }
+                    }
+                }
+
+                let is_match = dfa.is_match(state_id);
+                let (needs_word_boundary, needs_not_word_boundary) =
+                    dfa.get_state_boundary_requirements(state_id);
+                let (needs_end_of_text, needs_end_of_line) =
+                    dfa.get_state_anchor_requirements(state_id);
+
+                materialized.states.push(MaterializedState {
+                    id: state_id,
+                    transitions,
+                    is_match,
+                    needs_word_boundary,
+                    needs_not_word_boundary,
+                    needs_end_of_text,
+                    needs_end_of_line,
+                    prev_class: dfa.get_state_prev_class(state_id),
+                });
+            }
+
+            // Sort states by ID for deterministic code generation
+            materialized.states.sort_by_key(|s| s.id);
+
+            Ok(materialized)
+        });
+
+        match walk {
+            Ok(materialized) => materialized,
+            // The state cap is well under the cache ceiling, so reaching the
+            // ceiling here means the walk could not be completed at all.
+            Err(CacheCeilingExceeded) => Err(Error::new(
+                ErrorKind::Jit("DFA state cache exhausted during JIT materialization".to_string()),
+                "",
+            )),
         }
-
-        // Sort states by ID for deterministic code generation
-        materialized.states.sort_by_key(|s| s.id);
-
-        Ok(materialized)
     }
 }
 

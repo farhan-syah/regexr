@@ -13,12 +13,7 @@ use regexr::parser::parse;
 
 /// Helper function to compile a pattern to JIT code.
 fn jit_compile(pattern: &str) -> regexr::jit::CompiledRegex {
-    let ast = parse(pattern).expect("parse failed");
-    let hir = translate(&ast).expect("translate failed");
-    let nfa = compile_nfa(&hir).expect("nfa compile failed");
-    let mut dfa = LazyDfa::new(nfa);
-
-    compile_dfa(&mut dfa).expect("jit compile failed")
+    compile_dfa(&mut dfa_for(pattern)).expect("jit compile failed")
 }
 
 #[test]
@@ -366,4 +361,74 @@ fn test_word_boundary() {
     assert!(jit.is_full_match(b"word"));
     assert!(jit.is_full_match(b"hello"));
     assert!(!jit.is_full_match(b""));
+}
+
+/// Builds the DFA for `pattern` without compiling it, so a test can configure
+/// the state cache before materialization runs.
+fn dfa_for(pattern: &str) -> LazyDfa {
+    let ast = parse(pattern).expect("parse failed");
+    let hir = translate(&ast).expect("translate failed");
+    let nfa = compile_nfa(&hir).expect("nfa compile failed");
+    LazyDfa::new(nfa)
+}
+
+/// What the executable spec (`regexr::reference`) says the match is.
+fn reference_find(pattern: &str, input: &[u8]) -> Option<(usize, usize)> {
+    let ast = parse(pattern).expect("parse failed");
+    let hir = translate(&ast).expect("translate failed");
+    regexr::reference::find(&hir.expr, hir.props.capture_count as usize, input)
+}
+
+#[test]
+fn materialization_survives_a_forced_cache_flush() {
+    // A 12-byte literal is a 13-state chain: one state per matched prefix. With
+    // the cache limited to 8, materializing it has to cross the point where an
+    // unsuppressed flush would fire and renumber every state the walk is still
+    // holding in its queue, its visited set and its recorded transitions.
+    let pattern = "abcdefghijkl";
+    let mut dfa = dfa_for(pattern);
+    dfa.set_cache_limit(8);
+
+    let jit = compile_dfa(&mut dfa).expect("jit compile failed");
+
+    // Every one of these needs states created after the flush point.
+    for input in [
+        &b"abcdefghijkl"[..],
+        b"xxabcdefghijklyy",
+        b"abcdefghijk",
+        b"abcdefghij_abcdefghijkl",
+    ] {
+        assert_eq!(
+            jit.find(input),
+            reference_find(pattern, input),
+            "on {:?}",
+            std::str::from_utf8(input)
+        );
+    }
+}
+
+#[test]
+fn a_dfa_past_the_state_cap_is_refused_not_truncated() {
+    // The automaton cannot tell which `a` is the anchoring one until 12 more
+    // bytes have gone by, so it has to remember the last 13 bytes: 2^13 = 8192
+    // states, far past the 2048-state cap (and reached long before the cache
+    // ceiling, which sits at 4x the 10_000-state default limit).
+    let pattern = "(?:a|b)*a(?:a|b){12}";
+
+    let err = compile_dfa(&mut dfa_for(pattern))
+        .err()
+        .expect("a DFA past the state cap must be refused rather than silently truncated");
+    // Pin the reason: an unrelated compile failure would satisfy `is_err` too,
+    // and would leave the cap itself untested.
+    let message = err.to_string();
+    assert!(
+        message.contains("too large for JIT"),
+        "expected the state cap to reject this DFA, got: {message}"
+    );
+
+    // Refusing is only safe because the engine falls back; the public API still
+    // has to answer, and answer correctly.
+    let re = regexr::Regex::new(pattern).expect("regex compile failed");
+    assert!(re.is_match("abbbabbbabbbab"));
+    assert!(!re.is_match("aaaaaaaaaaaa"));
 }

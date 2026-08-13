@@ -325,6 +325,26 @@ impl LazyDfa {
         self.get_start_state_with_prev_class(prev_class)
     }
 
+    /// Runs `f` with cache flushes suppressed, as a search would.
+    ///
+    /// A flush renumbers every state, so any caller that holds premultiplied
+    /// IDs across several calls — the JIT's materialization BFS, which carries a
+    /// queue and a visited set — needs one consistent numbering for the whole
+    /// walk, not just within a single call. This is the same guard the search
+    /// entry points use, so the cache grows instead of flushing and the deferred
+    /// flush happens once `f` returns.
+    ///
+    /// `Err` means the cache hit its ceiling inside `f`: states are missing, so
+    /// whatever `f` computed is incomplete rather than merely negative.
+    pub(crate) fn with_flushes_suppressed<T>(
+        &mut self,
+        f: impl FnOnce(&mut LazyDfa) -> T,
+    ) -> Result<T, CacheCeilingExceeded> {
+        let mut guard = SearchGuard::new(self);
+        let outcome = f(&mut guard);
+        guard.finish(outcome)
+    }
+
     /// Computes all 256 transitions for a state at once.
     pub fn compute_all_transitions(&mut self, state: DfaStateId) -> [Option<DfaStateId>; 256] {
         let mut result = [None; 256];
