@@ -19,12 +19,30 @@ use crate::vm::{
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::jit;
 
+use super::dfa_pool::LazyDfaPool;
 use super::{needs_boundary_aware_empty_match, select_engine, select_engine_from_hir, EngineType};
 
 /// Returns true if the byte is a word character (alphanumeric or underscore).
 #[inline]
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Runs `search` on `dfa` when the caller already checked one out, or checks
+/// one out from `pool` for just this call.
+///
+/// The `Option<&mut LazyDfa>` dispatch shared by
+/// [`CompiledRegex::find_engine_from`] and [`CompiledRegex::find_at_pos`]: both
+/// take an optional caller-held instance and fall back to the pool.
+fn with_lazy_dfa<T>(
+    pool: &LazyDfaPool,
+    dfa: Option<&mut LazyDfa>,
+    search: impl FnOnce(&mut LazyDfa) -> T,
+) -> T {
+    match dfa {
+        Some(lazy) => search(lazy),
+        None => pool.with(search),
+    }
 }
 
 /// Runs a lazy-DFA search, falling back to the PikeVM when the DFA gives up on
@@ -98,7 +116,10 @@ enum CompiledInner {
     /// Wide Shift-Or for patterns with 65-256 positions.
     /// Uses [u64; 4] for 256-bit state vectors.
     ShiftOrWide(ShiftOrWide),
-    LazyDfa(RwLock<LazyDfa>),
+    /// A pool of lazy DFAs rather than one shared instance: a lazy search
+    /// mutates its state cache, so sharing would serialize concurrent searches
+    /// on a single `Regex` for their whole duration.
+    LazyDfa(LazyDfaPool),
     /// Pre-materialized DFA for fast matching without JIT.
     /// Used for patterns that benefit from eager state computation.
     ///
@@ -241,7 +262,7 @@ impl CompiledRegex {
             if self.engine_searches_single_pass() {
                 let first = self.prefilter.find_candidates(input).next();
                 return match first {
-                    Some(first) => self.find_engine_from_boundary(input, first).is_some(),
+                    Some(first) => self.find_engine_from_boundary(input, first, None).is_some(),
                     None => false,
                 };
             }
@@ -251,7 +272,9 @@ impl CompiledRegex {
                     return true;
                 }
                 if drive.give_up(candidate) {
-                    return self.find_engine_from_boundary(input, candidate).is_some();
+                    return self
+                        .find_engine_from_boundary(input, candidate, None)
+                        .is_some();
                 }
             }
             return false;
@@ -262,14 +285,13 @@ impl CompiledRegex {
             CompiledInner::PikeVm(vm) => vm.is_match(input),
             CompiledInner::ShiftOr(so) => so.is_match(input),
             CompiledInner::ShiftOrWide(so) => so.is_match(input),
-            CompiledInner::LazyDfa(dfa) => {
-                let mut dfa = dfa.write().unwrap();
+            CompiledInner::LazyDfa(pool) => pool.with(|dfa| {
                 lazy_dfa_or_pikevm(
-                    &mut dfa,
+                    dfa,
                     |d| d.find(input).map(|found| found.is_some()),
                     |vm| vm.is_match(input),
                 )
-            }
+            }),
             CompiledInner::EagerDfa(dfa, nfa) => match dfa.find(input) {
                 Ok(found) => found.is_some(),
                 Err(EagerScanBudgetExceeded) => {
@@ -359,6 +381,26 @@ impl CompiledRegex {
     /// position. The prefilter stays on the hot path: it is simply scanned from
     /// `from` instead of from 0.
     pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        self.find_from_with(input, from, None)
+    }
+
+    /// [`Self::find_from`] on a lazy DFA the caller already holds.
+    ///
+    /// Iteration calls this once per match, and for the lazy DFA the pool
+    /// round trip around a single search costs more than the search itself.
+    /// A caller that will search many times — see [`PooledDfa`] — checks one
+    /// instance out up front and passes it here, so the pool is untouched in
+    /// between.
+    ///
+    /// `dfa` is ignored by every other engine, and passing `None` is always
+    /// correct: the lazy DFA then takes an instance from the pool per search,
+    /// exactly as [`Self::find_from`] does.
+    pub fn find_from_with(
+        &self,
+        input: &[u8],
+        from: usize,
+        mut dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         if from > input.len() {
             return None;
         }
@@ -370,7 +412,7 @@ impl CompiledRegex {
         // leftmost match that does start at a boundary.
         let mut from = from;
         loop {
-            let (start, end) = self.find_from_inner(input, from)?;
+            let (start, end) = self.find_from_inner(input, from, dfa.as_deref_mut())?;
             if crate::nfa::is_utf8_boundary(input, start) {
                 return Some((start, end));
             }
@@ -378,7 +420,12 @@ impl CompiledRegex {
         }
     }
 
-    fn find_from_inner(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+    fn find_from_inner(
+        &self,
+        input: &[u8],
+        from: usize,
+        mut dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         // Fast path: if prefilter can provide full match bounds (TeddyFull),
         // return directly without running the NFA
         if self.prefilter.is_full_match() {
@@ -412,13 +459,13 @@ impl CompiledRegex {
                 }
 
                 // Try starting from the candidate position
-                if let Some((start, end)) = self.find_at(input, candidate) {
+                if let Some((start, end)) = self.find_at(input, candidate, dfa.as_deref_mut()) {
                     return Some((start, end));
                 }
 
                 if drive.give_up(inner_pos) {
                     // The caller applies the codepoint-boundary rule.
-                    return self.find_engine_from(input, candidate);
+                    return self.find_engine_from(input, candidate, dfa);
                 }
 
                 // No match found around this inner byte, skip past it
@@ -434,31 +481,36 @@ impl CompiledRegex {
             if self.engine_searches_single_pass() {
                 // The caller applies the codepoint-boundary rule.
                 let first = self.prefilter.find_candidates_from(input, from).next()?;
-                return self.find_engine_from(input, first);
+                return self.find_engine_from(input, first, dfa);
             }
             let mut drive = PrefilterDrive::new();
             for candidate in self.prefilter.find_candidates_from(input, from) {
-                if let Some(result) = self.find_at_pos(input, candidate) {
+                if let Some(result) = self.find_at_pos(input, candidate, dfa.as_deref_mut()) {
                     return Some(result);
                 }
                 if drive.give_up(candidate) {
                     // The caller applies the codepoint-boundary rule.
-                    return self.find_engine_from(input, candidate);
+                    return self.find_engine_from(input, candidate, dfa);
                 }
             }
             return None;
         }
 
         // No prefilter - let the engine scan from the resume position
-        self.find_engine_from(input, from)
+        self.find_engine_from(input, from, dfa)
     }
 
     /// [`CompiledRegex::find_engine_from`] under the codepoint-boundary rule, for
     /// callers that are not already inside [`CompiledRegex::find_from`]'s loop.
-    fn find_engine_from_boundary(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+    fn find_engine_from_boundary(
+        &self,
+        input: &[u8],
+        from: usize,
+        mut dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         let mut from = from;
         loop {
-            let (start, end) = self.find_engine_from(input, from)?;
+            let (start, end) = self.find_engine_from(input, from, dfa.as_deref_mut())?;
             if crate::nfa::is_utf8_boundary(input, start) {
                 return Some((start, end));
             }
@@ -472,19 +524,23 @@ impl CompiledRegex {
     /// whose generated code has no start-offset parameter (the backtracking and
     /// tagged-NFA JITs) fall back internally to their interpreters for patterns
     /// that read left context, so slicing never hides preceding bytes.
-    fn find_engine_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+    fn find_engine_from(
+        &self,
+        input: &[u8],
+        from: usize,
+        dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         match &self.inner {
             CompiledInner::PikeVm(vm) => vm.find_from(input, from),
             CompiledInner::ShiftOr(so) => so.find_at(input, from),
             CompiledInner::ShiftOrWide(so) => so.find_at(input, from),
-            CompiledInner::LazyDfa(dfa) => {
-                let mut dfa = dfa.write().unwrap();
+            CompiledInner::LazyDfa(pool) => with_lazy_dfa(pool, dfa, |lazy| {
                 lazy_dfa_or_pikevm(
-                    &mut dfa,
+                    lazy,
                     |d| d.find_from(input, from),
                     |vm| vm.find_from(input, from),
                 )
-            }
+            }),
             CompiledInner::EagerDfa(dfa, nfa) => match dfa.find_from(input, from) {
                 Ok(result) => result,
                 Err(EagerScanBudgetExceeded) => {
@@ -527,6 +583,20 @@ impl CompiledRegex {
     /// an explicit start offset, so a resumed search still sees the text to the
     /// left of `from`. All reported slots are absolute input offsets.
     pub fn captures_from(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+        self.captures_from_with(input, from, None)
+    }
+
+    /// [`Self::captures_from`] on a lazy DFA the caller already holds.
+    ///
+    /// See [`Self::find_from_with`]: the instance only ever reaches the
+    /// two-pass path's bounds search, which is the only part of capture
+    /// extraction that runs the lazy DFA.
+    pub fn captures_from_with(
+        &self,
+        input: &[u8],
+        from: usize,
+        dfa: Option<&mut LazyDfa>,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
         if from > input.len() {
             return None;
         }
@@ -559,7 +629,7 @@ impl CompiledRegex {
                 }
 
                 // Two-pass capture strategy for DFA JIT (fallback)
-                self.captures_two_pass(input, from)
+                self.captures_two_pass(input, from, dfa)
             }
             CompiledInner::ShiftOr(_)
             | CompiledInner::ShiftOrWide(_)
@@ -570,7 +640,7 @@ impl CompiledRegex {
                     return backtracking_vm.captures_from(input, from);
                 }
 
-                self.captures_two_pass(input, from)
+                self.captures_two_pass(input, from, dfa)
             }
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::JitShiftOr(_) => {
@@ -581,7 +651,7 @@ impl CompiledRegex {
                 }
 
                 // Fall back to two-pass strategy if no BacktrackingJit
-                self.captures_two_pass(input, from)
+                self.captures_two_pass(input, from, dfa)
             }
         }
     }
@@ -655,7 +725,12 @@ impl CompiledRegex {
     /// locates the match and writes the slots in a single deterministic scan (see
     /// [`CompiledRegex::captures_one_pass`]), so the match region is walked once
     /// instead of once by the search engine and again by the capture pass.
-    fn captures_two_pass(&self, input: &[u8], from: usize) -> Option<Vec<Option<(usize, usize)>>> {
+    fn captures_two_pass(
+        &self,
+        input: &[u8],
+        from: usize,
+        dfa: Option<&mut LazyDfa>,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
         let mut from = from;
         if let Some(ref one_pass) = self.one_pass {
             match self.captures_one_pass(one_pass, input, from) {
@@ -668,7 +743,7 @@ impl CompiledRegex {
             }
         }
 
-        let (match_start, match_end) = self.find_from(input, from)?;
+        let (match_start, match_end) = self.find_from_with(input, from, dfa)?;
 
         if let Some(ref one_pass) = self.one_pass {
             if let Some(slots) = one_pass.captures_at(input, match_start) {
@@ -758,14 +833,19 @@ impl CompiledRegex {
     /// This method passes the full input to allow engines to check context
     /// (e.g., for word boundary assertions).
     fn is_match_at(&self, input: &[u8], pos: usize) -> bool {
-        self.find_at_pos(input, pos).is_some()
+        self.find_at_pos(input, pos, None).is_some()
     }
 
     /// Find a match starting exactly at `pos`.
     ///
     /// This method passes the full input to allow engines to check context
     /// (e.g., for word boundary assertions).
-    fn find_at_pos(&self, input: &[u8], pos: usize) -> Option<(usize, usize)> {
+    fn find_at_pos(
+        &self,
+        input: &[u8],
+        pos: usize,
+        dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         if pos > input.len() {
             return None;
         }
@@ -773,17 +853,16 @@ impl CompiledRegex {
             CompiledInner::PikeVm(vm) => vm.find_at(input, pos),
             CompiledInner::ShiftOr(so) => so.try_match_at(input, pos),
             CompiledInner::ShiftOrWide(so) => so.try_match_at(input, pos),
-            CompiledInner::LazyDfa(dfa) => {
-                let mut dfa = dfa.write().unwrap();
+            CompiledInner::LazyDfa(pool) => with_lazy_dfa(pool, dfa, |lazy| {
                 lazy_dfa_or_pikevm(
-                    &mut dfa,
+                    lazy,
                     |d| {
                         d.find_at(input, pos)
                             .map(|found| found.map(|end| (pos, end)))
                     },
                     |vm| vm.find_at(input, pos),
                 )
-            }
+            }),
             CompiledInner::EagerDfa(dfa, _) => dfa.find_at(input, pos).map(|end| (pos, end)),
             CompiledInner::CodepointClass(matcher) => {
                 // CodepointClass doesn't support word boundaries, use sliced input
@@ -804,14 +883,90 @@ impl CompiledRegex {
     }
 
     /// Find a match starting at or after `pos`.
-    fn find_at(&self, input: &[u8], pos: usize) -> Option<(usize, usize)> {
+    fn find_at(
+        &self,
+        input: &[u8],
+        pos: usize,
+        mut dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         // Try each position starting from pos
         for start in pos..=input.len() {
-            if let Some(result) = self.find_at_pos(input, start) {
+            if let Some(result) = self.find_at_pos(input, start, dfa.as_deref_mut()) {
                 return Some(result);
             }
         }
         None
+    }
+
+    /// Takes a lazy-DFA instance out of the pool, or `None` when the compiled
+    /// engine is not the lazy DFA and there is nothing to hand out.
+    pub(crate) fn checkout_lazy_dfa(&self) -> Option<LazyDfa> {
+        match &self.inner {
+            CompiledInner::LazyDfa(pool) => Some(pool.checkout()),
+            _ => None,
+        }
+    }
+
+    /// Returns an instance taken by [`Self::checkout_lazy_dfa`].
+    pub(crate) fn checkin_lazy_dfa(&self, dfa: LazyDfa) {
+        if let CompiledInner::LazyDfa(pool) = &self.inner {
+            pool.checkin(dfa);
+        }
+    }
+}
+
+/// A lazy DFA held out of a [`CompiledRegex`]'s pool for the lifetime of an
+/// iterator, and returned to it on drop.
+///
+/// Iteration runs one search per match, so a per-search pool round trip is
+/// paid once per match — two lock acquisitions around a search that can be a
+/// few tens of nanoseconds. Checking one instance out for the whole iteration
+/// removes the pool from the hot path entirely, and keeps the state cache warm
+/// across matches instead of possibly landing on a different instance each
+/// time. That is a cache-warmth difference only: every instance runs the same
+/// subset construction over the same NFA, so it cannot change what is matched.
+pub struct PooledDfa<'r> {
+    regex: &'r CompiledRegex,
+    /// `None` when the engine is not the lazy DFA, which is then also what the
+    /// searches receive — they fall back to their own engine as usual.
+    dfa: Option<LazyDfa>,
+}
+
+impl<'r> PooledDfa<'r> {
+    /// Takes an instance for `regex`, if its engine has one to give.
+    pub fn checkout(regex: &'r CompiledRegex) -> Self {
+        Self {
+            regex,
+            dfa: regex.checkout_lazy_dfa(),
+        }
+    }
+
+    /// The instance to pass to [`CompiledRegex::find_from_with`] and friends.
+    pub fn get(&mut self) -> Option<&mut LazyDfa> {
+        self.dfa.as_mut()
+    }
+}
+
+impl Drop for PooledDfa<'_> {
+    fn drop(&mut self) {
+        // Dropped while unwinding, the instance goes with the panic rather
+        // than being handed to the next search in whatever state it left the
+        // cache — the same choice `LazyDfaPool::with` makes. The pool clones
+        // its template when it runs dry, so losing one costs only its states.
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(dfa) = self.dfa.take() {
+            self.regex.checkin_lazy_dfa(dfa);
+        }
+    }
+}
+
+impl std::fmt::Debug for PooledDfa<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledDfa")
+            .field("held", &self.dfa.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -833,14 +988,14 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
             // Fall back to LazyDfa, keep NFA for captures
             let capture_nfa = Some(nfa.clone());
             (
-                CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                 capture_nfa,
             )
         }
         EngineType::LazyDfa => {
             let capture_nfa = Some(nfa.clone());
             (
-                CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                 capture_nfa,
             )
         }
@@ -849,7 +1004,7 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
             // JIT not implemented yet, fall back to LazyDfa
             let capture_nfa = Some(nfa.clone());
             (
-                CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                 capture_nfa,
             )
         }
@@ -977,7 +1132,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                     let nfa = nfa::compile(hir)?;
                     let capture_nfa = Some(nfa.clone());
                     (
-                        CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                        CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                         capture_nfa,
                     )
                 }
@@ -996,7 +1151,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                     let nfa = nfa::compile(hir)?;
                     let capture_nfa = Some(nfa.clone());
                     (
-                        CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                        CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                         capture_nfa,
                     )
                 }
@@ -1013,7 +1168,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             // for large Unicode classes.
             if hir.props.has_large_unicode_class || hir.props.has_anchors {
                 (
-                    CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                    CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                     capture_nfa,
                 )
             } else {
@@ -1031,7 +1186,9 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                         // fresh LazyDfa, which computes the identical states
                         // on demand instead of upfront.
                         (
-                            CompiledInner::LazyDfa(RwLock::new(LazyDfa::new((*nfa_arc).clone()))),
+                            CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(
+                                (*nfa_arc).clone(),
+                            ))),
                             capture_nfa,
                         )
                     }
@@ -1047,7 +1204,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             // Use LazyDfa for patterns with large Unicode classes or anchors
             if hir.props.has_large_unicode_class || hir.props.has_anchors {
                 (
-                    CompiledInner::LazyDfa(RwLock::new(LazyDfa::new(nfa))),
+                    CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(nfa))),
                     capture_nfa,
                 )
             } else {
@@ -1063,7 +1220,9 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                         // fresh LazyDfa, which computes the identical states
                         // on demand instead of upfront.
                         (
-                            CompiledInner::LazyDfa(RwLock::new(LazyDfa::new((*nfa_arc).clone()))),
+                            CompiledInner::LazyDfa(LazyDfaPool::new(LazyDfa::new(
+                                (*nfa_arc).clone(),
+                            ))),
                             capture_nfa,
                         )
                     }

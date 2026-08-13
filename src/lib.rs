@@ -32,7 +32,7 @@ pub mod simd;
 
 pub use error::{Error, Result};
 
-use engine::CompiledRegex;
+use engine::{CompiledRegex, PooledDfa};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -445,6 +445,7 @@ impl Regex {
                 text.len() + 1
             },
             skip_empty_at: None,
+            dfa: PooledDfa::checkout(&self.inner),
         }
     }
 
@@ -582,6 +583,11 @@ fn into_string_lossy(bytes: Vec<u8>) -> String {
 pub struct Matches<'a> {
     inner: MatchesInner<'a>,
     text: &'a str,
+    /// A lazy DFA checked out for the whole iteration rather than per match,
+    /// and returned to the pool when this iterator is dropped — including when
+    /// it is dropped part-way through. `None` unless the generic path is
+    /// taken; the other paths never run the engine.
+    dfa: Option<PooledDfa<'a>>,
 }
 
 impl<'a> std::fmt::Debug for Matches<'a> {
@@ -625,7 +631,9 @@ impl<'a> Matches<'a> {
                 skip_empty_at: None,
             }
         };
-        Matches { inner, text }
+        let dfa = matches!(inner, MatchesInner::Generic { .. })
+            .then(|| PooledDfa::checkout(&regex.inner));
+        Matches { inner, text, dfa }
     }
 }
 
@@ -633,6 +641,9 @@ impl<'a> Iterator for Matches<'a> {
     type Item = Match<'a>;
 
     fn next(&mut self) -> Option<Match<'a>> {
+        // Disjoint from the `self.inner` borrow below, so the checked-out
+        // instance stays reachable inside the match arms.
+        let held = &mut self.dfa;
         match &mut self.inner {
             MatchesInner::Empty => None,
             MatchesInner::TeddyFull(iter) => {
@@ -657,8 +668,11 @@ impl<'a> Iterator for Matches<'a> {
                     // rather than run on a slice starting there, so `^`, `\b`/`\B`
                     // and lookbehind still see the real text to the left of the
                     // resume point.
-                    let (abs_start, abs_end) =
-                        regex.inner.find_from(self.text.as_bytes(), *last_end)?;
+                    let (abs_start, abs_end) = regex.inner.find_from_with(
+                        self.text.as_bytes(),
+                        *last_end,
+                        held.as_mut().and_then(|held| held.get()),
+                    )?;
 
                     // Every match already ends on a codepoint boundary (the
                     // engine-wide rule, see `nfa::is_utf8_boundary`), so
@@ -701,6 +715,9 @@ pub struct CapturesIter<'r, 't> {
     last_end: usize,
     /// See `MatchesInner::Generic::skip_empty_at`.
     skip_empty_at: Option<usize>,
+    /// See `Matches::dfa`: one instance for the whole iteration, returned to
+    /// the pool when this iterator is dropped.
+    dfa: PooledDfa<'r>,
 }
 
 impl<'r, 't> Iterator for CapturesIter<'r, 't> {
@@ -714,10 +731,11 @@ impl<'r, 't> Iterator for CapturesIter<'r, 't> {
 
             // Resumed at an offset into the original text, for the same reason as
             // `Matches::next`; the slots come back as absolute offsets.
-            let slots = self
-                .regex
-                .inner
-                .captures_from(self.text.as_bytes(), self.last_end)?;
+            let slots = self.regex.inner.captures_from_with(
+                self.text.as_bytes(),
+                self.last_end,
+                self.dfa.get(),
+            )?;
             let (start, end) = slots.first().and_then(|s| *s)?;
 
             // Resume at the next UTF-8 character boundary, ensuring progress on

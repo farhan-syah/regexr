@@ -2,6 +2,7 @@
 //!
 //! Selects the optimal execution strategy based on pattern properties.
 
+mod dfa_pool;
 mod executor;
 mod selector;
 
