@@ -265,6 +265,15 @@ pub struct LazyDfaContext {
     /// scan reject a start outright instead of re-checking it per state, which
     /// is what `([a-zA-Z]+)*$` needs to stay fast over a non-matching input.
     pub(crate) has_clean_accept: bool,
+    /// How many transitions have been computed one byte at a time.
+    ///
+    /// `compute_all_transitions` computes a whole row in one batched pass, so
+    /// this counter stays put across such a call. The unit test that proves the
+    /// batched and per-byte paths agree asserts exactly that, which is what
+    /// keeps the batching from being quietly replaced by a per-byte loop that
+    /// would still pass the equality check.
+    #[cfg(test)]
+    pub(crate) per_byte_computations: usize,
 }
 
 impl LazyDfaContext {
@@ -315,6 +324,8 @@ impl LazyDfaContext {
             has_multiline_anchors,
             has_multiline_start_anchor,
             has_clean_accept,
+            #[cfg(test)]
+            per_byte_computations: 0,
         };
 
         // Create the start state

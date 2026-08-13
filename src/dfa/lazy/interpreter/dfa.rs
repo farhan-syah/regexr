@@ -198,6 +198,11 @@ impl LazyDfa {
 
     /// Computes a transition, handling word boundaries and anchors.
     fn compute_transition(&mut self, state: DfaStateId, byte: u8) -> Option<DfaStateId> {
+        #[cfg(test)]
+        {
+            self.ctx.per_byte_computations += 1;
+        }
+
         let state_idx = state_index(state);
         let dfa_state = self.ctx.states.get(state_idx)?;
         let nfa_states = dfa_state.nfa_states.clone();
@@ -472,24 +477,228 @@ impl LazyDfa {
     }
 
     /// Computes all transitions for patterns with word boundaries or anchors.
+    ///
+    /// Computing these one byte at a time repeats almost all of the work 256
+    /// times: [`LazyDfa::compute_transition`] re-expands this state's subset,
+    /// walks the target closure and re-checks match reachability per byte, even
+    /// though only two things about the byte are visible to any of it. The first
+    /// expansion sees the byte solely through `prev_class != CharClass::from_byte(byte)`,
+    /// a two-valued question; the target's position context sees it solely
+    /// through `byte == b'\n'`. So the expansion has at most two distinct
+    /// answers over the whole alphabet, and the rest is driven by the target
+    /// subset, which is constant across runs of bytes that lead to the same
+    /// NFA states.
+    ///
+    /// This computes each distinct answer once and then sweeps the alphabet in
+    /// order, doing the closure/reachability/interning work once per run of
+    /// adjacent bytes that agree on all three of character class, target
+    /// position context, and target subset. The transitions it writes are the
+    /// same ones the per-byte path writes, including the state IDs: the sweep
+    /// runs in byte order and never merges across a class change, so states are
+    /// interned in the same order they would have been.
     fn compute_all_transitions_with_context(
         &mut self,
         state: DfaStateId,
         result: &mut [Option<DfaStateId>; 256],
     ) {
-        for byte in 0..=255u8 {
+        let state_idx = state_index(state);
+        let Some(prev_class) = self.ctx.states.get(state_idx).map(|s| s.prev_class) else {
+            // No such state: fall back, so a partially populated row is still
+            // reported exactly as the per-byte path reports it.
+            self.compute_transitions_per_byte(state, result, 0);
+            return;
+        };
+
+        // Which target set each byte leads to, taken from the expansion that
+        // byte's own character class selects.
+        let mut byte_targets: [Option<BTreeSet<NfaStateId>>; 256] = std::array::from_fn(|_| None);
+        {
+            let nfa = &self.ctx.nfa;
+            let seeds = match self.ctx.states.get(state_idx) {
+                Some(s) => &s.nfa_states,
+                None => return,
+            };
+
+            let pos_ctx = if self.ctx.has_anchors {
+                Some(PositionContext::middle())
+            } else {
+                None
+            };
+            let boundary = |curr_class: CharClass| {
+                if self.ctx.has_word_boundary {
+                    Some(prev_class != curr_class)
+                } else {
+                    None
+                }
+            };
+
+            let expanded_non_word =
+                epsilon_closure_with_context(nfa, seeds, boundary(CharClass::NonWord), pos_ctx);
+            // Without `\b`/`\B` the boundary answer is `None` either way, so the
+            // two classes share one expansion.
+            let expanded_word = if self.ctx.has_word_boundary {
+                Some(epsilon_closure_with_context(
+                    nfa,
+                    seeds,
+                    boundary(CharClass::Word),
+                    pos_ctx,
+                ))
+            } else {
+                None
+            };
+            let expanded_word_ref = expanded_word.as_ref().unwrap_or(&expanded_non_word);
+
+            for (class, expanded) in [
+                (CharClass::NonWord, &expanded_non_word),
+                (CharClass::Word, expanded_word_ref),
+            ] {
+                for &nfa_state in expanded {
+                    if let Some(nfa_s) = nfa.get(nfa_state) {
+                        for (range, target) in &nfa_s.transitions {
+                            for byte in range.start..=range.end {
+                                if CharClass::from_byte(byte) == class {
+                                    byte_targets[byte as usize]
+                                        .get_or_insert_with(BTreeSet::new)
+                                        .insert(*target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Captured by value: the sweep below mutates the transition table, so a
+        // closure holding a borrow of `self` could not live across it.
+        let newline_starts_a_line = self.ctx.has_anchors && self.ctx.has_multiline_anchors;
+        let target_pos_ctx = move |byte: u8| {
+            if newline_starts_a_line && byte == b'\n' {
+                Some(PositionContext::after_newline())
+            } else {
+                None
+            }
+        };
+
+        let mut byte = 0usize;
+        while byte < 256 {
             let cache_idx = (state + byte as u32) as usize;
             if cache_idx < self.ctx.transitions.len() {
                 let tagged = self.ctx.transitions[cache_idx];
                 if !is_unknown_state(tagged) {
                     if !is_dead_state(tagged) {
-                        result[byte as usize] = Some(untag_state(tagged));
+                        result[byte] = Some(untag_state(tagged));
+                    }
+                    byte += 1;
+                    continue;
+                }
+            }
+
+            let targets = match &byte_targets[byte] {
+                Some(targets) if !targets.is_empty() => targets,
+                _ => {
+                    if cache_idx < self.ctx.transitions.len() {
+                        self.ctx.transitions[cache_idx] = DEAD_STATE;
+                    }
+                    byte += 1;
+                    continue;
+                }
+            };
+
+            let curr_class = CharClass::from_byte(byte as u8);
+            let pos_ctx = target_pos_ctx(byte as u8);
+
+            // Extend the run over adjacent bytes that would compute the same
+            // thing. A class change ends it unconditionally: the class is part
+            // of the interned state's key, so bytes of different classes are
+            // different transitions even when their target subsets coincide.
+            let mut end = byte + 1;
+            while end < 256 {
+                let idx = (state + end as u32) as usize;
+                if idx < self.ctx.transitions.len() && !is_unknown_state(self.ctx.transitions[idx])
+                {
+                    break;
+                }
+                if CharClass::from_byte(end as u8) != curr_class {
+                    break;
+                }
+                if target_pos_ctx(end as u8) != pos_ctx {
+                    break;
+                }
+                match &byte_targets[end] {
+                    Some(next) if next == targets => {}
+                    _ => break,
+                }
+                end += 1;
+            }
+
+            let next_closure = epsilon_closure_with_context(&self.ctx.nfa, targets, None, pos_ctx);
+            if next_closure.is_empty() {
+                for dead_byte in byte..end {
+                    let idx = (state + dead_byte as u32) as usize;
+                    if idx < self.ctx.transitions.len() {
+                        self.ctx.transitions[idx] = DEAD_STATE;
+                    }
+                }
+                byte = end;
+                continue;
+            }
+
+            let next_clean =
+                match_reachable_without_end_assertion(&self.ctx.nfa, targets, None, pos_ctx);
+            let flushes_before = self.ctx.flush_count;
+            let next_id =
+                get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class, next_clean);
+            result[byte] = Some(next_id);
+
+            // `state` is a premultiplied index into the table. Creating the
+            // target may have flushed the cache, which renumbers every state, so
+            // the row this index names is no longer this state's row — writing
+            // there would cache the transition against an unrelated state. The
+            // flush also invalidates the run: the per-byte path would rebuild
+            // the interned state for each remaining byte, so hand them back to
+            // it rather than reusing an ID from before the flush.
+            if self.ctx.flush_count != flushes_before {
+                self.compute_transitions_per_byte(state, result, byte + 1);
+                return;
+            }
+
+            let next_idx = state_index(next_id);
+            let is_match = self.ctx.states.get(next_idx).is_some_and(|s| s.is_match);
+            for (run_byte, slot) in result.iter_mut().enumerate().take(end).skip(byte) {
+                *slot = Some(next_id);
+                let idx = (state + run_byte as u32) as usize;
+                if idx < self.ctx.transitions.len() {
+                    self.ctx.transitions[idx] = tag_state(next_id, is_match);
+                }
+            }
+
+            byte = end;
+        }
+    }
+
+    /// Fills `result[from..]` by computing one transition per byte.
+    ///
+    /// The unbatched path, kept for the cases
+    /// [`LazyDfa::compute_all_transitions_with_context`] cannot batch.
+    fn compute_transitions_per_byte(
+        &mut self,
+        state: DfaStateId,
+        result: &mut [Option<DfaStateId>; 256],
+        from: usize,
+    ) {
+        for (byte, slot) in result.iter_mut().enumerate().skip(from) {
+            let cache_idx = (state + byte as u32) as usize;
+            if cache_idx < self.ctx.transitions.len() {
+                let tagged = self.ctx.transitions[cache_idx];
+                if !is_unknown_state(tagged) {
+                    if !is_dead_state(tagged) {
+                        *slot = Some(untag_state(tagged));
                     }
                     continue;
                 }
             }
-            if let Some(target) = self.transition(state, byte) {
-                result[byte as usize] = Some(target);
+            if let Some(target) = self.transition(state, byte as u8) {
+                *slot = Some(target);
             }
         }
     }
@@ -1256,10 +1465,138 @@ mod tests {
     use crate::dfa::EagerDfa;
     use crate::hir::translate;
     use crate::parser::parse;
+    use std::collections::{HashSet, VecDeque};
 
     fn dfa(pattern: &str) -> LazyDfa {
         let hir = parse(pattern).and_then(|ast| translate(&ast)).unwrap();
         LazyDfa::new(crate::nfa::compile(&hir).unwrap())
+    }
+
+    /// REFERENCE IMPLEMENTATION — the unbatched row computation.
+    ///
+    /// One [`LazyDfa::compute_transition`] per byte, which is what
+    /// `compute_all_transitions_with_context` did before it was batched. It is
+    /// deliberately written against `transition`, the untouched per-byte entry
+    /// point, so comparing the two is not circular.
+    fn reference_all_transitions(
+        lazy: &mut LazyDfa,
+        state: DfaStateId,
+    ) -> [Option<DfaStateId>; 256] {
+        let mut result = [None; 256];
+        for byte in 0..=255u8 {
+            let cache_idx = (state + byte as u32) as usize;
+            if cache_idx < lazy.ctx.transitions.len() {
+                let tagged = lazy.ctx.transitions[cache_idx];
+                if !is_unknown_state(tagged) {
+                    if !is_dead_state(tagged) {
+                        result[byte as usize] = Some(untag_state(tagged));
+                    }
+                    continue;
+                }
+            }
+            if let Some(target) = lazy.transition(state, byte) {
+                result[byte as usize] = Some(target);
+            }
+        }
+        result
+    }
+
+    /// The batched row computation must be indistinguishable from the per-byte
+    /// one — same targets, same state IDs, for every reachable state and every
+    /// one of the 256 bytes.
+    ///
+    /// Two independent DFAs are walked in lockstep from the same pattern, so
+    /// the comparison covers the interned IDs too: batching that merged bytes
+    /// across a character-class boundary, or that swept the alphabet
+    /// class-by-class instead of in byte order, would intern states in a
+    /// different order and show up here as mismatched IDs rather than as a
+    /// silently different-but-equivalent automaton.
+    ///
+    /// The counter assertion is the second half: it fails if the batched path
+    /// ever falls back to computing a transition one byte at a time, so this
+    /// test cannot pass with the optimization removed.
+    #[test]
+    fn batched_context_transitions_match_the_per_byte_path() {
+        for pattern in [
+            r"\b\w+\b",
+            r"\bfoo\b",
+            r"\B\w+",
+            r"(?m)^\w+$",
+            r"^\w+$",
+            r"(?m)\b\w+\b$",
+            // `\t` and `\n` are adjacent bytes of the same class leading to the
+            // same NFA states, yet only `\n` opens the `^a` branch — so the run
+            // that would otherwise merge them must be split on position
+            // context, not just on target subset.
+            r"(?m)([\t\n]|^a)+",
+            // These pin the class-boundary run terminator, and the boundary has
+            // to come *after* the consumed byte for them to bite. Every byte
+            // reaches the same NFA states, so target-subset equality alone would
+            // merge the whole row into one run — but `/` (0x2F) and `0` (0x30)
+            // are adjacent across the Word/NonWord split, and the trailing `\b`
+            // means the interned target still carries the consumed byte's class,
+            // so they must become *different* DFA states.
+            //
+            // A leading boundary (`\b.`) does NOT work here: nothing downstream
+            // reads the class, so merging across the split is harmless and the
+            // test stays green with the terminator deleted. Without `.\b` this
+            // guard is caught only by the randomized `resumed_iteration_matches_
+            // reference` fuzz — verified by deleting it and watching this fail
+            // at exactly byte 0x30.
+            r".\b",
+            r"(?s).\B",
+        ] {
+            let mut batched = dfa(pattern);
+            let mut per_byte = dfa(pattern);
+            assert!(
+                batched.has_word_boundary() || batched.has_anchors(),
+                "{pattern:?} must reach the context path for this test to mean anything"
+            );
+
+            let mut seen: HashSet<DfaStateId> = HashSet::new();
+            let mut queue: VecDeque<DfaStateId> = VecDeque::new();
+            for class in [CharClass::NonWord, CharClass::Word] {
+                let start = batched.get_start_state_for_class(class);
+                assert_eq!(
+                    start,
+                    per_byte.get_start_state_for_class(class),
+                    "{pattern:?}: start states diverged before any transition"
+                );
+                if seen.insert(start) {
+                    queue.push_back(start);
+                }
+            }
+
+            while let Some(state) = queue.pop_front() {
+                let before = batched.ctx.per_byte_computations;
+                let got = batched.compute_all_transitions(state);
+                assert_eq!(
+                    batched.ctx.per_byte_computations, before,
+                    "{pattern:?} state {state}: the batched path fell back to per-byte work"
+                );
+
+                let want = reference_all_transitions(&mut per_byte, state);
+                for (byte, (batched_target, per_byte_target)) in
+                    got.iter().zip(want.iter()).enumerate()
+                {
+                    assert_eq!(
+                        batched_target, per_byte_target,
+                        "{pattern:?} state {state} byte {byte:#04x}"
+                    );
+                }
+
+                for &target in got.iter().flatten() {
+                    if seen.insert(target) {
+                        queue.push_back(target);
+                    }
+                }
+            }
+
+            assert!(
+                seen.len() > 1,
+                "{pattern:?}: expected more than the start state to be reachable"
+            );
+        }
     }
 
     /// An end anchor belongs to the branch that carries it, not to the pattern.
