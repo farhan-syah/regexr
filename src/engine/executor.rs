@@ -446,7 +446,7 @@ impl CompiledRegex {
         &self,
         input: &[u8],
         from: usize,
-        mut dfa: Option<&mut LazyDfa>,
+        dfa: Option<&mut LazyDfa>,
     ) -> Option<(usize, usize)> {
         if from > input.len() {
             return None;
