@@ -6,6 +6,7 @@
 use crate::nfa::Nfa;
 
 use super::interpreter::LazyDfa;
+use super::shared::CacheCeilingExceeded;
 
 /// Lazy DFA engine that wraps the interpreter.
 ///
@@ -32,20 +33,33 @@ impl LazyDfaEngine {
     }
 
     /// Returns true if the pattern matches the entire input.
+    ///
+    /// `Err` means the search gave up on the state-cache ceiling; see
+    /// [`LazyDfa::find_from`].
     #[inline]
-    pub fn is_match_bytes(&mut self, input: &[u8]) -> bool {
+    pub fn is_match_bytes(&mut self, input: &[u8]) -> Result<bool, CacheCeilingExceeded> {
         self.dfa.is_match_bytes(input)
     }
 
     /// Finds the first match, returning (start, end).
+    ///
+    /// `Err` means the search gave up on the state-cache ceiling; see
+    /// [`LazyDfa::find_from`].
     #[inline]
-    pub fn find(&mut self, input: &[u8]) -> Option<(usize, usize)> {
+    pub fn find(&mut self, input: &[u8]) -> Result<Option<(usize, usize)>, CacheCeilingExceeded> {
         self.dfa.find(input)
     }
 
-    /// Finds a match starting at or after the given position.
+    /// Finds a match starting at the given position, returning its end.
+    ///
+    /// `Err` means the search gave up on the state-cache ceiling; see
+    /// [`LazyDfa::find_from`].
     #[inline]
-    pub fn find_at(&mut self, input: &[u8], pos: usize) -> Option<usize> {
+    pub fn find_at(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+    ) -> Result<Option<usize>, CacheCeilingExceeded> {
         self.dfa.find_at(input, pos)
     }
 

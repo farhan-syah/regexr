@@ -3,6 +3,7 @@
 //! Contains types used by both the interpreter and potentially a JIT backend.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::hir::unicode::is_word_byte;
 use crate::nfa::{Nfa, NfaInstruction, StateId as NfaStateId};
@@ -40,6 +41,27 @@ pub const UNKNOWN_STATE: u32 = TAG_DEAD;
 
 /// Default cache limit (number of states).
 pub const DEFAULT_CACHE_LIMIT: usize = 10_000;
+
+/// How far past [`LazyDfaContext::cache_limit`] the cache may grow while a
+/// search is in flight.
+///
+/// A search holds premultiplied state IDs in registers, so flushing under it
+/// would leave those IDs pointing at nothing; flushes are therefore deferred
+/// until the search ends and the cache is allowed to grow instead. That growth
+/// still has to stop somewhere: every cached state costs ~1KB for its 256×u32
+/// transition row, plus a second row of the same size once the unanchored table
+/// is built. At 4× the 10_000-state default that is a ~90MB worst case for a
+/// single search — high enough that no ordinary pattern reaches it, bounded
+/// enough that a pathological one cannot exhaust memory.
+pub const CACHE_GROWTH_CEILING_FACTOR: usize = 4;
+
+/// A lazy-DFA search stopped because the state cache could not grow further.
+///
+/// Distinct from "no match": the transition table is incomplete, so the answer
+/// is unknown. Callers re-run the search on an engine without a state cache
+/// (the PikeVM) rather than reporting the partial scan's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheCeilingExceeded;
 
 /// Position context for anchor assertions.
 /// Tracks what we know about the current position relative to input boundaries.
@@ -166,7 +188,10 @@ impl DfaState {
 #[derive(Debug, Clone)]
 pub struct LazyDfaContext {
     /// The underlying NFA.
-    pub(crate) nfa: Nfa,
+    ///
+    /// Shared rather than owned so a fallback engine — the PikeVM, when a search
+    /// gives up on the cache ceiling — can be built from it without copying it.
+    pub(crate) nfa: Arc<Nfa>,
     /// DFA states metadata (NFA state set, match status, etc.).
     pub(crate) states: Vec<DfaState>,
     /// Dense transition table: transitions[state_id + byte] = tagged next state.
@@ -195,6 +220,20 @@ pub struct LazyDfaContext {
     pub(crate) cache_limit: usize,
     /// Number of cache flushes (for debugging/profiling).
     pub(crate) flush_count: usize,
+    /// How many searches are currently holding state IDs.
+    ///
+    /// A running search keeps premultiplied IDs outside the context, and a flush
+    /// invalidates every one of them, so flushing is suppressed while this is
+    /// non-zero and performed when it drops back to zero. It counts rather than
+    /// flags because a search may nest inside another one.
+    pub(crate) search_depth: u32,
+    /// Set when a search needed a state the cache is no longer allowed to hold.
+    ///
+    /// Written only by [`get_or_create_state_with_class`] and consumed only by
+    /// the outermost search entry point, which turns it into a
+    /// [`CacheCeilingExceeded`] the caller cannot ignore. It is never a public
+    /// signal: the typed return is.
+    pub(crate) ceiling_exceeded: bool,
     /// Whether this pattern has word boundary assertions.
     /// When true, states are keyed by (nfa_states, prev_class).
     pub(crate) has_word_boundary: bool,
@@ -249,7 +288,7 @@ impl LazyDfaContext {
         });
 
         let mut ctx = Self {
-            nfa,
+            nfa: Arc::new(nfa),
             states: Vec::new(),
             transitions: Vec::new(),
             transitions_unanchored: Vec::new(),
@@ -258,6 +297,8 @@ impl LazyDfaContext {
             start: 0,
             cache_limit: DEFAULT_CACHE_LIMIT,
             flush_count: 0,
+            search_depth: 0,
+            ceiling_exceeded: false,
             has_word_boundary,
             has_anchors,
             has_start_anchor,
@@ -360,6 +401,18 @@ impl LazyDfaContext {
     /// Sets the cache size limit.
     pub fn set_cache_limit(&mut self, limit: usize) {
         self.cache_limit = limit;
+    }
+
+    /// The most states the cache may hold while a search defers its flush.
+    ///
+    /// See [`CACHE_GROWTH_CEILING_FACTOR`].
+    pub fn cache_ceiling(&self) -> usize {
+        self.cache_limit.saturating_mul(CACHE_GROWTH_CEILING_FACTOR)
+    }
+
+    /// The NFA this DFA is built from, shareable without copying it.
+    pub(crate) fn nfa_arc(&self) -> Arc<Nfa> {
+        Arc::clone(&self.nfa)
     }
 }
 
@@ -567,11 +620,21 @@ pub fn get_or_create_state_with_class(
         return id;
     }
 
-    // Check if cache is full - if so, flush it
+    // Cache full. Flushing invalidates every premultiplied ID in flight, so it
+    // is only safe between searches; under a running one the cache grows
+    // instead, up to a hard ceiling.
     if ctx.states.len() >= ctx.cache_limit {
-        flush_cache(ctx);
-        if let Some(&id) = ctx.state_map.get(&key) {
-            return id;
+        if ctx.search_depth == 0 {
+            flush_cache(ctx);
+            if let Some(&id) = ctx.state_map.get(&key) {
+                return id;
+            }
+        } else if ctx.states.len() >= ctx.cache_ceiling() {
+            // The search cannot be completed. The returned ID keeps the walk
+            // well-formed until it unwinds; the flag makes the entry point
+            // report the give-up instead of the partial scan's answer.
+            ctx.ceiling_exceeded = true;
+            return ctx.start;
         }
     }
 

@@ -5,7 +5,7 @@
 
 use std::sync::RwLock;
 
-use crate::dfa::{EagerDfa, LazyDfa};
+use crate::dfa::{CacheCeilingExceeded, EagerDfa, LazyDfa};
 use crate::error::Result;
 use crate::hir::Hir;
 use crate::literal::{extract_literals, Prefilter};
@@ -25,6 +25,23 @@ use super::{needs_boundary_aware_empty_match, select_engine, select_engine_from_
 #[inline]
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Runs a lazy-DFA search, falling back to the PikeVM when the DFA gives up on
+/// its state-cache ceiling.
+///
+/// Past the ceiling the DFA's transition table is incomplete, so its result
+/// would be a false negative rather than a real answer. The same question is
+/// re-run on the PikeVM, which caches no states and so has no ceiling to hit.
+fn lazy_dfa_or_pikevm<T>(
+    dfa: &mut LazyDfa,
+    search: impl FnOnce(&mut LazyDfa) -> std::result::Result<T, CacheCeilingExceeded>,
+    fallback: impl FnOnce(&PikeVm) -> T,
+) -> T {
+    match search(dfa) {
+        Ok(result) => result,
+        Err(_) => fallback(&PikeVm::from_arc(dfa.nfa_arc())),
+    }
 }
 
 /// A compiled regex ready for execution.
@@ -229,7 +246,14 @@ impl CompiledRegex {
             CompiledInner::PikeVm(vm) => vm.is_match(input),
             CompiledInner::ShiftOr(so) => so.is_match(input),
             CompiledInner::ShiftOrWide(so) => so.is_match(input),
-            CompiledInner::LazyDfa(dfa) => dfa.write().unwrap().find(input).is_some(),
+            CompiledInner::LazyDfa(dfa) => {
+                let mut dfa = dfa.write().unwrap();
+                lazy_dfa_or_pikevm(
+                    &mut dfa,
+                    |d| d.find(input).map(|found| found.is_some()),
+                    |vm| vm.is_match(input),
+                )
+            }
             CompiledInner::EagerDfa(dfa) => dfa.find(input).is_some(),
             CompiledInner::CodepointClass(matcher) => matcher.is_match(input),
             CompiledInner::BacktrackingVm(vm) => vm.find(input).is_some(),
@@ -427,7 +451,14 @@ impl CompiledRegex {
             CompiledInner::PikeVm(vm) => vm.find_from(input, from),
             CompiledInner::ShiftOr(so) => so.find_at(input, from),
             CompiledInner::ShiftOrWide(so) => so.find_at(input, from),
-            CompiledInner::LazyDfa(dfa) => dfa.write().unwrap().find_from(input, from),
+            CompiledInner::LazyDfa(dfa) => {
+                let mut dfa = dfa.write().unwrap();
+                lazy_dfa_or_pikevm(
+                    &mut dfa,
+                    |d| d.find_from(input, from),
+                    |vm| vm.find_from(input, from),
+                )
+            }
             CompiledInner::EagerDfa(dfa) => dfa.find_from(input, from),
             CompiledInner::CodepointClass(matcher) => matcher.find_from(input, from),
             CompiledInner::BacktrackingVm(vm) => vm.find_at(input, from),
@@ -706,11 +737,17 @@ impl CompiledRegex {
             CompiledInner::PikeVm(vm) => vm.find_at(input, pos),
             CompiledInner::ShiftOr(so) => so.try_match_at(input, pos),
             CompiledInner::ShiftOrWide(so) => so.try_match_at(input, pos),
-            CompiledInner::LazyDfa(dfa) => dfa
-                .write()
-                .unwrap()
-                .find_at(input, pos)
-                .map(|end| (pos, end)),
+            CompiledInner::LazyDfa(dfa) => {
+                let mut dfa = dfa.write().unwrap();
+                lazy_dfa_or_pikevm(
+                    &mut dfa,
+                    |d| {
+                        d.find_at(input, pos)
+                            .map(|found| found.map(|end| (pos, end)))
+                    },
+                    |vm| vm.find_at(input, pos),
+                )
+            }
             CompiledInner::EagerDfa(dfa) => dfa.find_at(input, pos).map(|end| (pos, end)),
             CompiledInner::CodepointClass(matcher) => {
                 // CodepointClass doesn't support word boundaries, use sliced input

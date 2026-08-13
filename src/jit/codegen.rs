@@ -160,6 +160,11 @@ impl CompiledRegex {
         let budget = input.len().saturating_mul(SCAN_BUDGET_FACTOR);
         let mut walked = 0usize;
         let mut from = start_from;
+        // Set once the fallback DFA gives up on its state-cache ceiling. Retrying
+        // it would rebuild the cache to the ceiling again at every remaining start
+        // position, so this search sticks with the scan below, which is complete
+        // on its own — the fallback is only ever a shortcut.
+        let mut fallback_gave_up = false;
         loop {
             let prev_class = if self.has_word_boundary && from > 0 {
                 CharClass::from_byte(input[from - 1])
@@ -178,9 +183,15 @@ impl CompiledRegex {
                 return None;
             }
             walked += end - from;
-            if walked > budget {
+            if walked > budget && !fallback_gave_up {
                 if let Some(dfa) = &self.dfa_fallback {
-                    return dfa.lock().unwrap().find_from(input, next);
+                    match dfa.lock().unwrap().find_from(input, next) {
+                        Ok(found) => return found,
+                        // Its transition table is incomplete past the ceiling, so
+                        // its answer would be a false negative rather than a real
+                        // one. Fall through and keep scanning.
+                        Err(_) => fallback_gave_up = true,
+                    }
                 }
             }
             from = next;

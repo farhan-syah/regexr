@@ -22,14 +22,16 @@
 //! its limit, we clear all states and rebuild from the start state.
 
 use std::collections::BTreeSet;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use crate::nfa::{Nfa, NfaInstruction, StateId as NfaStateId};
 
 use super::super::shared::{
     epsilon_closure_with_context, flush_cache, get_or_create_state_with_class, is_dead_state,
     is_tagged_match, is_unknown_state, match_reachable_without_end_assertion, state_index,
-    tag_state, untag_state, CharClass, DfaStateId, LazyDfaContext, PositionContext, DEAD_STATE,
-    UNKNOWN_STATE,
+    tag_state, untag_state, CacheCeilingExceeded, CharClass, DfaStateId, LazyDfaContext,
+    PositionContext, DEAD_STATE, UNKNOWN_STATE,
 };
 
 /// How much input the per-start attempts in [`LazyDfa::find_from`] may walk in
@@ -43,6 +45,59 @@ const SCAN_BUDGET_FACTOR: usize = 4;
 pub struct LazyDfa {
     /// Internal context containing state and transition data.
     ctx: LazyDfaContext,
+}
+
+/// Holds a [`LazyDfa`] for the duration of one search.
+///
+/// State IDs are premultiplied indices into the state and transition tables, so
+/// a cache flush turns every ID a running search is holding into garbage. While
+/// this guard lives, flushing is suppressed and the cache grows instead; the
+/// deferred flush happens on the outermost drop, so the growth does not carry
+/// into the next search. Being a `Drop` guard, it also restores the depth when a
+/// search unwinds, which is what keeps a panic from suppressing flushes forever.
+///
+/// Searches may nest, hence a depth count rather than a flag.
+struct SearchGuard<'a> {
+    dfa: &'a mut LazyDfa,
+}
+
+impl<'a> SearchGuard<'a> {
+    fn new(dfa: &'a mut LazyDfa) -> Self {
+        dfa.ctx.search_depth += 1;
+        Self { dfa }
+    }
+
+    /// Reports the search's result, unless it gave up on the cache ceiling.
+    fn finish<T>(self, outcome: T) -> Result<T, CacheCeilingExceeded> {
+        if std::mem::take(&mut self.dfa.ctx.ceiling_exceeded) {
+            Err(CacheCeilingExceeded)
+        } else {
+            Ok(outcome)
+        }
+    }
+}
+
+impl Drop for SearchGuard<'_> {
+    fn drop(&mut self) {
+        self.dfa.ctx.search_depth = self.dfa.ctx.search_depth.saturating_sub(1);
+        if self.dfa.ctx.search_depth == 0 && self.dfa.ctx.states.len() >= self.dfa.ctx.cache_limit {
+            flush_cache(&mut self.dfa.ctx);
+        }
+    }
+}
+
+impl Deref for SearchGuard<'_> {
+    type Target = LazyDfa;
+
+    fn deref(&self) -> &LazyDfa {
+        &*self.dfa
+    }
+}
+
+impl DerefMut for SearchGuard<'_> {
+    fn deref_mut(&mut self) -> &mut LazyDfa {
+        &mut *self.dfa
+    }
 }
 
 impl LazyDfa {
@@ -224,15 +279,22 @@ impl LazyDfa {
             None,
             target_pos_ctx,
         );
+        let flushes_before = self.ctx.flush_count;
         let next_id =
             get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class, next_clean);
 
         let next_idx = state_index(next_id);
         let is_match = self.ctx.states.get(next_idx).is_some_and(|s| s.is_match);
 
-        let cache_idx = (state + byte as u32) as usize;
-        if cache_idx < self.ctx.transitions.len() {
-            self.ctx.transitions[cache_idx] = tag_state(next_id, is_match);
+        // `state` is a premultiplied index into the table. Creating the target
+        // may have flushed the cache, which renumbers every state, so the row
+        // this index names is no longer this state's row — writing there would
+        // cache the transition against an unrelated state.
+        if self.ctx.flush_count == flushes_before {
+            let cache_idx = (state + byte as u32) as usize;
+            if cache_idx < self.ctx.transitions.len() {
+                self.ctx.transitions[cache_idx] = tag_state(next_id, is_match);
+            }
         }
 
         Some(next_id)
@@ -349,6 +411,7 @@ impl LazyDfa {
 
                 let next_clean =
                     match_reachable_without_end_assertion(&self.ctx.nfa, targets, None, None);
+                let flushes_before = self.ctx.flush_count;
                 let next_id = get_or_create_state_with_class(
                     &mut self.ctx,
                     next_closure,
@@ -359,9 +422,15 @@ impl LazyDfa {
 
                 let next_idx = state_index(next_id);
                 let is_match = self.ctx.states.get(next_idx).is_some_and(|s| s.is_match);
-                let cache_idx = (state + byte as u32) as usize;
-                if cache_idx < self.ctx.transitions.len() {
-                    self.ctx.transitions[cache_idx] = tag_state(next_id, is_match);
+                // `state` is fixed across this 256-byte loop, but creating a
+                // target may flush and renumber the cache underneath it, so the
+                // row this index names is only this state's row while no flush
+                // has happened.
+                if self.ctx.flush_count == flushes_before {
+                    let cache_idx = (state + byte as u32) as usize;
+                    if cache_idx < self.ctx.transitions.len() {
+                        self.ctx.transitions[cache_idx] = tag_state(next_id, is_match);
+                    }
                 }
             } else if cache_idx < self.ctx.transitions.len() {
                 self.ctx.transitions[cache_idx] = DEAD_STATE;
@@ -402,8 +471,18 @@ impl LazyDfa {
         flush_cache(&mut self.ctx);
     }
 
-    /// Executes the DFA on input, returning true if it matches.
-    pub fn is_match_bytes(&mut self, input: &[u8]) -> bool {
+    /// Executes the DFA on input, returning true if it matches the whole input.
+    ///
+    /// `Err` means the state cache could not grow far enough to finish the scan;
+    /// the answer is unknown, not `false`.
+    pub fn is_match_bytes(&mut self, input: &[u8]) -> Result<bool, CacheCeilingExceeded> {
+        let mut guard = SearchGuard::new(self);
+        let outcome = guard.is_match_bytes_inner(input);
+        guard.finish(outcome)
+    }
+
+    /// [`LazyDfa::is_match_bytes`] without the search guard.
+    fn is_match_bytes_inner(&mut self, input: &[u8]) -> bool {
         let mut state = self.ctx.start;
 
         for &byte in input {
@@ -417,7 +496,10 @@ impl LazyDfa {
     }
 
     /// Finds the first match in the input.
-    pub fn find(&mut self, input: &[u8]) -> Option<(usize, usize)> {
+    ///
+    /// `Err` means the search gave up on the cache ceiling; see
+    /// [`LazyDfa::find_from`].
+    pub fn find(&mut self, input: &[u8]) -> Result<Option<(usize, usize)>, CacheCeilingExceeded> {
         self.find_from(input, 0)
     }
 
@@ -425,7 +507,23 @@ impl LazyDfa {
     ///
     /// Every attempt gets the whole input (see [`LazyDfa::find_at`]), so the
     /// start state carries the real preceding byte for `^` and `\b`.
-    pub fn find_from(&mut self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+    ///
+    /// `Err` means the search needed more DFA states than the cache is allowed
+    /// to hold, so the transition table is incomplete and the scan's result
+    /// would be a false negative. Callers re-run such a search on an engine that
+    /// does not cache states — the PikeVM — rather than reporting "no match".
+    pub fn find_from(
+        &mut self,
+        input: &[u8],
+        from: usize,
+    ) -> Result<Option<(usize, usize)>, CacheCeilingExceeded> {
+        let mut guard = SearchGuard::new(self);
+        let outcome = guard.find_from_inner(input, from);
+        guard.finish(outcome)
+    }
+
+    /// [`LazyDfa::find_from`] without the search guard.
+    fn find_from_inner(&mut self, input: &[u8], from: usize) -> Option<(usize, usize)> {
         if from > input.len() {
             return None;
         }
@@ -438,7 +536,7 @@ impl LazyDfa {
         if start_only {
             if self.ctx.has_multiline_anchors {
                 if from == 0 {
-                    if let Some(end) = self.find_at(input, 0) {
+                    if let Some(end) = self.find_at_inner(input, 0) {
                         return Some((0, end));
                     }
                 }
@@ -446,14 +544,14 @@ impl LazyDfa {
                 // before it, hence `from - 1`.
                 for (i, &byte) in input.iter().enumerate().skip(from.saturating_sub(1)) {
                     if byte == b'\n' {
-                        if let Some(end) = self.find_at(input, i + 1) {
+                        if let Some(end) = self.find_at_inner(input, i + 1) {
                             return Some((i + 1, end));
                         }
                     }
                 }
                 None
             } else if from == 0 {
-                self.find_at(input, 0).map(|end| (0, end))
+                self.find_at_inner(input, 0).map(|end| (0, end))
             } else {
                 None
             }
@@ -471,22 +569,48 @@ impl LazyDfa {
             let mut walked = 0usize;
 
             for start_pos in from..=input.len() {
+                // The cache ran out under an earlier start; the remaining ones
+                // would scan an incomplete table, so stop and let the entry
+                // point report the give-up.
+                if self.ctx.ceiling_exceeded {
+                    return None;
+                }
                 self.ctx.last_reach = start_pos;
-                if let Some(end) = self.find_at(input, start_pos) {
+                if let Some(end) = self.find_at_inner(input, start_pos) {
                     return Some((start_pos, end));
                 }
                 walked += self.ctx.last_reach.saturating_sub(start_pos);
                 if walked > budget {
                     let start = self.leftmost_start(input, start_pos + 1)?;
-                    return self.find_at(input, start).map(|end| (start, end));
+                    return self.find_at_inner(input, start).map(|end| (start, end));
                 }
             }
             None
         }
     }
 
-    /// Finds a match starting at the given position.
-    pub fn find_at(&mut self, input: &[u8], start: usize) -> Option<usize> {
+    /// Finds a match starting at the given position, returning its end.
+    ///
+    /// `Err` means the search gave up on the cache ceiling; see
+    /// [`LazyDfa::find_from`].
+    pub fn find_at(
+        &mut self,
+        input: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, CacheCeilingExceeded> {
+        let mut guard = SearchGuard::new(self);
+        let outcome = guard.find_at_inner(input, start);
+        guard.finish(outcome)
+    }
+
+    /// [`LazyDfa::find_at`] without the search guard.
+    fn find_at_inner(&mut self, input: &[u8], start: usize) -> Option<usize> {
+        // A previous attempt in this search already ran out of cache; every
+        // further one would scan an incomplete table, so unwind instead.
+        if self.ctx.ceiling_exceeded {
+            return None;
+        }
+
         // If pattern has ONLY a start anchor (no end anchor), we can skip invalid positions.
         // But if it has both anchors (possibly on different alternation branches), we need
         // to try all positions and let the NFA handle anchor checking per branch.
@@ -854,6 +978,10 @@ impl LazyDfa {
     /// starting no later than here" — which is monotone in `seed_until`, and so
     /// binary-searchable for the leftmost start.
     fn matches_starting_by(&mut self, input: &[u8], from: usize, seed_until: usize) -> bool {
+        if self.ctx.ceiling_exceeded {
+            return false;
+        }
+
         let mut state = self.get_start_state_for_position(input, from);
         if self.is_match(state) && self.check_end_assertions(input, from, state) {
             return true;
@@ -898,6 +1026,11 @@ impl LazyDfa {
     }
 
     /// Get transition, computing if needed, returning tagged state.
+    ///
+    /// The computed state is returned directly. Re-reading the table at
+    /// `state + byte` instead would be reading through an ID that computing the
+    /// transition may have invalidated (a cache flush renumbers every state),
+    /// and would report the live target as dead.
     #[inline(always)]
     fn transition_or_compute(&mut self, state: DfaStateId, byte: u8) -> u32 {
         let idx = (state + byte as u32) as usize;
@@ -908,14 +1041,7 @@ impl LazyDfa {
             }
         }
         match self.compute_transition(state, byte) {
-            Some(_) => {
-                let idx = (state + byte as u32) as usize;
-                if idx < self.ctx.transitions.len() {
-                    unsafe { *self.ctx.transitions.get_unchecked(idx) }
-                } else {
-                    DEAD_STATE
-                }
-            }
+            Some(next_id) => tag_state(next_id, self.is_match(next_id)),
             None => DEAD_STATE,
         }
     }
@@ -1081,6 +1207,14 @@ impl LazyDfa {
     pub fn nfa(&self) -> &Nfa {
         &self.ctx.nfa
     }
+
+    /// The NFA this DFA was built from, shareable without copying it.
+    ///
+    /// Lets a caller that catches [`CacheCeilingExceeded`] build the fallback
+    /// engine for the same pattern.
+    pub fn nfa_arc(&self) -> Arc<Nfa> {
+        self.ctx.nfa_arc()
+    }
 }
 
 #[cfg(test)]
@@ -1121,7 +1255,7 @@ mod tests {
             let mut lazy = dfa(pattern);
             assert_eq!(
                 lazy.find_from(input.as_bytes(), 0),
-                expected,
+                Ok(expected),
                 "LazyDfa {pattern:?} on {input:?}"
             );
 

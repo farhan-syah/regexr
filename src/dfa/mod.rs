@@ -11,4 +11,6 @@ pub mod eager;
 pub mod lazy;
 
 pub use eager::{EagerDfa, EagerDfaEngine};
-pub use lazy::{CharClass, DfaStateId, LazyDfa, LazyDfaEngine, PositionContext};
+pub use lazy::{
+    CacheCeilingExceeded, CharClass, DfaStateId, LazyDfa, LazyDfaEngine, PositionContext,
+};
