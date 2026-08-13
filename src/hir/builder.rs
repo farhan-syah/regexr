@@ -377,11 +377,10 @@ impl HirTranslator {
     /// uses for bracketed classes like `[^...]` — it skips the lossy
     /// byte-range/UTF-8-sequence detour entirely (pushing ranges through
     /// `compile_utf8_range`/`optimize_sequences` and then reconstructing the
-    /// excluded set by decoding those sequences back with
-    /// `utf8_sequence_to_code_point_range`, which takes the byte-range hull of
-    /// a sequence and can over-approximate once `optimize_sequences` has
-    /// merged sequences with partial continuation ranges — see
-    /// `build_negated_class_expr`'s docs).
+    /// excluded set by decoding those sequences back through a hull-taking
+    /// decode (`utf8_sequence_to_code_point_range`, since deleted), which
+    /// over-approximates once `optimize_sequences` has merged sequences with
+    /// partial continuation ranges — see `build_negated_class_expr`'s docs).
     fn translate_ranges_to_hir(&mut self, ranges: &[(u32, u32)], negated: bool) -> Result<HirExpr> {
         if negated {
             let mut sorted = ranges.to_vec();
@@ -400,8 +399,9 @@ impl HirTranslator {
         byte_ranges.sort_by_key(|r| r.0);
         let merged_bytes = merge_byte_ranges(byte_ranges);
         let optimized_seqs = optimize_sequences(utf8_sequences);
+        let merged_codepoints = merge_codepoint_ranges(ranges.to_vec());
 
-        Ok(self.build_class_expr(merged_bytes, optimized_seqs))
+        Ok(self.build_class_expr(merged_bytes, optimized_seqs, &merged_codepoints))
     }
 
     /// Translates a Unicode property to HIR.
@@ -449,7 +449,8 @@ impl HirTranslator {
         let optimized_seqs = optimize_sequences(utf8_sequences);
 
         // Build the final expression (non-negated path)
-        Ok(self.build_class_expr(merged_bytes, optimized_seqs))
+        let merged_codepoints = merge_codepoint_ranges(ranges.to_vec());
+        Ok(self.build_class_expr(merged_bytes, optimized_seqs, &merged_codepoints))
     }
 
     /// Builds a negated Unicode class directly from codepoint ranges.
@@ -659,7 +660,7 @@ impl HirTranslator {
             // Optimize multi-byte sequences
             let optimized_seqs = optimize_sequences(utf8_sequences);
 
-            self.build_class_expr(merged_bytes, optimized_seqs)
+            self.build_class_expr(merged_bytes, optimized_seqs, &merged_codepoints)
         };
 
         // Store for potential use by CodepointClassMatcher
@@ -691,8 +692,9 @@ impl HirTranslator {
     /// into. That is both cheaper and more accurate than the old route of
     /// pushing the members through `compile_utf8_range`/`optimize_sequences`
     /// and then reconstructing the excluded set by decoding those sequences
-    /// with `utf8_sequence_to_code_point_range`: that decode takes the
-    /// byte-range hull of a sequence, and once `optimize_sequences` has merged
+    /// back (`utf8_sequence_to_code_point_range`, since deleted): that decode
+    /// took the byte-range hull of a sequence, and once `optimize_sequences`
+    /// has merged
     /// two sequences on a byte position whose successors are partial ranges,
     /// the hull is a strict *superset* of what the sequence encodes. For a
     /// negated class a superset means excluding characters the class never
@@ -735,6 +737,7 @@ impl HirTranslator {
         &mut self,
         byte_ranges: Vec<(u8, u8)>,
         utf8_sequences: Vec<Utf8Sequence>,
+        exact_codepoints: &[(u32, u32)],
     ) -> HirExpr {
         // A class with multi-byte members becomes a codepoint node once its UTF-8
         // expansion stops being cheap. Below that bound the trie is the better
@@ -750,7 +753,7 @@ impl HirTranslator {
         if utf8_sequences.len() > MAX_TRIE_SEQUENCES
             || (self.engine_already_pinned && !utf8_sequences.is_empty())
         {
-            return self.build_unicode_codepoint_class(byte_ranges, utf8_sequences);
+            return self.build_unicode_codepoint_class(exact_codepoints);
         }
 
         let mut alternatives: Vec<HirExpr> = Vec::new();
@@ -967,95 +970,26 @@ impl HirTranslator {
     /// those directly from exact codepoint ranges (see `translate_ranges_to_hir`
     /// and `translate_class`), so this function's sole caller (`build_class_expr`)
     /// only ever has non-negated members to lower.
-    fn build_unicode_codepoint_class(
-        &mut self,
-        byte_ranges: Vec<(u8, u8)>,
-        utf8_sequences: Vec<Utf8Sequence>,
-    ) -> HirExpr {
+    ///
+    /// Takes the exact, already-merged code-point ranges the class was parsed
+    /// from — not reconstructed by decoding `utf8_sequences` back through their
+    /// byte-range hull. That decode (formerly `utf8_sequence_to_code_point_range`)
+    /// takes the min/max byte of each position and treats the result as one
+    /// contiguous interval, which over-approximates once `optimize_sequences`
+    /// has merged sequences leaving more than one byte position with a partial
+    /// range — for a non-negated class that means matching code points the
+    /// class never named. Passing the exact ranges through from the caller
+    /// (which already has them, from `merged_codepoints` / the `ranges`
+    /// parameter / a Unicode property's table) sidesteps the lossy decode
+    /// entirely.
+    fn build_unicode_codepoint_class(&mut self, exact_codepoints: &[(u32, u32)]) -> HirExpr {
         // Mark as large unicode class for engine selection
         self.props.has_large_unicode_class = true;
-
-        // Convert byte ranges and UTF-8 sequences back to code point ranges
-        let mut code_point_ranges = Vec::new();
-
-        // Add code points from byte ranges (always ASCII, 0-127: code points
-        // 128 and above are routed through utf8_sequences instead, never
-        // pushed into byte_ranges directly)
-        for (start, end) in byte_ranges {
-            code_point_ranges.push((start as u32, end as u32));
-        }
-
-        // Convert UTF-8 sequences back to code point ranges
-        for seq in utf8_sequences {
-            if let Some(range) = self.utf8_sequence_to_code_point_range(&seq) {
-                code_point_ranges.push(range);
-            }
-        }
-
-        // Sort and merge ranges
-        code_point_ranges.sort_by_key(|r| r.0);
-        let merged = merge_codepoint_ranges(code_point_ranges);
 
         // Return as UnicodeCpClass - the Thompson compiler will handle this efficiently
         // Instead of expanding to thousands of byte-level alternations, we use a single
         // state that checks codepoint membership using binary search.
-        HirExpr::UnicodeCpClass(CodepointClass::new(merged, false))
-    }
-
-    /// Attempts to convert a UTF-8 sequence back to a code point range.
-    /// This is a best-effort approximation for sequences with variable ranges.
-    fn utf8_sequence_to_code_point_range(&self, seq: &Utf8Sequence) -> Option<(u32, u32)> {
-        // Decode the start and end code points from the byte ranges
-        match seq.len() {
-            1 => {
-                let (start, end) = seq.ranges[0];
-                Some((start as u32, end as u32))
-            }
-            2 => {
-                // 2-byte UTF-8: 110xxxxx 10xxxxxx
-                let (b1_start, b1_end) = seq.ranges[0];
-                let (b2_start, b2_end) = seq.ranges[1];
-
-                let start = (((b1_start & 0x1F) as u32) << 6) | ((b2_start & 0x3F) as u32);
-                let end = (((b1_end & 0x1F) as u32) << 6) | ((b2_end & 0x3F) as u32);
-
-                Some((start, end))
-            }
-            3 => {
-                // 3-byte UTF-8: 1110xxxx 10xxxxxx 10xxxxxx
-                let (b1_start, b1_end) = seq.ranges[0];
-                let (b2_start, b2_end) = seq.ranges[1];
-                let (b3_start, b3_end) = seq.ranges[2];
-
-                let start = (((b1_start & 0x0F) as u32) << 12)
-                    | (((b2_start & 0x3F) as u32) << 6)
-                    | ((b3_start & 0x3F) as u32);
-                let end = (((b1_end & 0x0F) as u32) << 12)
-                    | (((b2_end & 0x3F) as u32) << 6)
-                    | ((b3_end & 0x3F) as u32);
-
-                Some((start, end))
-            }
-            4 => {
-                // 4-byte UTF-8: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-                let (b1_start, b1_end) = seq.ranges[0];
-                let (b2_start, b2_end) = seq.ranges[1];
-                let (b3_start, b3_end) = seq.ranges[2];
-                let (b4_start, b4_end) = seq.ranges[3];
-
-                let start = (((b1_start & 0x07) as u32) << 18)
-                    | (((b2_start & 0x3F) as u32) << 12)
-                    | (((b3_start & 0x3F) as u32) << 6)
-                    | ((b4_start & 0x3F) as u32);
-                let end = (((b1_end & 0x07) as u32) << 18)
-                    | (((b2_end & 0x3F) as u32) << 12)
-                    | (((b3_end & 0x3F) as u32) << 6)
-                    | ((b4_end & 0x3F) as u32);
-
-                Some((start, end))
-            }
-            _ => None,
-        }
+        HirExpr::UnicodeCpClass(CodepointClass::new(exact_codepoints.to_vec(), false))
     }
 
     /// Translates a lookaround.
@@ -1781,5 +1715,71 @@ mod tests {
         // Either side of the whole span.
         assert!(compiled.is_match(encode(0x80F).as_bytes()));
         assert!(compiled.is_match(encode(0x880).as_bytes()));
+    }
+
+    /// The non-negated counterpart of the test above: `build_class_expr`'s
+    /// `UnicodeCpClass` fallback (`build_unicode_codepoint_class`) must match
+    /// exactly the code points it is given, not the byte-range hull of
+    /// whatever UTF-8 sequences they happen to encode to.
+    ///
+    /// This is the same gap-inducing range set (U+0810-U+083F and
+    /// U+0850-U+087F, whose sequences `E0 A0 90-BF` / `E0 A1 90-BF` merge into
+    /// `E0 A0-A1 90-BF`, a hull that also spans U+0840-U+084F), but for a
+    /// non-negated class a hull means *over-matching*: accepting the gap code
+    /// points the class never named.
+    ///
+    /// That fallback is reached only once the class's optimized UTF-8
+    /// sequences exceed `MAX_TRIE_SEQUENCES`, or once something else has
+    /// already pinned the pattern to a codepoint-capable engine — this range
+    /// set optimizes to only 2 sequences, far under the trie cap, so no
+    /// pattern built through the public API reaches the fallback with it.
+    /// This test drives `translate_ranges_to_hir` directly and pins the
+    /// engine by hand (`engine_already_pinned = true`, mirroring what
+    /// `pins_codepoint_engine` would set for e.g. a lookaround elsewhere in
+    /// the same pattern) to force the fallback while keeping the range set
+    /// itself small enough to hand-verify.
+    #[test]
+    fn translate_ranges_to_hir_unicode_cp_class_fallback_matches_only_named_codepoints() {
+        let ranges = [(0x810u32, 0x83F), (0x850, 0x87F)];
+        let mut translator = HirTranslator::new();
+        translator.engine_already_pinned = true;
+        let expr = translator.translate_ranges_to_hir(&ranges, false).unwrap();
+
+        // Confirm the fallback was actually taken, not the small-trie path.
+        assert!(
+            matches!(expr, HirExpr::UnicodeCpClass(_)),
+            "expected the UnicodeCpClass fallback to be taken with engine_already_pinned set"
+        );
+
+        let hir = Hir {
+            expr,
+            props: translator.props.clone(),
+        };
+        let compiled = crate::engine::compile_from_hir(&hir).unwrap();
+
+        let encode = |cp: u32| char::from_u32(cp).unwrap().to_string();
+
+        // The gap between the two named ranges: must NOT match — the old hull
+        // decode wrongly swallowed it.
+        assert!(
+            !compiled.is_match(encode(0x840).as_bytes()),
+            "U+0840 lies in the gap between the named ranges and must not match"
+        );
+        assert!(
+            !compiled.is_match(encode(0x84F).as_bytes()),
+            "U+084F lies in the gap between the named ranges and must not match"
+        );
+
+        // The named ranges themselves, including both edges: must match.
+        for cp in [0x810u32, 0x820, 0x83F, 0x850, 0x86F, 0x87F] {
+            assert!(
+                compiled.is_match(encode(cp).as_bytes()),
+                "U+{cp:04X} is named by the class and must match"
+            );
+        }
+
+        // Either side of the whole span: must not match.
+        assert!(!compiled.is_match(encode(0x80F).as_bytes()));
+        assert!(!compiled.is_match(encode(0x880).as_bytes()));
     }
 }
