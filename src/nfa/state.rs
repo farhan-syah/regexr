@@ -268,6 +268,30 @@ impl Nfa {
         closure
     }
 
+    /// Upper bound on the total number of elements across all precomputed
+    /// epsilon closures (Σ|closure(state)| over every state), above which
+    /// precomputation is abandoned in favor of the on-the-fly DFS in
+    /// [`Nfa::epsilon_closure`].
+    ///
+    /// The closures are a pure cache: `epsilon_closure` falls back to a DFS
+    /// that computes the mathematically identical set whenever
+    /// `epsilon_closures` is `None`, so skipping precomputation only trades
+    /// upfront cost for repeated on-demand recomputation — it never changes
+    /// match results.
+    ///
+    /// For a chain-shaped NFA (e.g. `a{50000}`, where fragments are joined by
+    /// a single non-skippable epsilon edge) each closure is O(1), so Σ is
+    /// O(V) — about 1e5 for `a{50000}`. For a chained-nullable NFA (e.g.
+    /// `(?:a?){n}`, where every `a?` can be skipped so closure(start_i)
+    /// reaches every downstream skip state) Σ is Θ(V²): measured at ~8e6 for
+    /// `(?:a?){1000}` and ~3.2e7 for `(?:a?){2000}` (V≈4n in both cases,
+    /// since each `a?` adds ~4 states). This budget sits at the geometric
+    /// mean of those two anchors (~1e5 vs ~8e6), comfortably clear of both:
+    /// `a{50000}` stays roughly 10x under it and keeps its cache, while
+    /// `(?:a?){1000}` exceeds it by roughly 8x and falls back to on-demand
+    /// closures.
+    const EPSILON_CLOSURE_BUDGET: usize = 1_000_000;
+
     /// Precomputes epsilon closures for all states.
     /// This significantly speeds up DFA construction for NFAs with many epsilon transitions.
     pub fn precompute_epsilon_closures(&mut self) {
@@ -279,6 +303,7 @@ impl Nfa {
         }
 
         let mut closures = Vec::with_capacity(self.states.len());
+        let mut total_size: usize = 0;
 
         for state_id in 0..self.states.len() {
             let mut closure = BTreeSet::new();
@@ -295,7 +320,17 @@ impl Nfa {
                 }
             }
 
+            total_size += closure.len();
             closures.push(closure);
+
+            if total_size > Self::EPSILON_CLOSURE_BUDGET {
+                // Σ|closure| has blown past the budget (quadratic blowup on a
+                // chained-nullable NFA). Discard the partial cache and leave
+                // epsilon_closures as None so callers use the on-the-fly DFS
+                // fallback in epsilon_closure, which is already correct and
+                // already exercised below the epsilon_count < 100 threshold.
+                return;
+            }
         }
 
         self.epsilon_closures = Some(closures);

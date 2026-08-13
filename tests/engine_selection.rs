@@ -285,3 +285,64 @@ fn nullable_repetition_matches_agree_with_the_reference() {
         );
     }
 }
+
+// =============================================================================
+// `Nfa::precompute_epsilon_closures` declining its own budget must not change
+// what the pattern matches either.
+// =============================================================================
+// `(?:a?){n}` is also the pattern that makes `precompute_epsilon_closures`
+// (`src/nfa/state.rs`) blow up: because every `a?` can be skipped,
+// closure(start_i) reaches every downstream skip state, so Σ|closure| is
+// Θ(n²) — about 8·n² measured. `EPSILON_CLOSURE_BUDGET` caps that sum and
+// aborts the precomputation once n grows past roughly 354, leaving
+// `epsilon_closures` as `None` for this pattern. `Nfa::epsilon_closure` then
+// takes its on-the-fly DFS fallback instead of the cache — this locks in that
+// the fallback computes the exact same closures, at an n picked well past
+// that cutoff. The haystacks stay short: `reference::find`/`captures` recurse
+// once per repetition of the pattern, not per haystack byte, so `n` (not
+// haystack length) is what has to stay stack-safe here.
+#[test]
+fn nullable_repetition_matches_agree_with_the_reference_past_the_closure_budget() {
+    use regexr::hir::translate;
+    use regexr::parser::parse;
+
+    let pattern = "(?:a?){500}";
+    let hir = parse(pattern)
+        .and_then(|ast| translate(&ast))
+        .expect("pattern should compile");
+    let ncaps = hir.props.capture_count as usize;
+
+    let re = regexr::Regex::new(pattern).expect("pattern should compile");
+
+    let haystacks = [
+        String::new(),
+        "a".to_string(),
+        "aaaa".to_string(),
+        "a".repeat(500),
+        "b".to_string(),
+        // A mismatch in the middle of an otherwise-matching run.
+        "aaaabaaaa".to_string(),
+    ];
+
+    for haystack in &haystacks {
+        let bytes = haystack.as_bytes();
+        let expected_find = regexr::reference::find(&hir.expr, ncaps, bytes);
+        let expected_captures = regexr::reference::captures(&hir.expr, ncaps, bytes);
+
+        let found = re.find(haystack).map(|m| (m.start(), m.end()));
+        assert_eq!(
+            found, expected_find,
+            "{pattern:?} on {haystack:?}: find() disagrees with reference"
+        );
+
+        let captured = re
+            .captures(haystack)
+            .and_then(|caps| caps.get(0))
+            .map(|m| (m.start(), m.end()));
+        let expected_group0 = expected_captures.and_then(|caps| caps[0]);
+        assert_eq!(
+            captured, expected_group0,
+            "{pattern:?} on {haystack:?}: captures() disagrees with reference"
+        );
+    }
+}
