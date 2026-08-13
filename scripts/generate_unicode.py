@@ -288,6 +288,56 @@ def generate_rust_module(
         lines.append("];")
         lines.append("")
 
+        # `translate_class` (src/hir/builder.rs) assumes simple case folding is
+        # single-hop: a `to` value never also appears as a `from` value, so
+        # visiting the `from` entries of CASE_FOLDING_SIMPLE plus the keys of
+        # CASE_FOLD_GROUPS covers every codepoint that participates in
+        # folding. Guard that assumption here so a future UCD update that
+        # introduces multi-hop folding fails generation loudly instead of
+        # letting translate_class silently under-fold.
+        from_cps = {from_cp for from_cp, _ in case_folding}
+        to_cps = {to_cp for _, to_cp in case_folding}
+        multi_hop = sorted(from_cps & to_cps)
+        if multi_hop:
+            sample = ", ".join(f"U+{cp:04X}" for cp in multi_hop[:5])
+            raise SystemExit(
+                f"case folding table has multi-hop entries (e.g. {sample}); "
+                "the single-hop assumption in translate_class's binary-searched "
+                "range enumeration no longer holds and must be revisited"
+            )
+
+        # Reverse-grouped table: canonical folded codepoint -> every codepoint
+        # (including itself) that folds to it. Flat fixed-width rows (max group
+        # size in current UCD data is 4) so this emits one array instead of
+        # ~1482 separate slice statics with their own relocations.
+        groups: dict[int, set[int]] = {}
+        for from_cp, to_cp in case_folding:
+            groups.setdefault(to_cp, {to_cp}).add(from_cp)
+
+        max_group_len = max((len(members) for members in groups.values()), default=0)
+        if max_group_len > 4:
+            for key, members in groups.items():
+                if len(members) > 4:
+                    raise SystemExit(
+                        f"case fold group for U+{key:04X} has {len(members)} members, "
+                        "exceeds the fixed width of 4"
+                    )
+
+        lines.append("/// Reverse-grouped case folding: maps a canonical folded code point to")
+        lines.append("/// every code point (including itself) that folds to it.")
+        lines.append("/// Each entry is (key, len, members), members padded with 0 past len.")
+        lines.append("/// Sorted ascending by key for binary search.")
+        lines.append("pub const CASE_FOLD_GROUPS: &[(u32, u8, [u32; 4])] = &[")
+        group_lines = []
+        for key in sorted(groups.keys()):
+            members = sorted(groups[key])
+            padded = members + [0] * (4 - len(members))
+            member_str = ", ".join(f"0x{m:04X}" for m in padded)
+            group_lines.append(f"    (0x{key:04X}, {len(members)}, [{member_str}]),")
+        lines.append("\n".join(group_lines))
+        lines.append("];")
+        lines.append("")
+
     # Grapheme cluster segmentation. These are not addressable as `\p{...}`;
     # they exist so the HIR builder can expand `\X` into the UAX #29 boundary
     # rules, which is the only thing that reads them.
@@ -507,29 +557,22 @@ def generate_lookup_functions(
             "",
             "/// Get all code points that fold to the same value as the given code point.",
             "/// Used for case-insensitive matching.",
-            "/// Returns a Vec containing all equivalent code points (including the input).",
-            "pub fn case_fold_equivalents(cp: u32) -> Vec<u32> {",
-            "    // Get the canonical (folded) form",
+            "///",
+            "/// Returns the equivalence class (including the input) via a binary search",
+            "/// over `CASE_FOLD_GROUPS`. Unlike the old `Vec`-returning version, a code",
+            "/// point that does not participate in any folding now yields an EMPTY",
+            "/// slice rather than a single-element `vec![cp]` — callers must not assume",
+            "/// the input is always present in the result.",
+            "#[inline]",
+            "pub fn case_fold_equivalents(cp: u32) -> &'static [u32] {",
             "    let folded = simple_case_fold(cp);",
-            "    ",
-            "    // Collect all code points that fold to this value",
-            "    let mut equivalents = vec![folded];",
-            "    ",
-            "    // Find all entries that map to the same folded value",
-            "    for &(from, to) in CASE_FOLDING_SIMPLE.iter() {",
-            "        if to == folded && from != folded {",
-            "            equivalents.push(from);",
+            "    match CASE_FOLD_GROUPS.binary_search_by_key(&folded, |&(key, _, _)| key) {",
+            "        Ok(idx) => {",
+            "            let (_, len, ref members) = CASE_FOLD_GROUPS[idx];",
+            "            &members[..len as usize]",
             "        }",
+            "        Err(_) => &[],",
             "    }",
-            "    ",
-            "    // Also add the original if different from folded",
-            "    if cp != folded && !equivalents.contains(&cp) {",
-            "        equivalents.push(cp);",
-            "    }",
-            "    ",
-            "    equivalents.sort();",
-            "    equivalents.dedup();",
-            "    equivalents",
             "}",
             "",
         ])

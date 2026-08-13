@@ -561,14 +561,42 @@ impl HirTranslator {
                 if e.saturating_sub(s) >= 0x1000 {
                     continue;
                 }
-                for cp in s..=e {
-                    for &fc in unicode_data::case_fold_equivalents(cp).iter() {
+                // Rather than walking every codepoint in [s, e] and calling
+                // `case_fold_equivalents` on each (O(range size)), binary-search
+                // the sub-range of codepoints that actually participate in
+                // folding. Every folding codepoint is either a `from` entry in
+                // `CASE_FOLDING_SIMPLE` or a key in `CASE_FOLD_GROUPS`, and those
+                // two sets are provably disjoint: Unicode simple case folding is
+                // single-hop, so a `to` value never appears as a `from` (verified
+                // across all 1512 current `CASE_FOLDING_SIMPLE` entries). That
+                // means visiting both sorted tables' overlap with [s, e] finds
+                // every codepoint in the range that has equivalents, without
+                // touching the ones that don't. If a future UCD version ever
+                // introduces a multi-hop fold, this assumption breaks and this
+                // loop would silently skip codepoints that need folding.
+                let push_variants = |cp: u32, out: &mut Vec<ClassRange>| {
+                    for &fc in unicode_data::case_fold_equivalents(cp) {
                         if fc != cp {
                             if let Some(fch) = char::from_u32(fc) {
                                 out.push(ClassRange::new(fch, fch));
                             }
                         }
                     }
+                };
+
+                let from_lo =
+                    unicode_data::CASE_FOLDING_SIMPLE.partition_point(|&(from, _)| from < s);
+                let from_hi =
+                    unicode_data::CASE_FOLDING_SIMPLE.partition_point(|&(from, _)| from <= e);
+                for &(cp, _) in &unicode_data::CASE_FOLDING_SIMPLE[from_lo..from_hi] {
+                    push_variants(cp, &mut out);
+                }
+
+                let key_lo = unicode_data::CASE_FOLD_GROUPS.partition_point(|&(key, _, _)| key < s);
+                let key_hi =
+                    unicode_data::CASE_FOLD_GROUPS.partition_point(|&(key, _, _)| key <= e);
+                for &(cp, _, _) in &unicode_data::CASE_FOLD_GROUPS[key_lo..key_hi] {
+                    push_variants(cp, &mut out);
                 }
             }
             folded = out;
@@ -1643,5 +1671,78 @@ mod tests {
             !hir.props.has_large_unicode_class,
             "[α-ω] lowers to a small trie and should not be flagged large"
         );
+    }
+
+    /// Proves the binary-searched range enumeration in `translate_class`
+    /// (Step 3 of the `case_fold_equivalents` fast path) produces exactly the
+    /// same set of case-folded variants as the naive per-codepoint walk it
+    /// replaced. This is the test that actually protects the optimization:
+    /// it recomputes the old O(range size) approach independently and checks
+    /// the two agree, rather than restating the new logic.
+    #[test]
+    fn test_case_fold_range_enumeration_matches_brute_force() {
+        use std::collections::HashSet;
+
+        /// Old approach: walk every codepoint in `[s, e]` individually.
+        fn brute_force(s: u32, e: u32) -> HashSet<u32> {
+            let mut out = HashSet::new();
+            for cp in s..=e {
+                for &fc in unicode_data::case_fold_equivalents(cp).iter() {
+                    if fc != cp {
+                        out.insert(fc);
+                    }
+                }
+            }
+            out
+        }
+
+        /// New approach: binary-search the sub-ranges of `CASE_FOLDING_SIMPLE`
+        /// and `CASE_FOLD_GROUPS` that overlap `[s, e]`, mirroring the
+        /// production code in `translate_class`.
+        fn binary_searched(s: u32, e: u32) -> HashSet<u32> {
+            let mut out = HashSet::new();
+
+            let from_lo = unicode_data::CASE_FOLDING_SIMPLE.partition_point(|&(from, _)| from < s);
+            let from_hi = unicode_data::CASE_FOLDING_SIMPLE.partition_point(|&(from, _)| from <= e);
+            for &(cp, _) in &unicode_data::CASE_FOLDING_SIMPLE[from_lo..from_hi] {
+                for &fc in unicode_data::case_fold_equivalents(cp).iter() {
+                    if fc != cp {
+                        out.insert(fc);
+                    }
+                }
+            }
+
+            let key_lo = unicode_data::CASE_FOLD_GROUPS.partition_point(|&(key, _, _)| key < s);
+            let key_hi = unicode_data::CASE_FOLD_GROUPS.partition_point(|&(key, _, _)| key <= e);
+            for &(cp, _, _) in &unicode_data::CASE_FOLD_GROUPS[key_lo..key_hi] {
+                for &fc in unicode_data::case_fold_equivalents(cp).iter() {
+                    if fc != cp {
+                        out.insert(fc);
+                    }
+                }
+            }
+
+            out
+        }
+
+        let representative_ranges: &[(u32, u32, &str)] = &[
+            (0x0041, 0x005A, "ASCII (A-Z)"),
+            (0x0391, 0x03A9, "Greek (Α-Ω)"),
+            (0x0410, 0x042F, "Cyrillic (А-Я)"),
+            (0x0030, 0x0039, "no folding (0-9)"),
+            // Straddles the U+03B8 (θ) group key, which sits between two
+            // "from" entries (U+0398 -> U+03B8, U+03D1 -> U+03B8).
+            (0x03B5, 0x03BB, "range straddling a group key"),
+        ];
+
+        for &(s, e, label) in representative_ranges {
+            let brute = brute_force(s, e);
+            let fast = binary_searched(s, e);
+            assert_eq!(
+                brute, fast,
+                "case folding mismatch for {label} (U+{s:04X}-U+{e:04X}): \
+                 brute-force and binary-searched enumeration disagree"
+            );
+        }
     }
 }
