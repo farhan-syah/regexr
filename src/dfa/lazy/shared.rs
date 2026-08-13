@@ -2,9 +2,10 @@
 //!
 //! Contains types used by both the interpreter and potentially a JIT backend.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::hash::FxHashMap;
 use crate::hir::unicode::is_word_byte;
 use crate::nfa::{Nfa, NfaInstruction, StateId as NfaStateId};
 
@@ -221,7 +222,7 @@ pub struct LazyDfaContext {
     /// attempt that gave up immediately from one that scanned to the end.
     pub(crate) last_reach: usize,
     /// Map from state keys to DFA state IDs (premultiplied).
-    pub(crate) state_map: HashMap<StateKey, DfaStateId>,
+    pub(crate) state_map: FxHashMap<StateKey, DfaStateId>,
     /// The start state (premultiplied, for NonWord prev_class).
     pub(crate) start: DfaStateId,
     /// Cache size limit (number of states).
@@ -311,7 +312,7 @@ impl LazyDfaContext {
             transitions: Vec::new(),
             transitions_unanchored: Vec::new(),
             last_reach: 0,
-            state_map: HashMap::new(),
+            state_map: FxHashMap::default(),
             start: 0,
             cache_limit: DEFAULT_CACHE_LIMIT,
             flush_count: 0,

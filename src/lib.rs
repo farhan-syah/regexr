@@ -17,6 +17,7 @@
 pub mod dfa;
 pub mod engine;
 pub mod error;
+mod hash;
 pub mod hir;
 pub mod literal;
 pub mod nfa;

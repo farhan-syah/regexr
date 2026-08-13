@@ -14,6 +14,7 @@
 
 use crate::dfa::{CacheCeilingExceeded, CharClass, DfaStateId, LazyDfa};
 use crate::error::{Error, ErrorKind, Result};
+use crate::hash::FxHashSet;
 use dynasmrt::{AssemblyOffset, ExecutableBuffer};
 use std::sync::Mutex;
 
@@ -563,7 +564,7 @@ impl JitCompiler {
             };
 
             let mut queue = vec![start_nonword];
-            let mut visited = std::collections::HashSet::new();
+            let mut visited: FxHashSet<DfaStateId> = FxHashSet::default();
             visited.insert(start_nonword);
 
             // Also add the Word start state to the queue if present

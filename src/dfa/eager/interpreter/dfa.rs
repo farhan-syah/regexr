@@ -16,13 +16,14 @@
 //! if state == DEAD: stop
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use super::super::super::lazy::{CharClass, LazyDfa, SCAN_BUDGET_FACTOR};
 use super::super::shared::{
     is_word_byte, EagerMaterializationBudgetExceeded, EagerScanBudgetExceeded, StateMetadata,
     DEAD_STATE, MATERIALIZATION_WORK_BUDGET, STATE_MASK, TAG_DEAD, TAG_MATCH,
 };
+use crate::hash::FxHashMap;
 
 /// A pre-materialized DFA with flat transition table.
 ///
@@ -83,7 +84,7 @@ impl EagerDfa {
         };
 
         // Map from lazy state ID to eager state index
-        let mut state_map: HashMap<u32, u32> = HashMap::new();
+        let mut state_map: FxHashMap<u32, u32> = FxHashMap::default();
         let mut queue: VecDeque<u32> = VecDeque::new();
 
         // Temporary storage for transitions before we know final state count

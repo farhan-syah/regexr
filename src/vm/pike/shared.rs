@@ -89,6 +89,13 @@ pub struct PikeVmContext {
     /// Key: (state_id with lookaround instruction, position in input)
     /// Value: whether the lookaround matched
     /// This avoids re-executing the same lookaround at the same position.
+    ///
+    /// Deliberately left on the default hasher while its siblings moved to
+    /// `FxHashMap`: `PikeVmContext` is public API, so the map's hasher is part
+    /// of this field's published type. Swapping it would both break that type
+    /// and leak the crate-private `FxHasher`, and there is nothing to buy —
+    /// once codepoint classes moved to the tagged NFA, almost nothing reaches
+    /// the PikeVM's lookaround path.
     pub lookaround_cache: HashMap<(StateId, usize), bool>,
     /// Capture history for the run in progress. Threads index into this.
     pub capture_arena: CaptureArena,

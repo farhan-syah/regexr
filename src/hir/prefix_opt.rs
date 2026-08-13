@@ -21,7 +21,7 @@
 //! This reduces active threads from O(vocabulary_size) to O(token_length).
 
 use super::{Hir, HirCapture, HirExpr};
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 
 /// Threshold for when to apply prefix optimization.
 /// Smaller alternations don't benefit much from the overhead.
@@ -31,7 +31,7 @@ const MIN_LITERALS_FOR_OPTIMIZATION: usize = 4;
 #[derive(Debug, Default)]
 struct TrieNode {
     /// Children indexed by byte value.
-    children: HashMap<u8, TrieNode>,
+    children: FxHashMap<u8, TrieNode>,
     /// If this node represents a complete literal, store the capture index (if any).
     /// None means this is just an intermediate node.
     is_terminal: bool,
