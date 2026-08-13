@@ -666,3 +666,93 @@ fn test_lookbehind_widths_of_two_classes_combine() {
     assert!(!re.is_match(" x"));
     assert!(!re.is_match("\u{2003}x"));
 }
+
+// =============================================================================
+// Leading lookbehind literal as an offset prefilter
+// =============================================================================
+
+/// All spans of `pattern` over `text`, as (start, end) byte offsets.
+fn spans(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+    let re = regex(pattern);
+    re.find_iter(text).map(|m| (m.start(), m.end())).collect()
+}
+
+/// A pattern opening with `(?<=@)` is searched by its lookbehind's literal,
+/// which sits one byte to the LEFT of every match. Every span below is one the
+/// offset arithmetic has to reproduce exactly.
+#[test]
+fn test_lookbehind_literal_prefix_finds_every_match() {
+    let text = "@abc x@def @ghi @@jkl no@at";
+    assert_eq!(
+        spans(r"(?<=@)\w+", text),
+        vec![(1, 4), (7, 10), (12, 15), (18, 21), (25, 27)]
+    );
+    assert_eq!(
+        spans(r"(?<=\$)\d+", "$12 x34 $5 6$78"),
+        vec![(1, 3), (9, 10), (13, 15)]
+    );
+
+    // A haystack without the literal has no match, and the first byte of the
+    // haystack can never be a match start when a byte is required behind it.
+    assert!(!regex(r"(?<=@)\w+").is_match("abc def"));
+    assert_eq!(spans(r"(?<=@)\w+", "@a"), vec![(1, 2)]);
+}
+
+/// The resume path: the second match starts at exactly the byte the previous
+/// iteration step resumed from, so its `a` sits STRICTLY BEFORE the resume
+/// point. A scan that starts looking for the literal at the resume position
+/// instead of `resume - offset` never sees it and silently drops the match.
+#[test]
+fn test_lookbehind_literal_prefix_survives_the_resume_point() {
+    assert_eq!(spans(r"(?<=a)\w", "aab"), vec![(1, 2), (2, 3)]);
+    assert_eq!(spans(r"(?<=a)\w", "aaaa"), vec![(1, 2), (2, 3), (3, 4)]);
+    // The same shape with a two-byte literal, so the scan has to reach two
+    // bytes back from the resume point rather than one.
+    assert_eq!(spans(r"(?<=ab)\w\w", "abcdcd"), vec![(2, 4)]);
+    assert_eq!(spans(r"(?<=ab)\w\w", "abcdabef"), vec![(2, 4), (6, 8)]);
+}
+
+/// A multi-byte lookbehind literal offsets by its full byte length.
+#[test]
+fn test_multi_byte_lookbehind_literal_prefix() {
+    assert_eq!(
+        spans(r"(?<=foo@)\w+", "foo@bar x@baz foo@qux"),
+        vec![(4, 7), (18, 21)]
+    );
+    // Only the whole literal qualifies: a partial one must not offset.
+    assert!(!regex(r"(?<=foo@)\w+").is_match("fo@bar"));
+    assert!(!regex(r"(?<=foo@)\w+").is_match("xoo@bar"));
+}
+
+/// A UTF-8 lookbehind literal is offset by BYTES, not characters: `é` is two
+/// bytes, so a match sits two bytes past the literal's start.
+#[test]
+fn test_utf8_lookbehind_literal_prefix() {
+    assert_eq!(spans(r"(?<=é)\w+", "xéab yéc"), vec![(3, 5), (9, 10)]);
+    assert!(!regex(r"(?<=é)\w+").is_match("xeab"));
+}
+
+/// A nullable body can match at end of input, where the translated candidate
+/// lands exactly on `input.len()` — one past the last byte the prefilter can
+/// ever report.
+#[test]
+fn test_lookbehind_literal_prefix_at_end_of_input() {
+    let re = regex(r"(?<=@)\w*");
+    assert_eq!(re.find("x@").map(|m| (m.start(), m.end())), Some((2, 2)));
+    assert!(re.is_match("x@"));
+    assert_eq!(re.find("@ab").map(|m| (m.start(), m.end())), Some((1, 3)));
+}
+
+/// A NEGATIVE lookbehind's literal is the text that must be absent, so it must
+/// never become a prefilter: searching for `@` would skip to precisely the
+/// positions that cannot match.
+#[test]
+fn test_negative_lookbehind_literal_is_not_a_prefix() {
+    assert_eq!(
+        spans(r"(?<!@)\w+", "@abc x@def"),
+        vec![(2, 4), (5, 6), (8, 10)]
+    );
+    // Only the first `a` qualifies: every later position has an `a` behind it.
+    assert_eq!(spans(r"(?<!a)\w", "aab"), vec![(0, 1)]);
+    assert!(regex(r"(?<!@)\w+").is_match("abc"));
+}

@@ -22,12 +22,6 @@ use crate::jit;
 use super::dfa_pool::LazyDfaPool;
 use super::{needs_boundary_aware_empty_match, select_engine, select_engine_from_hir, EngineType};
 
-/// Returns true if the byte is a word character (alphanumeric or underscore).
-#[inline]
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// Runs `search` on `dfa` when the caller already checked one out, or checks
 /// one out from `pool` for just this call.
 ///
@@ -78,6 +72,14 @@ fn eager_scan_fallback(nfa: &Arc<Nfa>) -> LazyDfa {
 pub struct CompiledRegex {
     inner: CompiledInner,
     prefilter: Prefilter,
+    /// How many bytes past a prefilter candidate the match starts.
+    ///
+    /// Zero for every ordinary prefilter, whose candidates are match starts.
+    /// Non-zero when the literal being searched for is a leading positive
+    /// lookbehind's (see [`crate::literal::Literals::prefix_offset`]): the
+    /// candidate is then the literal, and the match begins that many bytes
+    /// after it.
+    prefix_offset: usize,
     /// Fallback NFA for captures when using Shift-Or or LazyDfa.
     /// Populated at construction (or left permanently `None` for engines that
     /// extract captures themselves) — the `RwLock` exists for interior mutability
@@ -280,6 +282,13 @@ impl CompiledRegex {
 
     /// Returns true if the pattern matches anywhere in the input.
     pub fn is_match(&self, input: &[u8]) -> bool {
+        // An offset prefilter's candidates are not match starts, so the loop
+        // below cannot verify them directly; `find_from_inner` owns that
+        // translation and answers the same question.
+        if self.prefix_offset != 0 {
+            return self.find(input).is_some();
+        }
+
         // Fast path: if prefilter can provide full match bounds (TeddyFull),
         // finding any match means there's a match
         if self.prefilter.is_full_match() {
@@ -461,65 +470,43 @@ impl CompiledRegex {
             return self.prefilter.find_full_match(input, from);
         }
 
-        // Special handling for InnerByte prefilter
-        // InnerByte finds a required byte that appears somewhere in the match,
-        // so we need to look back from the found position to find the actual start.
-        if self.prefilter.is_inner_byte() {
-            let lookback = self.prefilter.inner_byte_lookback();
-            let mut search_pos = from;
-            let mut drive = PrefilterDrive::new();
-
-            while let Some(inner_pos) = self.prefilter.find_candidate(input, search_pos) {
-                // Find the likely start position by looking back for a word boundary
-                // (non-word char followed by word char, or start of input).
-                // The lookback never reaches behind the resume position.
-                let start_pos = inner_pos.saturating_sub(lookback).max(from);
-                let mut candidate = start_pos;
-
-                // Find the first word boundary in the lookback window
-                for i in (start_pos..inner_pos).rev() {
-                    if (i == 0 || !is_word_byte(input[i - 1]))
-                        && i < input.len()
-                        && is_word_byte(input[i])
-                    {
-                        candidate = i;
-                        break;
-                    }
-                }
-
-                // Try starting from the candidate position
-                if let Some((start, end)) = self.find_at(input, candidate, dfa.as_deref_mut()) {
-                    return Some((start, end));
-                }
-
-                if drive.give_up(inner_pos) {
-                    // The caller applies the codepoint-boundary rule.
-                    return self.find_engine_from(input, candidate, dfa);
-                }
-
-                // No match found around this inner byte, skip past it
-                search_pos = inner_pos + 1;
-            }
-            return None;
-        }
-
         // Use prefilter to skip to candidate positions
         // IMPORTANT: Use find_at_pos (exact position) not find_at (linear search from pos)
         // The prefilter already tells us where candidates are - we only need to verify each one.
         if !self.prefilter.is_none() {
+            // With an offset prefilter the candidate is the literal and the
+            // match starts `prefix_offset` bytes later, so the scan itself has
+            // to begin BEHIND the resume point: a match starting exactly at
+            // `from` has its literal at `from - prefix_offset`, and scanning
+            // from `from` would never see it. `match_start` then discards the
+            // candidates that translate to a position before `from` (already
+            // reported) or past the end of the input.
+            let scan_from = from.saturating_sub(self.prefix_offset);
+            let match_start = |candidate: usize| {
+                candidate
+                    .checked_add(self.prefix_offset)
+                    .filter(|&start| start >= from && start <= input.len())
+            };
+
             if self.engine_searches_single_pass() {
                 // The caller applies the codepoint-boundary rule.
-                let first = self.prefilter.find_candidates_from(input, from).next()?;
+                let first = self
+                    .prefilter
+                    .find_candidates_from(input, scan_from)
+                    .find_map(match_start)?;
                 return self.find_engine_from(input, first, dfa);
             }
             let mut drive = PrefilterDrive::new();
-            for candidate in self.prefilter.find_candidates_from(input, from) {
-                if let Some(result) = self.find_at_pos(input, candidate, dfa.as_deref_mut()) {
+            for candidate in self.prefilter.find_candidates_from(input, scan_from) {
+                let Some(start) = match_start(candidate) else {
+                    continue;
+                };
+                if let Some(result) = self.find_at_pos(input, start, dfa.as_deref_mut()) {
                     return Some(result);
                 }
-                if drive.give_up(candidate) {
+                if drive.give_up(start) {
                     // The caller applies the codepoint-boundary rule.
-                    return self.find_engine_from(input, candidate, dfa);
+                    return self.find_engine_from(input, start, dfa);
                 }
             }
             return None;
@@ -822,9 +809,9 @@ impl CompiledRegex {
         from: usize,
     ) -> OnePassSearch<Vec<Option<(usize, usize)>>> {
         // A full-match prefilter already reports the span without running an
-        // engine, and an inner-byte one yields positions inside the match rather
-        // than starts. Neither is a source of anchored candidates.
-        if self.prefilter.is_full_match() || self.prefilter.is_inner_byte() {
+        // engine, and an offset one yields the position of a lookbehind literal
+        // rather than a match start. Neither is a source of anchored candidates.
+        if self.prefilter.is_full_match() || self.prefix_offset != 0 {
             return OnePassSearch::NotApplicable;
         }
 
@@ -909,22 +896,6 @@ impl CompiledRegex {
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::JitShiftOr(jit) => jit.try_match_at(input, pos),
         }
-    }
-
-    /// Find a match starting at or after `pos`.
-    fn find_at(
-        &self,
-        input: &[u8],
-        pos: usize,
-        mut dfa: Option<&mut LazyDfa>,
-    ) -> Option<(usize, usize)> {
-        // Try each position starting from pos
-        for start in pos..=input.len() {
-            if let Some(result) = self.find_at_pos(input, start, dfa.as_deref_mut()) {
-                return Some(result);
-            }
-        }
-        None
     }
 
     /// Takes a lazy-DFA instance out of the pool, or `None` when the compiled
@@ -1052,6 +1023,7 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
     Ok(CompiledRegex {
         inner,
         prefilter: Prefilter::None, // Can't extract literals from NFA
+        prefix_offset: 0,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1079,6 +1051,7 @@ fn compile_tagged_nfa_interp(hir: &Hir, nfa: Nfa) -> CompiledRegex {
     CompiledRegex {
         inner: CompiledInner::TaggedNfaInterp(TaggedNfaEngine::new(nfa)),
         prefilter,
+        prefix_offset: literals.prefix_offset,
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1101,6 +1074,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                 codepoint_class.clone(),
             )),
             prefilter: Prefilter::None,
+            prefix_offset: 0,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1300,6 +1274,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
     Ok(CompiledRegex {
         inner,
         prefilter,
+        prefix_offset: literals.prefix_offset,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1329,6 +1304,7 @@ pub fn compile_with_pikevm(hir: &Hir) -> Result<CompiledRegex> {
     Ok(CompiledRegex {
         inner: CompiledInner::PikeVm(PikeVm::new(nfa)),
         prefilter,
+        prefix_offset: literals.prefix_offset,
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1357,6 +1333,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 codepoint_class.clone(),
             )),
             prefilter: Prefilter::None,
+            prefix_offset: 0,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1418,6 +1395,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 return Ok(CompiledRegex {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
+                    prefix_offset: literals.prefix_offset,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1453,6 +1431,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 return Ok(CompiledRegex {
                     inner: CompiledInner::Backtracking(jit_regex),
                     prefilter,
+                    prefix_offset: literals.prefix_offset,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1472,6 +1451,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 return Ok(CompiledRegex {
                     inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
                     prefilter,
+                    prefix_offset: literals.prefix_offset,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1500,6 +1480,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 return Ok(CompiledRegex {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
+                    prefix_offset: literals.prefix_offset,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1544,6 +1525,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
         return Ok(CompiledRegex {
             inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
             prefilter: Prefilter::from_literals(&literals),
+            prefix_offset: literals.prefix_offset,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1643,6 +1625,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     return Ok(CompiledRegex {
                         inner: CompiledInner::JitShiftOr(jit_shift_or),
                         prefilter,
+                        prefix_offset: literals.prefix_offset,
                         capture_nfa: RwLock::new(capture_nfa),
                         one_pass: OnceLock::new(),
                         capture_vm: RwLock::new(None),
@@ -1678,6 +1661,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 return Ok(CompiledRegex {
                     inner: CompiledInner::Jit(jit_regex),
                     prefilter,
+                    prefix_offset: literals.prefix_offset,
                     capture_nfa: RwLock::new(capture_nfa),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),

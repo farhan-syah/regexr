@@ -16,6 +16,12 @@ pub struct Literals {
     pub suffixes: Vec<Vec<u8>>,
     /// Whether the prefix set is complete (all match positions start with one of these).
     pub prefix_complete: bool,
+    /// How many bytes after a prefix's own start the match begins.
+    ///
+    /// Zero for an ordinary prefix, which *is* the start of the match. Non-zero
+    /// only for the literal of a leading positive lookbehind, which sits that
+    /// many bytes to the left of every match start (see `lookbehind_prefix`).
+    pub prefix_offset: usize,
     /// True if the pattern starts with a digit class (0-9).
     /// Used to create StartsWithDigit prefilter when no literal prefix exists.
     pub starts_with_digit: bool,
@@ -71,22 +77,81 @@ pub fn extract_literals(hir: &Hir) -> Literals {
         && !hir.props.has_word_boundary
         && !hir.props.has_anchors;
 
-    // If no prefix literals found, check if pattern starts with digit class
-    let starts_with_digit = result.prefixes.is_empty() && starts_with_digit_class(&hir.expr);
+    // A pattern that opens with a positive lookbehind has no literal prefix of
+    // its own, but the lookbehind's literal is required text at a known distance
+    // to the LEFT of every match start, which searches just as fast. Only
+    // consulted when ordinary extraction found nothing, so no pattern that
+    // already has a prefix trades it for a weaker one.
+    let mut prefixes = result.prefixes;
+    let mut prefix_offset = 0;
+    if prefixes.is_empty() {
+        if let Some((literals, offset)) = lookbehind_prefix(&hir.expr) {
+            prefixes = literals;
+            prefix_offset = offset;
+        }
+    }
 
-    let leading_bytes = if result.prefixes.is_empty() && !starts_with_digit {
+    // If no prefix literals found, check if pattern starts with digit class
+    let starts_with_digit = prefixes.is_empty() && starts_with_digit_class(&hir.expr);
+
+    let leading_bytes = if prefixes.is_empty() && !starts_with_digit {
         leading_byte_set(&hir.expr).unwrap_or_default()
     } else {
         Vec::new()
     };
 
     Literals {
-        prefixes: result.prefixes,
+        prefixes,
         suffixes: vec![],
         prefix_complete,
+        prefix_offset,
         starts_with_digit,
         leading_bytes,
     }
+}
+
+/// The literal a leading positive lookbehind requires, plus the byte distance
+/// from that literal's start to the match start.
+///
+/// `(?<=@)\w+` cannot match anywhere the byte before the match is not `@`, so a
+/// search for `@` finds every candidate — each one byte to the left of a
+/// possible match. That is only sound when the lookbehind's inner expression is
+/// an *exact, fixed-width* literal set: the distance is the literal's own byte
+/// length, so every alternative has to be the same length, and an extraction
+/// that did not cover the whole inner expression (a truncated literal, a
+/// repetition, a class) says nothing about where the match begins.
+///
+/// A negative lookbehind is deliberately excluded: its literal is the text that
+/// must be ABSENT, so searching for it would skip to exactly the positions that
+/// cannot match. Lookahead is excluded too — it sits at the match end, at a
+/// distance no fixed offset describes once the body is variable-width — as is
+/// any lookbehind that is not the pattern's first element.
+fn lookbehind_prefix(expr: &HirExpr) -> Option<(Vec<Vec<u8>>, usize)> {
+    let look = match expr {
+        HirExpr::Lookaround(look) => look,
+        HirExpr::Concat(exprs) => match exprs.first() {
+            Some(HirExpr::Lookaround(look)) => look,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !matches!(look.kind, HirLookaroundKind::PositiveLookbehind) {
+        return None;
+    }
+
+    let mut extractor = LiteralExtractor::new();
+    let inner = extractor.extract(&look.expr);
+    if !inner.complete {
+        return None;
+    }
+
+    // The offset is the literal's byte length, so a set of differing lengths
+    // has no single offset and an empty one no offset at all.
+    let width = inner.prefixes.first()?.len();
+    if width == 0 || inner.prefixes.iter().any(|lit| lit.len() != width) {
+        return None;
+    }
+    Some((inner.prefixes, width))
 }
 
 /// Bytes a match can begin with, when a leading character class names at most
@@ -731,14 +796,66 @@ mod tests {
     #[test]
     fn test_leading_lookaround_does_not_hide_the_prefilter() {
         assert!(literals(r"(?<!\$)\d+").starts_with_digit);
-        assert!(literals(r"(?<=\$)\d+").starts_with_digit);
         assert!(literals(r"(?!x)\d+").starts_with_digit);
+        // `(?<=\$)\d+` does better still: the lookbehind's own literal is an
+        // offset prefix, which beats scanning for any digit — see
+        // `test_leading_lookbehind_literal_becomes_an_offset_prefix`.
         assert_eq!(literals(r"(?<!a)bcd").prefixes, vec![b"bcd".to_vec()]);
         assert_eq!(literals(r"(?=x)abc").prefixes, vec![b"abc".to_vec()]);
 
         // Still candidate-only: a lookaround means the literal alone cannot
         // decide a match.
         assert!(!literals(r"(?<!a)bcd").prefix_complete);
+    }
+
+    /// A leading positive lookbehind on a fixed-width literal is searchable
+    /// text, offset by its own width. Nothing about the *matches* changes when
+    /// this is lost — only the cost — so it has to be asserted here.
+    #[test]
+    fn test_leading_lookbehind_literal_becomes_an_offset_prefix() {
+        let lits = literals(r"(?<=@)\w+");
+        assert_eq!(lits.prefixes, vec![b"@".to_vec()]);
+        assert_eq!(lits.prefix_offset, 1);
+        // A lookaround can never let the literal alone decide a match.
+        assert!(!lits.prefix_complete);
+        // The offset prefix wins over the weaker digit-class prefilter.
+        let lits = literals(r"(?<=\$)\d+");
+        assert_eq!(lits.prefixes, vec![b"$".to_vec()]);
+        assert_eq!(lits.prefix_offset, 1);
+        assert!(!lits.starts_with_digit);
+
+        // The offset is a byte count, not a character count.
+        let lits = literals(r"(?<=é)\w+");
+        assert_eq!(lits.prefixes, vec!["é".as_bytes().to_vec()]);
+        assert_eq!(lits.prefix_offset, 2);
+
+        // Several alternatives are fine while they share one width.
+        let lits = literals(r"(?<=(?:ab|cd))\w+");
+        assert_eq!(lits.prefixes, vec![b"ab".to_vec(), b"cd".to_vec()]);
+        assert_eq!(lits.prefix_offset, 2);
+
+        // A pattern with a prefix of its own keeps it, at offset zero.
+        let lits = literals(r"(?<=@)foo");
+        assert_eq!(lits.prefixes, vec![b"foo".to_vec()]);
+        assert_eq!(lits.prefix_offset, 0);
+    }
+
+    /// Everything the offset prefix must refuse. A literal contributed by any
+    /// of these is not "text that precedes the match at a fixed distance", and
+    /// searching for it would skip real matches.
+    #[test]
+    fn test_lookbehind_offset_prefix_is_refused_when_unsound() {
+        // A negative lookbehind's literal is what must be ABSENT.
+        assert!(literals(r"(?<!@)\w+").prefixes.is_empty());
+        assert_eq!(literals(r"(?<!@)\w+").prefix_offset, 0);
+        // Lookahead sits at the match end, not at a fixed distance before it.
+        assert!(literals(r"(?=@)\w+").prefixes.is_empty());
+        assert!(literals(r"\w+(?=@)").prefixes.is_empty());
+        // Not fixed-width: the literal's distance from the match start varies.
+        assert!(literals(r"(?<=ab+)\w+").prefixes.is_empty());
+        assert!(literals(r"(?<=(?:a|bc))\w+").prefixes.is_empty());
+        // Not the pattern's first element.
+        assert!(literals(r"\s(?<=@)\w+").prefixes.is_empty());
     }
 
     fn required(pattern: &str) -> Option<Vec<u8>> {

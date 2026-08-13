@@ -20,16 +20,6 @@ pub enum Prefilter {
     None,
     /// Single-byte prefix search using memchr.
     SingleByte(u8),
-    /// Inner byte search - finds a required byte that appears somewhere in the match.
-    /// Unlike SingleByte (prefix), this requires backtracking to find the actual match start.
-    /// NOTE: Currently disabled in from_literals() due to performance issues.
-    #[allow(dead_code)]
-    InnerByte {
-        /// The byte to search for.
-        byte: u8,
-        /// How far back to search for the actual match start.
-        max_lookback: usize,
-    },
     /// Multi-byte literal prefix search using memmem.
     Literal(Box<memchr::memmem::Finder<'static>>),
     /// Pattern starts with a digit (0-9). Uses memchr to find digit positions.
@@ -66,13 +56,6 @@ impl std::fmt::Debug for Prefilter {
         match self {
             Self::None => write!(f, "Prefilter::None"),
             Self::SingleByte(b) => write!(f, "Prefilter::SingleByte({:#04x})", b),
-            Self::InnerByte { byte, max_lookback } => {
-                write!(
-                    f,
-                    "Prefilter::InnerByte({:#04x}, lookback={})",
-                    byte, max_lookback
-                )
-            }
             Self::Literal(_) => write!(f, "Prefilter::Literal"),
             Self::StartsWithDigit => write!(f, "Prefilter::StartsWithDigit"),
             Self::LeadingBytes(bytes, len) => {
@@ -160,12 +143,6 @@ impl Prefilter {
             Self::SingleByte(needle) => {
                 let slice = &haystack[pos..];
                 memchr::memchr(*needle, slice).map(|i| pos + i)
-            }
-            Self::InnerByte { byte, .. } => {
-                // For InnerByte, we just find the next occurrence of the byte.
-                // The executor will handle the lookback logic.
-                let slice = &haystack[pos..];
-                memchr::memchr(*byte, slice).map(|i| pos + i)
             }
             Self::Literal(finder) => {
                 let slice = &haystack[pos..];
@@ -329,20 +306,6 @@ impl Prefilter {
             Self::None => false,
             Self::StartsWithDigit => false, // Too many candidates in typical text
             Self::LeadingBytes(..) => true,
-            Self::InnerByte { .. } => false, // Requires lookback, complex handling
-        }
-    }
-
-    /// Returns true if this is an InnerByte prefilter.
-    pub fn is_inner_byte(&self) -> bool {
-        matches!(self, Self::InnerByte { .. })
-    }
-
-    /// Returns the max_lookback for InnerByte prefilter.
-    pub fn inner_byte_lookback(&self) -> usize {
-        match self {
-            Self::InnerByte { max_lookback, .. } => *max_lookback,
-            _ => 0,
         }
     }
 }
@@ -475,6 +438,7 @@ mod tests {
             prefixes: vec![b"hello".to_vec()],
             suffixes: vec![],
             prefix_complete: true,
+            prefix_offset: 0,
             starts_with_digit: false,
             leading_bytes: Vec::new(),
         };
@@ -488,6 +452,7 @@ mod tests {
             prefixes: vec![b"h".to_vec()],
             suffixes: vec![],
             prefix_complete: true,
+            prefix_offset: 0,
             starts_with_digit: false,
             leading_bytes: Vec::new(),
         };
@@ -501,6 +466,7 @@ mod tests {
             prefixes: vec![],
             suffixes: vec![],
             prefix_complete: false,
+            prefix_offset: 0,
             starts_with_digit: false,
             leading_bytes: Vec::new(),
         };
@@ -514,6 +480,7 @@ mod tests {
             prefixes: vec![b"hello".to_vec(), b"world".to_vec()],
             suffixes: vec![],
             prefix_complete: true,
+            prefix_offset: 0,
             starts_with_digit: false,
             leading_bytes: Vec::new(),
         };
@@ -537,6 +504,7 @@ mod tests {
             prefixes: vec![b"hello".to_vec(), b"world".to_vec()],
             suffixes: vec![],
             prefix_complete: false, // Not a complete literal match
+            prefix_offset: 0,
             starts_with_digit: false,
             leading_bytes: Vec::new(),
         };
