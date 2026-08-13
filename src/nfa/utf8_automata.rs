@@ -21,20 +21,82 @@
 //! - 1-byte: `[0x61-0x7F]` (U+0061-U+007F)
 //! - 2-byte: `[0xC2-0xC3][0x80-0xBF]` (U+0080-U+00FF)
 
+/// An inline, allocation-free stand-in for `Vec<(u8, u8)>` sized for a UTF-8
+/// sequence, which is at most 4 byte-range elements (one per encoded byte).
+///
+/// Every producer in this module builds a sequence once from a fixed-size
+/// literal and never mutates it afterward, so a fixed `[(u8, u8); 4]` buffer
+/// with a length tag avoids a per-sequence heap allocation entirely. `Deref`
+/// to `&[(u8, u8)]` keeps every existing call site (`.ranges[0]`, `.iter()`,
+/// `.is_empty()`, slicing, ...) compiling unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct Utf8Ranges {
+    buf: [(u8, u8); 4],
+    len: u8,
+}
+
+impl Utf8Ranges {
+    /// Builds a `Utf8Ranges` from up to 4 byte ranges.
+    ///
+    /// Every caller in this crate passes a UTF-8 sequence (0-4 elements); a
+    /// longer slice would index out of bounds below, matching the
+    /// `debug_assert!`-guarded invariants already used elsewhere in this
+    /// module for internal preconditions.
+    pub fn from_slice(ranges: &[(u8, u8)]) -> Self {
+        debug_assert!(
+            ranges.len() <= 4,
+            "UTF-8 sequences have at most 4 bytes, got {}",
+            ranges.len()
+        );
+        let mut buf = [(0u8, 0u8); 4];
+        buf[..ranges.len()].copy_from_slice(ranges);
+        Self {
+            buf,
+            len: ranges.len() as u8,
+        }
+    }
+}
+
+impl std::ops::Deref for Utf8Ranges {
+    type Target = [(u8, u8)];
+
+    fn deref(&self) -> &[(u8, u8)] {
+        &self.buf[..self.len as usize]
+    }
+}
+
+// Hand-written rather than `#[derive]`, and the reason is narrower than it
+// might look. Padding alone can never differ: `from_slice` zero-fills `buf`
+// before copying, so two values with the same live prefix always have an
+// identical array. What matters is that `len` keeps participating — an
+// equality reduced to `self.buf == other.buf` would call a 2-range sequence
+// equal to a 4-range one whose extra ranges are the `(0, 0)` used as padding,
+// silently merging sequences that encode different byte strings. Comparing the
+// live prefix through `Deref` gets both halves right.
+impl PartialEq for Utf8Ranges {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Utf8Ranges {}
+
 /// A sequence of byte ranges representing a UTF-8 encoded character range.
 ///
 /// Each element is a (min, max) byte range. The sequence length corresponds
 /// to the UTF-8 encoding length (1-4 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Utf8Sequence {
     /// The byte ranges, one per UTF-8 byte position.
-    pub ranges: Vec<(u8, u8)>,
+    pub ranges: Utf8Ranges,
 }
 
 impl Utf8Sequence {
     /// Creates a new UTF-8 sequence with the given byte ranges.
-    pub fn new(ranges: Vec<(u8, u8)>) -> Self {
-        Self { ranges }
+    pub fn new(ranges: &[(u8, u8)]) -> Self {
+        Self {
+            ranges: Utf8Ranges::from_slice(ranges),
+        }
     }
 
     /// Returns the number of bytes in this sequence.
@@ -120,7 +182,7 @@ fn compile_utf8_class(start: u32, end: u32, encoding_len: usize) -> Vec<Utf8Sequ
 /// Compiles 1-byte UTF-8 sequences (U+0000..U+007F).
 fn compile_1byte(start: u32, end: u32) -> Vec<Utf8Sequence> {
     debug_assert!(start <= 0x7F && end <= 0x7F);
-    vec![Utf8Sequence::new(vec![(start as u8, end as u8)])]
+    vec![Utf8Sequence::new(&[(start as u8, end as u8)])]
 }
 
 /// Compiles 2-byte UTF-8 sequences (U+0080..U+07FF).
@@ -146,7 +208,7 @@ fn compile_2byte(start: u32, end: u32) -> Vec<Utf8Sequence> {
         let byte2_start = (0x80 | (current & 0x3F)) as u8;
         let byte2_end = (0x80 | (range_end & 0x3F)) as u8;
 
-        sequences.push(Utf8Sequence::new(vec![
+        sequences.push(Utf8Sequence::new(&[
             (byte1, byte1),
             (byte2_start, byte2_end),
         ]));
@@ -224,7 +286,7 @@ fn compile_3byte_with_fixed_byte1(start: u32, end: u32, byte1: u8) -> Vec<Utf8Se
         let byte3_start = (0x80 | (current & 0x3F)) as u8;
         let byte3_end = (0x80 | (range_end & 0x3F)) as u8;
 
-        sequences.push(Utf8Sequence::new(vec![
+        sequences.push(Utf8Sequence::new(&[
             (byte1, byte1),
             (byte2, byte2),
             (byte3_start, byte3_end),
@@ -306,7 +368,7 @@ fn compile_4byte_with_fixed_byte12(
         let byte4_start = (0x80 | (current & 0x3F)) as u8;
         let byte4_end = (0x80 | (range_end & 0x3F)) as u8;
 
-        sequences.push(Utf8Sequence::new(vec![
+        sequences.push(Utf8Sequence::new(&[
             (byte1, byte1),
             (byte2, byte2),
             (byte3, byte3),
@@ -373,12 +435,15 @@ pub fn optimize_sequences(sequences: Vec<Utf8Sequence>) -> Vec<Utf8Sequence> {
     // the passes have to run to a fixed point.
     let mut current = sequences;
     loop {
-        let mut merged = Vec::with_capacity(current.len());
         let mut changed = false;
         let mut index = 0;
+        // Write-behind cursor: `write` is always <= `index`, so writing
+        // `current[write]` before advancing `index` further never clobbers
+        // data the read side hasn't consumed yet.
+        let mut write = 0;
 
         while index < current.len() {
-            let Some(mut sequence) = current.get(index).cloned() else {
+            let Some(mut sequence) = current.get(index).copied() else {
                 break;
             };
             while let Some(next) = current.get(index + 1) {
@@ -391,11 +456,12 @@ pub fn optimize_sequences(sequences: Vec<Utf8Sequence>) -> Vec<Utf8Sequence> {
                     None => break,
                 }
             }
-            merged.push(sequence);
+            current[write] = sequence;
+            write += 1;
             index += 1;
         }
 
-        current = merged;
+        current.truncate(write);
         if !changed {
             return current;
         }
@@ -575,9 +641,10 @@ fn try_merge_sequences(a: &Utf8Sequence, b: &Utf8Sequence) -> Option<Utf8Sequenc
         return None;
     }
 
-    let mut ranges = a.ranges.clone();
-    *ranges.get_mut(index)? = (a_start, b_end);
-    Some(Utf8Sequence::new(ranges))
+    let mut ranges: [(u8, u8); 4] = [(0, 0); 4];
+    ranges[..a.ranges.len()].copy_from_slice(&a.ranges);
+    ranges[index] = (a_start, b_end);
+    Some(Utf8Sequence::new(&ranges[..a.ranges.len()]))
 }
 
 #[cfg(test)]
@@ -677,7 +744,7 @@ mod tests {
     fn test_compile_1byte_range() {
         let seqs = compile_utf8_range(0x41, 0x5A); // A-Z
         assert_eq!(seqs.len(), 1);
-        assert_eq!(seqs[0].ranges, vec![(0x41, 0x5A)]);
+        assert_eq!(&*seqs[0].ranges, &[(0x41, 0x5A)][..]);
     }
 
     #[test]
@@ -760,16 +827,55 @@ mod tests {
     #[test]
     fn test_optimize_sequences() {
         let seqs = vec![
-            Utf8Sequence::new(vec![(0xC2, 0xC2), (0x80, 0x8F)]),
-            Utf8Sequence::new(vec![(0xC2, 0xC2), (0x90, 0x9F)]),
-            Utf8Sequence::new(vec![(0xC2, 0xC2), (0xA0, 0xAF)]),
+            Utf8Sequence::new(&[(0xC2, 0xC2), (0x80, 0x8F)]),
+            Utf8Sequence::new(&[(0xC2, 0xC2), (0x90, 0x9F)]),
+            Utf8Sequence::new(&[(0xC2, 0xC2), (0xA0, 0xAF)]),
         ];
 
         let optimized = optimize_sequences(seqs);
 
         // Should merge into one sequence
         assert_eq!(optimized.len(), 1);
-        assert_eq!(optimized[0].ranges, vec![(0xC2, 0xC2), (0x80, 0xAF)]);
+        assert_eq!(&*optimized[0].ranges, &[(0xC2, 0xC2), (0x80, 0xAF)][..]);
+    }
+
+    /// Padding beyond the live prefix must never affect equality: two
+    /// sequences reached via different construction paths but with the same
+    /// live prefix must compare equal, and sequences that genuinely differ
+    /// in their live prefix must compare unequal.
+    #[test]
+    fn test_utf8_ranges_equality_uses_live_prefix_only() {
+        let direct = Utf8Sequence::new(&[(0xC2, 0xC3), (0x80, 0xBF)]);
+
+        let via_length_4 =
+            Utf8Sequence::new(&[(0xC2, 0xC3), (0x80, 0xBF), (0x01, 0x02), (0x03, 0x04)]);
+        let reconstructed = Utf8Sequence::new(&via_length_4.ranges[..2]);
+        assert_eq!(
+            direct, reconstructed,
+            "same live prefix must compare equal regardless of how each value was built"
+        );
+
+        let different = Utf8Sequence::new(&[(0xC2, 0xC3), (0x80, 0xBE)]);
+        assert_ne!(
+            direct, different,
+            "sequences with a different live prefix must compare unequal"
+        );
+
+        // The case that actually bites an array-backed representation. Padding
+        // can never differ on its own — `from_slice` zero-fills before copying,
+        // so two values with the same prefix always have identical `buf`. What
+        // an equality that forgot `len` WOULD confuse is a short sequence
+        // against a longer one whose extra ranges happen to be the `(0, 0)` the
+        // padding is filled with: identical `buf`, different length, and they
+        // must not be equal.
+        let short = Utf8Sequence::new(&[(0x41, 0x5A), (0x61, 0x7A)]);
+        let padded_lookalike =
+            Utf8Sequence::new(&[(0x41, 0x5A), (0x61, 0x7A), (0x00, 0x00), (0x00, 0x00)]);
+        assert_ne!(
+            short, padded_lookalike,
+            "length must participate in equality: a 2-range sequence is not a \
+             4-range sequence whose tail happens to match the zero padding"
+        );
     }
 
     #[test]

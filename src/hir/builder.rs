@@ -765,7 +765,7 @@ impl HirTranslator {
         let mut byte_ranges = Vec::new();
         let mut sequences = Vec::new();
         for seq in complement {
-            match seq.ranges.as_slice() {
+            match &seq.ranges[..] {
                 [single] => byte_ranges.push(*single),
                 _ => sequences.push(seq),
             }
@@ -887,7 +887,7 @@ impl HirTranslator {
                 groups
                     .entry(atom)
                     .or_default()
-                    .push(Utf8Sequence::new(seq.ranges[1..].to_vec()));
+                    .push(Utf8Sequence::new(&seq.ranges[1..]));
             }
         }
 
@@ -1313,9 +1313,9 @@ fn push_codepoint_range(
 /// still excluded because they cannot begin any well-formed character.
 fn any_non_ascii_character() -> Vec<Utf8Sequence> {
     vec![
-        Utf8Sequence::new(vec![(0xc2, 0xdf), (0x80, 0xbf)]),
-        Utf8Sequence::new(vec![(0xe0, 0xef), (0x80, 0xbf), (0x80, 0xbf)]),
-        Utf8Sequence::new(vec![(0xf0, 0xf4), (0x80, 0xbf), (0x80, 0xbf), (0x80, 0xbf)]),
+        Utf8Sequence::new(&[(0xc2, 0xdf), (0x80, 0xbf)]),
+        Utf8Sequence::new(&[(0xe0, 0xef), (0x80, 0xbf), (0x80, 0xbf)]),
+        Utf8Sequence::new(&[(0xf0, 0xf4), (0x80, 0xbf), (0x80, 0xbf), (0x80, 0xbf)]),
     ]
 }
 
