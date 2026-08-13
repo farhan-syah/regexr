@@ -6,7 +6,7 @@ use crate::nfa::Nfa;
 
 use super::super::lazy::LazyDfa;
 use super::interpreter::EagerDfa;
-use super::shared::EagerScanBudgetExceeded;
+use super::shared::{EagerMaterializationBudgetExceeded, EagerScanBudgetExceeded};
 
 /// Eager DFA engine that wraps the interpreter.
 ///
@@ -28,18 +28,26 @@ impl EagerDfaEngine {
     /// Creates a new Eager DFA engine from an NFA.
     ///
     /// This first creates a LazyDfa and then materializes all states.
-    pub fn new(nfa: Nfa) -> Self {
+    ///
+    /// Declines with [`EagerMaterializationBudgetExceeded`] under the same
+    /// condition as [`EagerDfa::from_lazy`]; the caller should fall back to
+    /// `LazyDfa` directly.
+    pub fn new(nfa: Nfa) -> Result<Self, EagerMaterializationBudgetExceeded> {
         let mut lazy = LazyDfa::new(nfa);
-        Self {
-            dfa: EagerDfa::from_lazy(&mut lazy),
-        }
+        Ok(Self {
+            dfa: EagerDfa::from_lazy(&mut lazy)?,
+        })
     }
 
     /// Creates a new Eager DFA engine from a LazyDfa.
-    pub fn from_lazy(lazy: &mut LazyDfa) -> Self {
-        Self {
-            dfa: EagerDfa::from_lazy(lazy),
-        }
+    ///
+    /// Declines with [`EagerMaterializationBudgetExceeded`] under the same
+    /// condition as [`EagerDfa::from_lazy`]; the caller should fall back to
+    /// `LazyDfa` directly.
+    pub fn from_lazy(lazy: &mut LazyDfa) -> Result<Self, EagerMaterializationBudgetExceeded> {
+        Ok(Self {
+            dfa: EagerDfa::from_lazy(lazy)?,
+        })
     }
 
     /// Finds the first match, returning (start, end).

@@ -20,8 +20,8 @@ use std::collections::{HashMap, VecDeque};
 
 use super::super::super::lazy::{CharClass, LazyDfa, SCAN_BUDGET_FACTOR};
 use super::super::shared::{
-    is_word_byte, EagerScanBudgetExceeded, StateMetadata, DEAD_STATE, STATE_MASK, TAG_DEAD,
-    TAG_MATCH,
+    is_word_byte, EagerMaterializationBudgetExceeded, EagerScanBudgetExceeded, StateMetadata,
+    DEAD_STATE, MATERIALIZATION_WORK_BUDGET, STATE_MASK, TAG_DEAD, TAG_MATCH,
 };
 
 /// A pre-materialized DFA with flat transition table.
@@ -55,7 +55,13 @@ pub struct EagerDfa {
 
 impl EagerDfa {
     /// Creates an EagerDfa by materializing all states from a LazyDfa.
-    pub fn from_lazy(lazy: &mut LazyDfa) -> Self {
+    ///
+    /// Declines with [`EagerMaterializationBudgetExceeded`] if the BFS's
+    /// cumulative work (see [`MATERIALIZATION_WORK_BUDGET`]) crosses the
+    /// budget before finishing — the caller should fall back to `LazyDfa`,
+    /// which computes the identical states/transitions on demand instead of
+    /// paying for all of them upfront.
+    pub fn from_lazy(lazy: &mut LazyDfa) -> Result<Self, EagerMaterializationBudgetExceeded> {
         // Disable cache flushing during materialization to prevent state loss.
         // When LazyDfa flushes its cache, state IDs become invalid, which would
         // corrupt the state mapping we're building during BFS.
@@ -104,9 +110,20 @@ impl EagerDfa {
             None
         };
 
-        // BFS to materialize all reachable states
+        // BFS to materialize all reachable states, metered by cumulative
+        // NFA-subset size (see MATERIALIZATION_WORK_BUDGET) so a state whose
+        // transition computation would be expensive gets charged for it
+        // before that cost is paid, not after.
+        let mut work_budget_used: usize = 0;
+
         while let Some(lazy_state) = queue.pop_front() {
             let eager_idx = *state_map.get(&lazy_state).unwrap();
+
+            work_budget_used =
+                work_budget_used.saturating_add(lazy.get_state_subset_size(lazy_state));
+            if work_budget_used > MATERIALIZATION_WORK_BUDGET {
+                return Err(EagerMaterializationBudgetExceeded);
+            }
 
             // Ensure we have space for this state
             while all_transitions.len() <= eager_idx as usize {
@@ -205,7 +222,7 @@ impl EagerDfa {
             }
         });
 
-        Self {
+        Ok(Self {
             transitions,
             state_count,
             start,
@@ -216,7 +233,7 @@ impl EagerDfa {
             has_end_anchor,
             has_multiline_anchors,
             state_metadata,
-        }
+        })
     }
 
     /// Returns the number of DFA states.

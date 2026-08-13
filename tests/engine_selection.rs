@@ -227,3 +227,61 @@ fn plus_quantifier_before_a_codepoint_class_is_unaffected() {
     let re = regexr::Regex::new(r"[^\s]+\p{N}").unwrap();
     assert_eq!(re.find("\u{BD}\u{BD}").map(|m| m.end()), Some(4));
 }
+
+// =============================================================================
+// `EagerDfa::from_lazy` declining its materialization budget must not change
+// what the pattern matches.
+// =============================================================================
+// `(?:a?){n}` selects `EngineType::LazyDfa`, which without anchors or a large
+// Unicode class used to always materialize into an `EagerDfa` eagerly. Past
+// n≈1000 that BFS is too expensive to run at all (see
+// `src/dfa/eager/shared.rs::MATERIALIZATION_WORK_BUDGET`), so it now declines
+// partway through and the engine falls back to `LazyDfa` instead. `LazyDfa`
+// computes the exact same states on demand, so the two must agree on every
+// match — this locks that in at a small `n`, where the eager path still
+// finishes, so both engines are exercised for real (not just the fallback).
+#[test]
+fn nullable_repetition_matches_agree_with_the_reference() {
+    use regexr::hir::translate;
+    use regexr::parser::parse;
+
+    let pattern = "(?:a?){20}";
+    let hir = parse(pattern)
+        .and_then(|ast| translate(&ast))
+        .expect("pattern should compile");
+    let ncaps = hir.props.capture_count as usize;
+
+    let re = regexr::Regex::new(pattern).expect("pattern should compile");
+
+    let haystacks = [
+        String::new(),
+        "a".to_string(),
+        "aaaa".to_string(),
+        "a".repeat(20),
+        "b".to_string(),
+        // A mismatch in the middle of an otherwise-matching run.
+        "aaaabaaaa".to_string(),
+    ];
+
+    for haystack in &haystacks {
+        let bytes = haystack.as_bytes();
+        let expected_find = regexr::reference::find(&hir.expr, ncaps, bytes);
+        let expected_captures = regexr::reference::captures(&hir.expr, ncaps, bytes);
+
+        let found = re.find(haystack).map(|m| (m.start(), m.end()));
+        assert_eq!(
+            found, expected_find,
+            "{pattern:?} on {haystack:?}: find() disagrees with reference"
+        );
+
+        let captured = re
+            .captures(haystack)
+            .and_then(|caps| caps.get(0))
+            .map(|m| (m.start(), m.end()));
+        let expected_group0 = expected_captures.and_then(|caps| caps[0]);
+        assert_eq!(
+            captured, expected_group0,
+            "{pattern:?} on {haystack:?}: captures() disagrees with reference"
+        );
+    }
+}

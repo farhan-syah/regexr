@@ -1023,8 +1023,19 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                 // Already held by `lazy`; cloning the Arc (not the Nfa) so the
                 // scan-budget give-up can rebuild a `LazyDfa` without recompiling.
                 let nfa_arc = lazy.nfa_arc();
-                let eager = EagerDfa::from_lazy(&mut lazy);
-                (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa)
+                match EagerDfa::from_lazy(&mut lazy) {
+                    Ok(eager) => (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa),
+                    Err(_) => {
+                        // Materialization declined (see
+                        // EagerMaterializationBudgetExceeded): fall back to a
+                        // fresh LazyDfa, which computes the identical states
+                        // on demand instead of upfront.
+                        (
+                            CompiledInner::LazyDfa(RwLock::new(LazyDfa::new((*nfa_arc).clone()))),
+                            capture_nfa,
+                        )
+                    }
+                }
             }
         }
         #[cfg(feature = "jit")]
@@ -1044,8 +1055,19 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                 // Already held by `lazy`; cloning the Arc (not the Nfa) so the
                 // scan-budget give-up can rebuild a `LazyDfa` without recompiling.
                 let nfa_arc = lazy.nfa_arc();
-                let eager = EagerDfa::from_lazy(&mut lazy);
-                (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa)
+                match EagerDfa::from_lazy(&mut lazy) {
+                    Ok(eager) => (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa),
+                    Err(_) => {
+                        // Materialization declined (see
+                        // EagerMaterializationBudgetExceeded): fall back to a
+                        // fresh LazyDfa, which computes the identical states
+                        // on demand instead of upfront.
+                        (
+                            CompiledInner::LazyDfa(RwLock::new(LazyDfa::new((*nfa_arc).clone()))),
+                            capture_nfa,
+                        )
+                    }
+                }
             }
         }
     };

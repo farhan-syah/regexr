@@ -717,3 +717,22 @@ fn pathological_sequential_alternations_do_not_blow_up_compile_time() {
         },
     );
 }
+
+// =============================================================================
+// `EagerDfa::from_lazy`'s materialization BFS does not blow up compile time
+// =============================================================================
+// `(?:a?){n}` selects `EngineType::LazyDfa`, and without anchors or a large
+// Unicode class that used to always materialize eagerly via
+// `EagerDfa::from_lazy` — a BFS whose per-state cost scales with the size of
+// that state's NFA subset. For this pattern shape the subset at DFA state
+// `S_k` is Θ(n−k), so materializing costs Θ((n−k)²) per state and Θ(n³)
+// overall: measured at n=2000, `Regex::new` did not return inside 500s.
+// `MATERIALIZATION_WORK_BUDGET` (src/dfa/eager/shared.rs) now meters that BFS
+// by cumulative NFA-subset size and declines partway through, falling back to
+// `LazyDfa` instead of finishing the materialization.
+#[test]
+fn nullable_repetition_does_not_blow_up_compile_time() {
+    bounded("nullable_repetition_does_not_blow_up_compile_time", || {
+        Regex::new("(?:a?){2000}").expect("pattern is well-formed and must compile");
+    });
+}

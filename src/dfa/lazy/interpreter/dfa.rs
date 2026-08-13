@@ -304,6 +304,21 @@ impl LazyDfa {
             .unwrap_or(false)
     }
 
+    /// Returns the size of the state's NFA subset (its live-thread count).
+    ///
+    /// Used by [`EagerDfa::from_lazy`](crate::dfa::eager::EagerDfa::from_lazy)
+    /// as a cheap proxy for the cost of computing this state's transitions:
+    /// that cost is dominated by unioning the epsilon closures reachable from
+    /// each member of the subset, so it scales with the subset's size.
+    pub fn get_state_subset_size(&self, state: DfaStateId) -> usize {
+        let idx = state_index(state);
+        self.ctx
+            .states
+            .get(idx)
+            .map(|s| s.nfa_states.len())
+            .unwrap_or(0)
+    }
+
     /// Returns the prev_class of a state (for JIT compilation).
     pub fn get_state_prev_class(&self, state: DfaStateId) -> CharClass {
         let idx = state_index(state);
@@ -1277,7 +1292,8 @@ mod tests {
                 "LazyDfa {pattern:?} on {input:?}"
             );
 
-            let eager = EagerDfa::from_lazy(&mut lazy);
+            let eager = EagerDfa::from_lazy(&mut lazy)
+                .expect("pattern is small; must not exceed the budget");
             assert_eq!(
                 eager.find_from(input.as_bytes(), 0),
                 Ok(expected),

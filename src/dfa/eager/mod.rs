@@ -28,7 +28,7 @@ pub(crate) mod shared;
 // Re-exports
 pub use engine::EagerDfaEngine;
 pub use interpreter::EagerDfa;
-pub use shared::EagerScanBudgetExceeded;
+pub use shared::{EagerMaterializationBudgetExceeded, EagerScanBudgetExceeded};
 
 #[cfg(test)]
 mod tests {
@@ -43,14 +43,14 @@ mod tests {
         let hir = translate(&ast).unwrap();
         let nfa = compile(&hir).unwrap();
         let mut lazy = LazyDfa::new(nfa);
-        EagerDfa::from_lazy(&mut lazy)
+        EagerDfa::from_lazy(&mut lazy).expect("pattern is small; must not exceed the budget")
     }
 
     fn make_engine(pattern: &str) -> EagerDfaEngine {
         let ast = parse(pattern).unwrap();
         let hir = translate(&ast).unwrap();
         let nfa = compile(&hir).unwrap();
-        EagerDfaEngine::new(nfa)
+        EagerDfaEngine::new(nfa).expect("pattern is small; must not exceed the budget")
     }
 
     #[test]
@@ -151,7 +151,8 @@ mod tests {
         let hir = translate(&ast).unwrap();
         let nfa = compile(&hir).unwrap();
         let mut lazy = LazyDfa::new(nfa);
-        let engine = EagerDfaEngine::from_lazy(&mut lazy);
+        let engine = EagerDfaEngine::from_lazy(&mut lazy)
+            .expect("pattern is small; must not exceed the budget");
         assert_eq!(engine.find(b"test"), Ok(Some((0, 4))));
     }
 }
