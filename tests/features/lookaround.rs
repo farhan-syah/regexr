@@ -580,3 +580,89 @@ fn test_alternation_arms_each_keep_their_lookaround() {
     let re = regex(r"\S+\p{N}?[^\s\p{L}\p{N}]*(?=$a|xa\Z)|[^\s]* +(?!\Z\p{L}^)");
     assert!(!re.is_match("\u{3000}a,\u{B2}\t.\u{E9}\u{4E2D}\u{E9}"));
 }
+
+// =============================================================================
+// Multi-Width Lookbehind
+// =============================================================================
+//
+// `\s` is the full Unicode `White_Space` set, whose members encode to one, two
+// or three UTF-8 bytes, so a lookbehind on it has no single width to look back
+// by — it has a *set* of candidate widths. These pin the observable behaviour
+// for each width, at the start of the haystack where the wider candidates do
+// not fit, and for the negated form.
+
+#[test]
+fn test_lookbehind_on_a_multi_width_class() {
+    let re = regex(r"(?<=\s)x");
+    // One-byte space.
+    assert_eq!(re.find(" x").map(|m| m.start()), Some(1));
+    // Two-byte space: U+00A0 NO-BREAK SPACE.
+    assert_eq!(re.find("\u{A0}x").map(|m| m.start()), Some(2));
+    // Three-byte spaces: U+2003 EM SPACE, U+3000 IDEOGRAPHIC SPACE.
+    assert_eq!(re.find("\u{2003}x").map(|m| m.start()), Some(3));
+    assert_eq!(re.find("\u{3000}x").map(|m| m.start()), Some(3));
+
+    // Non-space of each width behind: no candidate may match, and a candidate
+    // that lands mid-codepoint must be rejected rather than read as a space.
+    assert!(!re.is_match("ax"));
+    assert!(!re.is_match("\u{E9}x"));
+    assert!(!re.is_match("\u{4E2D}x"));
+}
+
+#[test]
+fn test_lookbehind_on_a_multi_width_class_at_haystack_start() {
+    // At position 0 nothing is behind, and at position 1 only the one-byte
+    // candidate fits; the wider ones must be skipped, not underflow the index.
+    let re = regex(r"(?<=\s)x");
+    assert!(!re.is_match("x"));
+    assert_eq!(re.find(" x").map(|m| m.start()), Some(1));
+
+    // Same at the start of a *word* match rather than a single byte.
+    let re = regex(r"(?<=\s)\w+");
+    assert!(!re.is_match("ab"));
+    assert_eq!(re.find(" ab").map(|m| (m.start(), m.end())), Some((1, 3)));
+    assert_eq!(
+        re.find("\u{A0}ab").map(|m| (m.start(), m.end())),
+        Some((2, 4))
+    );
+    assert_eq!(
+        re.find("\u{2003}ab").map(|m| (m.start(), m.end())),
+        Some((3, 5))
+    );
+}
+
+#[test]
+fn test_negative_lookbehind_on_a_multi_width_class() {
+    // The negation must cover *every* candidate width: a two- or three-byte
+    // space behind is only found if the wider candidates are tried, since the
+    // one-byte candidate lands on a continuation byte and rejects on its own.
+    let re = regex(r"(?<!\s)x");
+    assert_eq!(re.find("x").map(|m| m.start()), Some(0));
+    assert_eq!(re.find("ax").map(|m| m.start()), Some(1));
+    assert!(!re.is_match(" x"));
+    assert!(!re.is_match("\u{A0}x"));
+    assert!(!re.is_match("\u{2003}x"));
+    assert!(!re.is_match("\u{3000}x"));
+
+    let re = regex(r"(?<!\s)\w+");
+    assert_eq!(re.find("ab").map(|m| (m.start(), m.end())), Some((0, 2)));
+    assert_eq!(re.find(" ab").map(|m| (m.start(), m.end())), Some((2, 3)));
+    assert_eq!(
+        re.find("\u{A0}ab").map(|m| (m.start(), m.end())),
+        Some((3, 4))
+    );
+}
+
+#[test]
+fn test_lookbehind_widths_of_two_classes_combine() {
+    // Two multi-width classes in one lookbehind: the totals are every sum of
+    // their widths, and a mixed pair must match as readily as a matching pair.
+    let re = regex(r"(?<=\s\s)x");
+    assert_eq!(re.find("  x").map(|m| m.start()), Some(2));
+    assert_eq!(re.find(" \u{A0}x").map(|m| m.start()), Some(3));
+    assert_eq!(re.find("\u{A0} x").map(|m| m.start()), Some(3));
+    assert_eq!(re.find("\u{2003}\u{2003}x").map(|m| m.start()), Some(6));
+    // One space is not two, at any width.
+    assert!(!re.is_match(" x"));
+    assert!(!re.is_match("\u{2003}x"));
+}

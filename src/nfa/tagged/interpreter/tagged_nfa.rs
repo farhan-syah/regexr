@@ -208,14 +208,14 @@ impl TaggedNfa {
                         return None;
                     }
                 }
-                PatternStep::PositiveLookbehind(inner_steps, min_len) => {
-                    if !Self::check_lookbehind(inner_steps, input, pos, *min_len) {
+                PatternStep::PositiveLookbehind(inner_steps, widths) => {
+                    if !Self::check_lookbehind(inner_steps, input, pos, widths) {
                         return None;
                     }
                     // Zero-width: don't advance pos
                 }
-                PatternStep::NegativeLookbehind(inner_steps, min_len) => {
-                    if Self::check_lookbehind(inner_steps, input, pos, *min_len) {
+                PatternStep::NegativeLookbehind(inner_steps, widths) => {
+                    if Self::check_lookbehind(inner_steps, input, pos, widths) {
                         return None;
                     }
                     // Zero-width: don't advance pos
@@ -509,8 +509,30 @@ impl TaggedNfa {
         }
     }
 
-    /// Checks if the lookbehind pattern matches at position `pos` looking backwards.
-    fn check_lookbehind(steps: &[PatternStep], input: &[u8], pos: usize, min_len: usize) -> bool {
+    /// Checks if the lookbehind pattern matches at position `pos` looking
+    /// backwards, trying each candidate total width in turn.
+    ///
+    /// A lookbehind is a zero-width boolean assertion that records no captures,
+    /// so the candidates can be tried in any order and OR-ed: none of them can
+    /// change where the surrounding match starts or ends, and leftmost/longest
+    /// is unaffected. A candidate that would land mid-codepoint makes
+    /// `pos - width` a continuation byte, which `check_lookbehind_at` rejects
+    /// when it decodes there, so a wrong candidate cannot produce a false
+    /// positive — it can only cost one wasted walk.
+    fn check_lookbehind(steps: &[PatternStep], input: &[u8], pos: usize, widths: &[usize]) -> bool {
+        widths
+            .iter()
+            .any(|&width| Self::check_lookbehind_at(steps, input, pos, width))
+    }
+
+    /// Checks if the lookbehind pattern matches at position `pos` looking
+    /// backwards, assuming it consumes exactly `min_len` bytes.
+    fn check_lookbehind_at(
+        steps: &[PatternStep],
+        input: &[u8],
+        pos: usize,
+        min_len: usize,
+    ) -> bool {
         // Cannot match if not enough characters behind
         if pos < min_len {
             return false;
@@ -666,5 +688,95 @@ impl TaggedNfa {
             return Some((cp, 4));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod multi_width_lookbehind_tests {
+    use super::*;
+    use crate::nfa::tagged::steps::StepExtractor;
+
+    /// Extracts the step program for `pattern`, failing the test if the
+    /// extractor declines it.
+    ///
+    /// The assertion is half the point of these tests: a declined extraction is
+    /// invisible from the public API — the engine silently falls back to the
+    /// PikeVm and still answers correctly — so a test that only checked match
+    /// results would keep passing with the step path dead. Asserting extraction
+    /// here pins that `\s`-style multi-width lookbehinds stay on the step
+    /// engine, and every `find` below then really runs `check_lookbehind`.
+    fn steps_for(pattern: &str) -> Vec<PatternStep> {
+        let ast = crate::parser::parse(pattern).unwrap();
+        let hir = crate::hir::translate(&ast).unwrap();
+        let nfa = crate::nfa::compile(&hir).unwrap();
+        StepExtractor::new(&nfa)
+            .extract()
+            .unwrap_or_else(|| panic!("step extraction declined {pattern:?}"))
+    }
+
+    #[test]
+    fn positive_lookbehind_accepts_every_whitespace_width() {
+        // `\s` is the full Unicode White_Space set, whose members encode to 1, 2
+        // or 3 UTF-8 bytes. Each width must be recognised behind the assertion.
+        let steps = steps_for(r"(?<=\s)\w+");
+        // ASCII space: one byte.
+        assert_eq!(TaggedNfa::find(&steps, " ab".as_bytes()), Some((1, 3)));
+        // U+00A0 NO-BREAK SPACE: two bytes.
+        assert_eq!(TaggedNfa::find(&steps, "\u{A0}ab".as_bytes()), Some((2, 4)));
+        // U+2003 EM SPACE and U+3000 IDEOGRAPHIC SPACE: three bytes.
+        assert_eq!(
+            TaggedNfa::find(&steps, "\u{2003}ab".as_bytes()),
+            Some((3, 5))
+        );
+        assert_eq!(
+            TaggedNfa::find(&steps, "\u{3000}ab".as_bytes()),
+            Some((3, 5))
+        );
+        // A non-space of each width in front: no candidate may succeed, and the
+        // wider candidates must not be fooled by landing on a continuation byte.
+        assert_eq!(TaggedNfa::find(&steps, ",ab".as_bytes()), None);
+        assert_eq!(TaggedNfa::find(&steps, "\u{E9}ab".as_bytes()), None);
+        assert_eq!(TaggedNfa::find(&steps, "\u{4E2D}ab".as_bytes()), None);
+    }
+
+    #[test]
+    fn a_candidate_width_wider_than_the_haystack_is_skipped() {
+        // At position 1 only the one-byte candidate fits; the two- and
+        // three-byte ones would run off the front of the haystack.
+        let steps = steps_for(r"(?<=\s)x");
+        assert_eq!(TaggedNfa::find(&steps, " x".as_bytes()), Some((1, 2)));
+        // At position 0 no candidate fits at all.
+        assert_eq!(TaggedNfa::find(&steps, "x".as_bytes()), None);
+        assert_eq!(TaggedNfa::find(&steps, "".as_bytes()), None);
+    }
+
+    #[test]
+    fn negative_lookbehind_negates_the_whole_candidate_set() {
+        let steps = steps_for(r"(?<!\s)\w+");
+        // Nothing behind the first position, so the assertion holds there.
+        assert_eq!(TaggedNfa::find(&steps, "ab".as_bytes()), Some((0, 2)));
+        // A space of any width behind must block that position — the two- and
+        // three-byte cases only fail if the wider candidates are tried, since
+        // the one-byte candidate lands on a continuation byte and rejects.
+        assert_eq!(TaggedNfa::find(&steps, " ab".as_bytes()), Some((2, 3)));
+        assert_eq!(TaggedNfa::find(&steps, "\u{A0}ab".as_bytes()), Some((3, 4)));
+        assert_eq!(
+            TaggedNfa::find(&steps, "\u{2003}ab".as_bytes()),
+            Some((4, 5))
+        );
+    }
+
+    #[test]
+    fn widths_of_two_lookbehind_classes_combine() {
+        // Two `\s` in the lookbehind: the totals are the sumset {2..=6}, and a
+        // walk from the wrong total must not be mistaken for a match.
+        let steps = steps_for(r"(?<=\s\s)x");
+        assert_eq!(TaggedNfa::find(&steps, "  x".as_bytes()), Some((2, 3)));
+        assert_eq!(TaggedNfa::find(&steps, " \u{A0}x".as_bytes()), Some((3, 4)));
+        let two_em = "\u{2003}\u{2003}x";
+        assert_eq!(TaggedNfa::find(&steps, two_em.as_bytes()), Some((6, 7)));
+        // Only one space behind: no total may be satisfied.
+        assert_eq!(TaggedNfa::find(&steps, " x".as_bytes()), None);
+        assert_eq!(TaggedNfa::find(&steps, "\u{2003}x".as_bytes()), None);
     }
 }

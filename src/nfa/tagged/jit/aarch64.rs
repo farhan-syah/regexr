@@ -1112,11 +1112,13 @@ impl TaggedNfaJitCompiler {
                 PatternStep::NegativeLookahead(inner) => {
                     self.emit_standalone_lookahead(inner, byte_mismatch, false)?
                 }
-                PatternStep::PositiveLookbehind(inner, ml) => {
-                    self.emit_lookbehind_check(inner, *ml, byte_mismatch, true)?
+                PatternStep::PositiveLookbehind(inner, widths) => {
+                    let width = super::helpers::sole_lookbehind_width(widths)?;
+                    self.emit_lookbehind_check(inner, width, byte_mismatch, true)?
                 }
-                PatternStep::NegativeLookbehind(inner, ml) => {
-                    self.emit_lookbehind_check(inner, *ml, byte_mismatch, false)?
+                PatternStep::NegativeLookbehind(inner, widths) => {
+                    let width = super::helpers::sole_lookbehind_width(widths)?;
+                    self.emit_lookbehind_check(inner, width, byte_mismatch, false)?
                 }
                 PatternStep::Alt(alts) => {
                     if Self::has_unsupported_in_alt(alts) {
@@ -1816,11 +1818,13 @@ impl TaggedNfaJitCompiler {
             PatternStep::NegativeLookahead(inner) => {
                 self.emit_standalone_lookahead(inner, fail_label, false)?
             }
-            PatternStep::PositiveLookbehind(inner, ml) => {
-                self.emit_lookbehind_check(inner, *ml, fail_label, true)?
+            PatternStep::PositiveLookbehind(inner, widths) => {
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner, width, fail_label, true)?
             }
-            PatternStep::NegativeLookbehind(inner, ml) => {
-                self.emit_lookbehind_check(inner, *ml, fail_label, false)?
+            PatternStep::NegativeLookbehind(inner, widths) => {
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner, width, fail_label, false)?
             }
             PatternStep::StartOfText => {
                 dynasm!(self.asm ; .arch aarch64 ; cbnz x22, =>fail_label);
@@ -1989,20 +1993,30 @@ impl TaggedNfaJitCompiler {
                         // The lookbehind walk starts at a fixed offset behind the
                         // position, so it needs the exact width — a minimum would
                         // mislocate it. See `fixed_byte_len`.
+                        //
+                        // Multi-width lookbehind (a class like `\s` spanning UTF-8
+                        // widths 1, 2 and 3) is deliberately NOT compiled here:
+                        // `emit_lookbehind_check` bakes a single `sub`/`cmp` pair
+                        // into the machine code at assembly-generation time, so
+                        // emitting a candidate *set* means new codegen, deferred to
+                        // its own unit. `fixed_byte_len` answers `None` for more
+                        // than one candidate, which declines extraction and leaves
+                        // such patterns on the interpreter, exactly as before.
                         let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, vec![width]));
                     }
                     NfaInstruction::NegativeLookbehind(inner) => {
                         let inner_steps = self.extract_lookaround_steps(inner);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
+                        // Single-width only, for the reason given above.
                         let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, vec![width]));
                     }
                     NfaInstruction::WordBoundary => steps.push(PatternStep::WordBoundary),
                     NfaInstruction::NotWordBoundary => steps.push(PatternStep::NotWordBoundary),

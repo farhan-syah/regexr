@@ -72,6 +72,15 @@ const PATTERNS: &[&str] = &[
     r"(?<!a|\sa)x",
     r"(?<=\p{N}{1,3})x",
     r"(?<!\p{N}{1,3})x",
+    // Lookbehind over a class spanning several UTF-8 widths. `\s` is always the
+    // full Unicode White_Space set, so its members are 1, 2 and 3 bytes wide —
+    // the assertion has to consider every width that could end at this position.
+    // `inputs()` already seeds U+00A0, U+2003 and U+3000, one per width.
+    r"(?<=\s)\w+",
+    r"(?<!\s)\w+",
+    r"(?<=\s)\S",
+    r"(?<=\s\s)x",
+    r"(?<=\h)x",
     r"(?<=a.*)x",
     r"(?<!a.*)x",
     // Zero-width assertions inside a lookaround, in every position — leading,

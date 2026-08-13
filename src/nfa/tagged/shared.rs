@@ -361,11 +361,20 @@ pub enum PatternStep {
     /// Contains the inner pattern as a sequence of steps.
     NegativeLookahead(Vec<PatternStep>),
     /// Positive lookbehind assertion (?<=...).
-    /// Contains the inner pattern as a sequence of steps and its minimum length.
-    PositiveLookbehind(Vec<PatternStep>, usize),
+    ///
+    /// Contains the inner pattern as a sequence of steps, and every total byte
+    /// width that pattern can consume (ascending, deduplicated). A set rather
+    /// than one width because a class such as `\s` spans several UTF-8 widths:
+    /// the checker walks backwards from each candidate in turn and the walk
+    /// itself rejects the ones that do not land on a codepoint boundary, so
+    /// several candidates are as usable as one. Built once at compile time by
+    /// `byte_len_set`, never per match.
+    PositiveLookbehind(Vec<PatternStep>, Vec<usize>),
     /// Negative lookbehind assertion (?<!...).
-    /// Contains the inner pattern as a sequence of steps and its minimum length.
-    NegativeLookbehind(Vec<PatternStep>, usize),
+    ///
+    /// Carries the same candidate width set as [`PatternStep::PositiveLookbehind`];
+    /// the assertion holds when *no* candidate matches.
+    NegativeLookbehind(Vec<PatternStep>, Vec<usize>),
     /// Backreference to a capture group (\1, \2, etc.).
     /// The u32 is the capture group index (1-based in pattern, stored as-is).
     Backref(u32),

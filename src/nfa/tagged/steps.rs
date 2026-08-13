@@ -95,26 +95,48 @@ impl AssertionTally {
     }
 }
 
-/// The exact number of bytes a step program consumes, or `None` when that is
-/// not the same for every path through it.
+/// How many distinct total widths a lookbehind may carry before extraction
+/// gives up.
 ///
-/// A lookbehind is checked by walking forwards from `pos - len`, so `len` has to
-/// be the *exact* width, not a lower bound: start too early and the walk ends
-/// past `pos`, start too late and it ends short. Using a minimum here would read
-/// as exact and silently mislocate the walk — a variable-width step must refuse
-/// extraction instead, which is what `None` makes the caller do.
+/// Every candidate costs one extra backwards walk per position tried, and a
+/// program whose totals fan out this far is no longer the fixed-width shape the
+/// lookbehind checker is built for. Sixteen covers the real cases by a wide
+/// margin — the widest common one, a `\s`-style class spanning UTF-8 widths 1, 2
+/// and 3, contributes three candidates, and even three such classes in sequence
+/// stay under the cap. Above it [`byte_len_set`] answers `None`, which routes
+/// the pattern to the PikeVm, exactly as any other shape it declines; it never
+/// truncates the set, because a truncated set would silently stop matching
+/// inputs whose width it dropped.
+pub(crate) const MAX_LOOKBEHIND_WIDTHS: usize = 16;
+
+/// Every total byte count a step program can consume, ascending and without
+/// duplicates, or `None` when the program admits a width this model cannot
+/// enumerate (see the refused arms below) or fans out past
+/// [`MAX_LOOKBEHIND_WIDTHS`].
+///
+/// A lookbehind is checked by walking forwards from `pos - total`, so a *total*
+/// has to be exact, not a lower bound: start too early and the walk ends past
+/// `pos`, start too late and it ends short. What does not have to be unique is
+/// which total — the checker tries each candidate and the walk itself rejects
+/// the wrong ones, since it derives every codepoint's real length from the
+/// bytes and demands it land exactly on `pos`. So a class like `\s`, whose
+/// members encode to 1, 2 or 3 bytes, is extractable as the candidate set
+/// `[1, 2, 3]` rather than being refused for having no single width.
+///
+/// The set of totals for a sequence of steps is the sumset of the per-step
+/// width sets. Since UTF-8 widths come from `{1, 2, 3, 4}` the set stays small,
+/// and the cap keeps it that way for pathological input.
 ///
 /// The match is deliberately exhaustive. A new [`PatternStep`] variant then
 /// fails to compile here rather than falling into a default arm that guesses a
 /// width, which is the only way this stays honest as the step model grows.
-pub(crate) fn fixed_byte_len(steps: &[PatternStep]) -> Option<usize> {
-    let mut len = 0usize;
+pub(crate) fn byte_len_set(steps: &[PatternStep]) -> Option<Vec<usize>> {
+    let mut totals = vec![0usize];
     for step in steps {
-        let step_len = match step {
-            PatternStep::Byte(_) | PatternStep::ByteClass(_) => 1,
-            // A codepoint class is fixed-width only when every codepoint it
-            // admits encodes to the same number of UTF-8 bytes.
-            PatternStep::CodepointClass(cpclass, _) => fixed_utf8_width(cpclass)?,
+        let step_widths: Vec<usize> = match step {
+            PatternStep::Byte(_) | PatternStep::ByteClass(_) => vec![1],
+            // A codepoint class contributes every encoded width its members span.
+            PatternStep::CodepointClass(cpclass, _) => utf8_width_set(cpclass)?,
             // Zero-width: assertions and capture markers.
             PatternStep::WordBoundary
             | PatternStep::NotWordBoundary
@@ -127,9 +149,10 @@ pub(crate) fn fixed_byte_len(steps: &[PatternStep]) -> Option<usize> {
             | PatternStep::PositiveLookahead(_)
             | PatternStep::NegativeLookahead(_)
             | PatternStep::PositiveLookbehind(_, _)
-            | PatternStep::NegativeLookbehind(_, _) => 0,
-            // Repetition, alternation and backreferences all admit more than one
-            // width.
+            | PatternStep::NegativeLookbehind(_, _) => vec![0],
+            // Repetition, alternation and backreferences admit unboundedly many
+            // widths (or, for a backreference, a width not known until match
+            // time), so no finite candidate set describes them.
             PatternStep::GreedyPlus(_)
             | PatternStep::GreedyStar(_)
             | PatternStep::GreedyPlusLookahead(_, _, _)
@@ -140,9 +163,42 @@ pub(crate) fn fixed_byte_len(steps: &[PatternStep]) -> Option<usize> {
             | PatternStep::Alt(_)
             | PatternStep::Backref(_) => return None,
         };
-        len += step_len;
+        // Sumset: every running total extended by every width this step admits.
+        let mut next = Vec::with_capacity(totals.len() * step_widths.len());
+        for &total in &totals {
+            for &width in &step_widths {
+                next.push(total + width);
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        if next.len() > MAX_LOOKBEHIND_WIDTHS {
+            return None;
+        }
+        totals = next;
     }
-    Some(len)
+    Some(totals)
+}
+
+/// The exact number of bytes a step program consumes, or `None` when that is
+/// not the same for every path through it.
+///
+/// The single-width answer [`byte_len_set`] gives when it finds exactly one
+/// candidate. Kept as its own entry point because the JIT needs precisely this
+/// question: its lookbehind codegen bakes one offset into the emitted
+/// instructions, so it can only compile a program with one possible total.
+// The JIT is its only caller, so it is genuinely unused in a build without one —
+// scoped rather than a blanket `allow`, so it still reports as dead if the JIT
+// stops calling it too.
+#[cfg_attr(
+    not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
+pub(crate) fn fixed_byte_len(steps: &[PatternStep]) -> Option<usize> {
+    match byte_len_set(steps)?.as_slice() {
+        [width] => Some(*width),
+        _ => None,
+    }
 }
 
 /// The fewest bytes a step program can consume.
@@ -191,28 +247,41 @@ pub(crate) fn min_byte_len(steps: &[PatternStep]) -> usize {
         .sum()
 }
 
-/// The UTF-8 encoded width shared by every codepoint in `cpclass`, or `None` if
-/// they differ.
-fn fixed_utf8_width(cpclass: &crate::hir::CodepointClass) -> Option<usize> {
+/// The set of UTF-8 encoded widths the codepoints in `cpclass` span, ascending,
+/// or `None` when the class has no enumerable width set.
+///
+/// A range that straddles an encoding boundary contributes every width it
+/// touches rather than being refused: the lookbehind checker tries each
+/// candidate total and rejects the ones that do not land on a codepoint
+/// boundary, so several widths are as usable as one.
+fn utf8_width_set(cpclass: &crate::hir::CodepointClass) -> Option<Vec<usize>> {
     // A negated class admits codepoints from across the whole range, so it spans
-    // every encoded width.
+    // every encoded width. Left refused deliberately: the complement of a class
+    // is not modelled here, and answering `[1, 2, 3, 4]` would claim more than
+    // this function knows.
     if cpclass.negated || cpclass.ranges.is_empty() {
         return None;
     }
-    let width = crate::nfa::utf8_automata::utf8_width;
-    let mut common = None;
+    // `UTF8_WIDTH_BOUNDARIES[n]` is the lowest codepoint needing `n + 1` bytes,
+    // so band `n` is `[BOUNDARIES[n], BOUNDARIES[n + 1])` and a class range
+    // touches it when the two overlap.
+    let bounds = crate::nfa::utf8_automata::UTF8_WIDTH_BOUNDARIES;
+    let mut widths = Vec::new();
     for &(start, end) in &cpclass.ranges {
-        // A range spanning an encoding boundary is itself variable-width.
-        if width(start) != width(end) {
-            return None;
-        }
-        match common {
-            None => common = Some(width(start)),
-            Some(w) if w == width(start) => {}
-            Some(_) => return None,
+        for band in 0..4 {
+            if start < bounds[band + 1] && end >= bounds[band] && !widths.contains(&(band + 1)) {
+                widths.push(band + 1);
+            }
         }
     }
-    common
+    // A class whose ranges all fall outside the encodable code space admits no
+    // width at all; refuse rather than report an empty candidate set, which
+    // would read as "matches at width nothing".
+    if widths.is_empty() {
+        return None;
+    }
+    widths.sort_unstable();
+    Some(widths)
 }
 
 /// What an inner lookaround NFA's match state carries, for the linear walks
@@ -612,26 +681,26 @@ impl<'a> StepExtractor<'a> {
                         steps.push(PatternStep::NegativeLookahead(inner_steps));
                     }
                     NfaInstruction::PositiveLookbehind(inner_nfa) => {
-                        // The lookbehind walk needs an exact width, not a
-                        // minimum — see `fixed_byte_len`.
+                        // The lookbehind walk needs exact totals, not a minimum,
+                        // but not a *unique* total — see `byte_len_set`.
                         let inner_steps = self.extract_lookbehind_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let Some(width) = fixed_byte_len(&inner_steps) else {
+                        let Some(widths) = byte_len_set(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, widths));
                     }
                     NfaInstruction::NegativeLookbehind(inner_nfa) => {
                         let inner_steps = self.extract_lookbehind_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
-                        let Some(width) = fixed_byte_len(&inner_steps) else {
+                        let Some(widths) = byte_len_set(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, widths));
                     }
                     NfaInstruction::CodepointClass(cpclass, target) => {
                         // Unicode codepoint class - check for greedy loop pattern
@@ -1191,7 +1260,7 @@ impl<'a> StepExtractor<'a> {
 
     /// Extracts pattern steps from a lookbehind inner NFA.
     /// This is simpler than lookahead extraction - it doesn't recognize GreedyStar/Plus
-    /// because check_lookbehind uses fixed-length matching.
+    /// because check_lookbehind walks from a fixed offset behind the position.
     /// Patterns with repetitions in lookbehind will return empty, causing fallback to PikeVM.
     ///
     /// Not charged against [`MAX_EXTRACTED_STEPS`]: unlike `extract_from_state` /
@@ -1227,9 +1296,10 @@ impl<'a> StepExtractor<'a> {
             }
 
             // A codepoint class consumes input, so it advances the walk rather
-            // than being appended as a zero-width step. `fixed_byte_len` refuses
-            // the whole lookbehind if the class is not fixed-width, so the
-            // interpreter's fixed-offset walk stays valid.
+            // than being appended as a zero-width step. `byte_len_set` enumerates
+            // every total the class can contribute — and refuses the whole
+            // lookbehind if it cannot — so the interpreter has an exact offset to
+            // start each backwards walk from.
             if let Some(NfaInstruction::CodepointClass(cpclass, target)) = &state.instruction {
                 steps.push(PatternStep::CodepointClass(cpclass.clone(), *target));
                 if visited[current as usize] {
@@ -1465,6 +1535,90 @@ mod fixed_byte_len_tests {
             fixed_byte_len(&[PatternStep::Byte(b'a'), PatternStep::Backref(1)]),
             None
         );
+    }
+
+    #[test]
+    fn width_set_of_a_fixed_program_is_a_single_total() {
+        assert_eq!(byte_len_set(&[]), Some(vec![0]));
+        assert_eq!(
+            byte_len_set(&[PatternStep::Byte(b'a'), PatternStep::Byte(b'b')]),
+            Some(vec![2])
+        );
+        assert_eq!(
+            byte_len_set(&[PatternStep::StartOfText, class(&[(0x3B1, 0x3C9)], false)]),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn a_range_straddling_an_encoding_boundary_spans_both_widths() {
+        assert_eq!(
+            byte_len_set(&[class(&[(0x7F, 0x80)], false)]),
+            Some(vec![1, 2])
+        );
+        // The whole encodable space touches every width.
+        assert_eq!(
+            byte_len_set(&[class(&[(0, 0x10FFFF)], false)]),
+            Some(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn separate_ranges_contribute_their_own_widths() {
+        // `\s`-shaped: ASCII space (1), NBSP (2), em space (3). No 4-byte member.
+        assert_eq!(
+            byte_len_set(&[class(
+                &[(0x20, 0x20), (0xA0, 0xA0), (0x2003, 0x2003)],
+                false
+            )]),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn widths_of_successive_steps_form_a_sumset() {
+        let two_spaces = [
+            class(&[(0x20, 0x20), (0xA0, 0xA0)], false),
+            class(&[(0x20, 0x20), (0xA0, 0xA0)], false),
+        ];
+        // {1,2} + {1,2} = {2,3,4}, deduplicated: 1+2 and 2+1 both give 3.
+        assert_eq!(byte_len_set(&two_spaces), Some(vec![2, 3, 4]));
+        // A fixed step shifts every candidate by its own width.
+        let space_then_x = [
+            class(&[(0x20, 0x20), (0xA0, 0xA0)], false),
+            PatternStep::Byte(b'x'),
+        ];
+        assert_eq!(byte_len_set(&space_then_x), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn width_sets_that_fan_out_past_the_cap_are_declined() {
+        // Each class admits 1..=4 bytes, so `n` of them total `n..=4n`: five
+        // give exactly 16 candidates (the cap) and six give 19 (over it).
+        let all_widths = class(&[(0, 0x10FFFF)], false);
+        let five = vec![all_widths.clone(); 5];
+        let six = vec![all_widths; 6];
+        assert_eq!(MAX_LOOKBEHIND_WIDTHS, 16);
+        assert_eq!(byte_len_set(&five).map(|w| w.len()), Some(16));
+        assert_eq!(byte_len_set(&six), None);
+    }
+
+    #[test]
+    fn variable_width_steps_have_no_width_set() {
+        let bytes = ByteClass::new(vec![ByteRange::new(b'a', b'z')]);
+        assert_eq!(byte_len_set(&[PatternStep::GreedyPlus(bytes)]), None);
+        assert_eq!(byte_len_set(&[PatternStep::Backref(1)]), None);
+        // A negated class stays out of scope, as in `fixed_byte_len`.
+        assert_eq!(byte_len_set(&[class(&[(0x3B1, 0x3C9)], true)]), None);
+        assert_eq!(byte_len_set(&[class(&[], false)]), None);
+    }
+
+    #[test]
+    fn fixed_byte_len_is_the_single_candidate_case() {
+        // Multi-width programs are extractable as a set but have no fixed width.
+        let mixed = [class(&[(0x20, 0x20), (0xA0, 0xA0)], false)];
+        assert_eq!(byte_len_set(&mixed), Some(vec![1, 2]));
+        assert_eq!(fixed_byte_len(&mixed), None);
     }
 }
 

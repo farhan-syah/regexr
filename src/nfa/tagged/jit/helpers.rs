@@ -4,8 +4,28 @@
 //! - `JitContext` - Runtime context passed to JIT-compiled code
 //! - Helper functions callable from JIT code (lookaround evaluation, etc.)
 
+use crate::error::{Error, ErrorKind, Result};
 use crate::hir::CodepointClass;
 use crate::nfa::Nfa;
+
+/// The one candidate width a JIT-compiled lookbehind may carry.
+///
+/// `emit_lookbehind_check` (shared shape on both x86-64 and aarch64) bakes a
+/// single offset into the emitted instructions, so it can only express one
+/// total width. Multi-width lookbehind codegen is deliberately deferred to
+/// its own unit; the step extractor declines any lookbehind with more than
+/// one candidate, so this is the guard that keeps that decision from being
+/// quietly bypassed by a step program built elsewhere — never a case that
+/// arises today.
+pub(crate) fn sole_lookbehind_width(widths: &[usize]) -> Result<usize> {
+    match widths {
+        [width] => Ok(*width),
+        _ => Err(Error::new(
+            ErrorKind::Jit("multi-width lookbehind is not JIT-compiled".to_string()),
+            "",
+        )),
+    }
+}
 
 /// Runtime context for JIT-compiled Tagged NFA execution.
 ///

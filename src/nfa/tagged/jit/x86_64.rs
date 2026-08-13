@@ -758,13 +758,15 @@ impl TaggedNfaJitCompiler {
                     // Zero-width: don't advance r14
                     self.emit_standalone_lookahead(inner_steps, byte_mismatch, false)?;
                 }
-                PatternStep::PositiveLookbehind(ref inner_steps, min_len) => {
+                PatternStep::PositiveLookbehind(ref inner_steps, ref widths) => {
                     // Positive lookbehind: check if inner pattern matches behind current position
-                    self.emit_lookbehind_check(inner_steps, *min_len, byte_mismatch, true)?;
+                    let width = super::helpers::sole_lookbehind_width(widths)?;
+                    self.emit_lookbehind_check(inner_steps, width, byte_mismatch, true)?;
                 }
-                PatternStep::NegativeLookbehind(ref inner_steps, min_len) => {
+                PatternStep::NegativeLookbehind(ref inner_steps, ref widths) => {
                     // Negative lookbehind: check if inner pattern does NOT match behind
-                    self.emit_lookbehind_check(inner_steps, *min_len, byte_mismatch, false)?;
+                    let width = super::helpers::sole_lookbehind_width(widths)?;
+                    self.emit_lookbehind_check(inner_steps, width, byte_mismatch, false)?;
                 }
                 PatternStep::Backref(_) => {
                     // Backrefs in find_fn are handled by early return above (has_backrefs check)
@@ -3126,11 +3128,13 @@ impl TaggedNfaJitCompiler {
             PatternStep::NegativeLookahead(inner_steps) => {
                 self.emit_standalone_lookahead(inner_steps, fail_label, false)?;
             }
-            PatternStep::PositiveLookbehind(inner_steps, min_len) => {
-                self.emit_lookbehind_check(inner_steps, *min_len, fail_label, true)?;
+            PatternStep::PositiveLookbehind(inner_steps, widths) => {
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner_steps, width, fail_label, true)?;
             }
-            PatternStep::NegativeLookbehind(inner_steps, min_len) => {
-                self.emit_lookbehind_check(inner_steps, *min_len, fail_label, false)?;
+            PatternStep::NegativeLookbehind(inner_steps, widths) => {
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner_steps, width, fail_label, false)?;
             }
             PatternStep::Alt(alternatives) => {
                 // Simple alternation - try each and jump to success if one matches
@@ -5000,13 +5004,15 @@ impl TaggedNfaJitCompiler {
                 // Zero-width assertion - doesn't consume input, doesn't affect captures
                 self.emit_standalone_lookahead(inner_steps, fail_label, false)?;
             }
-            PatternStep::PositiveLookbehind(inner_steps, min_len) => {
+            PatternStep::PositiveLookbehind(inner_steps, widths) => {
                 // Zero-width assertion - doesn't consume input, doesn't affect captures
-                self.emit_lookbehind_check(inner_steps, *min_len, fail_label, true)?;
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner_steps, width, fail_label, true)?;
             }
-            PatternStep::NegativeLookbehind(inner_steps, min_len) => {
+            PatternStep::NegativeLookbehind(inner_steps, widths) => {
                 // Zero-width assertion - doesn't consume input, doesn't affect captures
-                self.emit_lookbehind_check(inner_steps, *min_len, fail_label, false)?;
+                let width = super::helpers::sole_lookbehind_width(widths)?;
+                self.emit_lookbehind_check(inner_steps, width, fail_label, false)?;
             }
             PatternStep::GreedyPlusLookahead(byte_class, lookahead_steps, is_positive) => {
                 // Greedy+ with lookahead in captures path
@@ -5448,20 +5454,30 @@ impl TaggedNfaJitCompiler {
                         // The lookbehind walk starts at a fixed offset behind the
                         // position, so it needs the exact width — a minimum would
                         // mislocate it. See `fixed_byte_len`.
+                        //
+                        // Multi-width lookbehind (a class like `\s` spanning UTF-8
+                        // widths 1, 2 and 3) is deliberately NOT compiled here:
+                        // `emit_lookbehind_check` bakes a single `sub`/`cmp` pair
+                        // into the machine code at assembly-generation time, so
+                        // emitting a candidate *set* means new codegen, deferred to
+                        // its own unit. `fixed_byte_len` answers `None` for more
+                        // than one candidate, which declines extraction and leaves
+                        // such patterns on the interpreter, exactly as before.
                         let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::PositiveLookbehind(inner_steps, width));
+                        steps.push(PatternStep::PositiveLookbehind(inner_steps, vec![width]));
                     }
                     NfaInstruction::NegativeLookbehind(inner_nfa) => {
                         let inner_steps = self.extract_lookaround_steps(inner_nfa);
                         if inner_steps.is_empty() {
                             return Vec::new();
                         }
+                        // Single-width only, for the reason given above.
                         let Some(width) = crate::nfa::tagged::fixed_byte_len(&inner_steps) else {
                             return Vec::new();
                         };
-                        steps.push(PatternStep::NegativeLookbehind(inner_steps, width));
+                        steps.push(PatternStep::NegativeLookbehind(inner_steps, vec![width]));
                     }
                     // Word boundaries - can be JIT'd
                     NfaInstruction::WordBoundary => {
