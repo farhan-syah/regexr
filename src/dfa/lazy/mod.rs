@@ -34,6 +34,7 @@ pub(crate) mod shared;
 // Re-exports
 pub use engine::LazyDfaEngine;
 pub use interpreter::LazyDfa;
+pub(crate) use shared::SCAN_BUDGET_FACTOR;
 pub use shared::{CacheCeilingExceeded, CharClass, DfaStateId, PositionContext};
 
 #[cfg(test)]

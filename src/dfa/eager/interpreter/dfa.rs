@@ -18,9 +18,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use super::super::super::lazy::{CharClass, LazyDfa};
+use super::super::super::lazy::{CharClass, LazyDfa, SCAN_BUDGET_FACTOR};
 use super::super::shared::{
-    is_word_byte, StateMetadata, DEAD_STATE, STATE_MASK, TAG_DEAD, TAG_MATCH,
+    is_word_byte, EagerScanBudgetExceeded, StateMetadata, DEAD_STATE, STATE_MASK, TAG_DEAD,
+    TAG_MATCH,
 };
 
 /// A pre-materialized DFA with flat transition table.
@@ -250,7 +251,10 @@ impl EagerDfa {
     }
 
     /// Finds the first match in the input, returning (start, end).
-    pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+    ///
+    /// `Err` means the unanchored search gave up on its scan budget; see
+    /// [`EagerDfa::find_from`].
+    pub fn find(&self, input: &[u8]) -> Result<Option<(usize, usize)>, EagerScanBudgetExceeded> {
         self.find_from(input, 0)
     }
 
@@ -259,9 +263,29 @@ impl EagerDfa {
     /// Attempts see the whole input (see [`EagerDfa::find_at`]), so the start
     /// state is picked from the real preceding byte rather than from a slice
     /// boundary.
-    pub fn find_from(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+    ///
+    /// The no-anchor loop below tries every start position, which is right
+    /// while a failed attempt gives up near where it began, and quadratic
+    /// when it does not (a full scan per start). Word-boundary patterns are
+    /// therefore metered: once the attempts have collectively walked several
+    /// times the input, `Err` hands the search to a caller that can fall back
+    /// to `LazyDfa`'s single unanchored pass. That pass is only linear for
+    /// *this* shape — its live NFA subset stays small for word-boundary
+    /// patterns (measured: 27,000 randomized `\b`/`\B` checks against the
+    /// reference matcher, zero divergences, and linear scaling) but grows one
+    /// state per byte for an unrolled non-looping pattern like `a{50000}`,
+    /// which made the unanchored pass itself quadratic when it was tried as a
+    /// universal fallback. So only the `has_word_boundary` path is metered;
+    /// every other no-anchor pattern keeps today's unmetered loop, unchanged,
+    /// which is what keeps `pattern_limits::the_expansion_limit_can_be_raised`
+    /// at its baseline.
+    pub fn find_from(
+        &self,
+        input: &[u8],
+        from: usize,
+    ) -> Result<Option<(usize, usize)>, EagerScanBudgetExceeded> {
         if from > input.len() {
-            return None;
+            return Ok(None);
         }
 
         if self.has_start_anchor {
@@ -269,7 +293,7 @@ impl EagerDfa {
                 // Multiline: try position 0 and after each newline
                 if from == 0 {
                     if let Some(end) = self.find_at(input, 0) {
-                        return Some((0, end));
+                        return Ok(Some((0, end)));
                     }
                 }
                 // Line starts at or after `from`: the newline itself may sit just
@@ -277,25 +301,58 @@ impl EagerDfa {
                 for (i, &byte) in input.iter().enumerate().skip(from.saturating_sub(1)) {
                     if byte == b'\n' {
                         if let Some(end) = self.find_at(input, i + 1) {
-                            return Some((i + 1, end));
+                            return Ok(Some((i + 1, end)));
                         }
                     }
                 }
-                None
+                Ok(None)
             } else if from == 0 {
                 // Non-multiline: only try position 0
-                self.find_at(input, 0).map(|end| (0, end))
+                Ok(self.find_at(input, 0).map(|end| (0, end)))
             } else {
-                None
+                Ok(None)
             }
-        } else {
-            // No start anchor: try starting at each position
+        } else if self.has_word_boundary {
+            // Metered: see the doc comment above.
+            let budget = input.len().saturating_mul(SCAN_BUDGET_FACTOR);
+            let mut walked = 0usize;
+
             for start_pos in from..=input.len() {
-                if let Some(end) = self.find_at(input, start_pos) {
-                    return Some((start_pos, end));
+                let (result, reach) = self.find_at_with_reach(input, start_pos);
+                if let Some(end) = result {
+                    return Ok(Some((start_pos, end)));
+                }
+                walked += reach.saturating_sub(start_pos);
+                if walked > budget {
+                    return Err(EagerScanBudgetExceeded);
                 }
             }
-            None
+            Ok(None)
+        } else {
+            // No start anchor, no word boundary: unmetered, identical to the
+            // loop before metering existed — see the doc comment above.
+            for start_pos in from..=input.len() {
+                if let Some(end) = self.find_at(input, start_pos) {
+                    return Ok(Some((start_pos, end)));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    /// Picks the start state for an attempt beginning at `start`, from the
+    /// character class of the preceding byte.
+    #[inline]
+    fn start_state_at(&self, input: &[u8], start: usize) -> u32 {
+        if self.has_word_boundary && start > 0 {
+            let prev_byte = input[start - 1];
+            if is_word_byte(prev_byte) {
+                self.start_word.unwrap_or(self.start)
+            } else {
+                self.start
+            }
+        } else {
+            self.start
         }
     }
 
@@ -311,17 +368,7 @@ impl EagerDfa {
             return None;
         }
 
-        // Get appropriate start state
-        let state = if self.has_word_boundary && start > 0 {
-            let prev_byte = input[start - 1];
-            if is_word_byte(prev_byte) {
-                self.start_word.unwrap_or(self.start)
-            } else {
-                self.start
-            }
-        } else {
-            self.start
-        };
+        let state = self.start_state_at(input, start);
 
         // Use fast path for simple patterns (no word boundary, simple anchors)
         if !self.has_word_boundary && !self.has_multiline_anchors {
@@ -329,6 +376,21 @@ impl EagerDfa {
         }
 
         self.find_at_slow(input, start, state)
+    }
+
+    /// [`EagerDfa::find_at`] that also reports how far the scan reached
+    /// before giving up, for the metered start-position loop in
+    /// [`EagerDfa::find_from`].
+    ///
+    /// Only reached on the `has_word_boundary` path, where `find_at` always
+    /// dispatches to [`EagerDfa::find_at_slow`] — so this mirrors that
+    /// dispatch directly rather than going through `find_at`'s anchor
+    /// short-circuit, which never applies here (the metered loop only runs
+    /// when there is no start anchor).
+    #[inline]
+    fn find_at_with_reach(&self, input: &[u8], start: usize) -> (Option<usize>, usize) {
+        let state = self.start_state_at(input, start);
+        self.find_at_slow_with_reach(input, start, state)
     }
 
     /// Fast matching loop for patterns without complex assertions.
@@ -373,7 +435,23 @@ impl EagerDfa {
     }
 
     /// Slow matching loop for patterns with word boundaries or multiline anchors.
-    fn find_at_slow(&self, input: &[u8], start: usize, mut state: u32) -> Option<usize> {
+    fn find_at_slow(&self, input: &[u8], start: usize, state: u32) -> Option<usize> {
+        self.find_at_slow_with_reach(input, start, state).0
+    }
+
+    /// [`EagerDfa::find_at_slow`] that also reports the byte offset the scan
+    /// reached before stopping — the position of the dead transition it broke
+    /// on, or `input.len()` if it ran to the end.
+    ///
+    /// Reported once per call, at the exit point, not per byte: the metered
+    /// loop in `find_from` only needs to know how far *this* attempt got, not
+    /// a running per-byte count, so nothing is added to the loop body below.
+    fn find_at_slow_with_reach(
+        &self,
+        input: &[u8],
+        start: usize,
+        mut state: u32,
+    ) -> (Option<usize>, usize) {
         let mut last_match = if state & TAG_MATCH != 0 {
             if self.check_end_assertions(input, start, (state & STATE_MASK) as usize) {
                 Some(start)
@@ -389,7 +467,7 @@ impl EagerDfa {
             let next = self.transitions[state_idx * 256 + byte as usize];
 
             if next & TAG_DEAD != 0 {
-                break;
+                return (last_match, start + i);
             }
 
             state = next;
@@ -403,7 +481,7 @@ impl EagerDfa {
             }
         }
 
-        last_match
+        (last_match, input.len())
     }
 
     /// Checks end assertions (word boundary and anchors) for a match at the given position.

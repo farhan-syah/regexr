@@ -31,14 +31,8 @@ use super::super::shared::{
     epsilon_closure_with_context, flush_cache, get_or_create_state_with_class, is_dead_state,
     is_tagged_match, is_unknown_state, match_reachable_without_end_assertion, state_index,
     tag_state, untag_state, CacheCeilingExceeded, CharClass, DfaStateId, LazyDfaContext,
-    PositionContext, DEAD_STATE, UNKNOWN_STATE,
+    PositionContext, DEAD_STATE, SCAN_BUDGET_FACTOR, UNKNOWN_STATE,
 };
-
-/// How much input the per-start attempts in [`LazyDfa::find_from`] may walk in
-/// total before the single-pass search takes over. A few passes' worth: high
-/// enough that attempts which fail near their start never reach it, low enough
-/// that ones which scan to the end trip it within a handful of tries.
-const SCAN_BUDGET_FACTOR: usize = 4;
 
 /// A lazy DFA that builds states on demand.
 #[derive(Debug, Clone)]
@@ -336,6 +330,10 @@ impl LazyDfa {
     ///
     /// `Err` means the cache hit its ceiling inside `f`: states are missing, so
     /// whatever `f` computed is incomplete rather than merely negative.
+    ///
+    /// Only the JIT materializes a DFA this way, so without that feature nothing
+    /// calls this.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     pub(crate) fn with_flushes_suppressed<T>(
         &mut self,
         f: impl FnOnce(&mut LazyDfa) -> T,
@@ -1282,7 +1280,7 @@ mod tests {
             let eager = EagerDfa::from_lazy(&mut lazy);
             assert_eq!(
                 eager.find_from(input.as_bytes(), 0),
-                expected,
+                Ok(expected),
                 "EagerDfa {pattern:?} on {input:?}"
             );
         }

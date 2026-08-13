@@ -28,6 +28,19 @@ pub struct StateMetadata {
     pub match_without_end_assertion: bool,
 }
 
+/// An eager-DFA search stopped because the unanchored start-position loop in
+/// `EagerDfa::find_from` walked past its scan budget.
+///
+/// Distinct from "no match": trying every remaining start position at up to
+/// O(n) cost each would make the search quadratic on patterns whose failed
+/// attempts each scan to the end (the shape a word-boundary pattern over a
+/// long non-matching run has), so the loop gives up rather than paying for
+/// it. Callers re-run the search on a fresh `LazyDfa`, whose single
+/// unanchored pass stays linear for word-boundary patterns — see the
+/// [`EagerDfa::find_from`](super::interpreter::EagerDfa::find_from) doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EagerScanBudgetExceeded;
+
 /// Check if a byte is a word character.
 #[inline(always)]
 pub fn is_word_byte(b: u8) -> bool {

@@ -3,9 +3,9 @@
 //! The executor uses a prefilter (when available) to quickly skip to candidate
 //! positions before engaging the full regex engine.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use crate::dfa::{CacheCeilingExceeded, EagerDfa, LazyDfa};
+use crate::dfa::{CacheCeilingExceeded, EagerDfa, EagerScanBudgetExceeded, LazyDfa};
 use crate::error::Result;
 use crate::hir::Hir;
 use crate::literal::{extract_literals, Prefilter};
@@ -42,6 +42,18 @@ fn lazy_dfa_or_pikevm<T>(
         Ok(result) => result,
         Err(_) => fallback(&PikeVm::from_arc(dfa.nfa_arc())),
     }
+}
+
+/// Builds the `LazyDfa` used to re-run a search after `EagerDfa::find_from`
+/// gives up on its scan budget (see [`EagerScanBudgetExceeded`]).
+///
+/// Cache limit is unbounded here because this fallback is only reached once
+/// per query, on the already-rare metered path, so there is no repeated-flush
+/// cost to bound against.
+fn eager_scan_fallback(nfa: &Arc<Nfa>) -> LazyDfa {
+    let mut fallback = LazyDfa::new((**nfa).clone());
+    fallback.set_cache_limit(usize::MAX);
+    fallback
 }
 
 /// A compiled regex ready for execution.
@@ -89,7 +101,11 @@ enum CompiledInner {
     LazyDfa(RwLock<LazyDfa>),
     /// Pre-materialized DFA for fast matching without JIT.
     /// Used for patterns that benefit from eager state computation.
-    EagerDfa(EagerDfa),
+    ///
+    /// The `Arc<Nfa>` is kept alongside so the unanchored search can hand off
+    /// to a fresh `LazyDfa` on [`EagerScanBudgetExceeded`] without rebuilding
+    /// the NFA — see [`lazy_dfa_or_pikevm`].
+    EagerDfa(EagerDfa, Arc<Nfa>),
     /// Fast codepoint-level matching for single character class patterns.
     CodepointClass(CodepointClassMatcher),
     /// Backtracking VM engine for patterns with backreferences.
@@ -183,7 +199,7 @@ impl CompiledRegex {
             CompiledInner::ShiftOr(_) => "ShiftOr",
             CompiledInner::ShiftOrWide(_) => "ShiftOrWide",
             CompiledInner::LazyDfa(_) => "LazyDfa",
-            CompiledInner::EagerDfa(_) => "EagerDfa",
+            CompiledInner::EagerDfa(_, _) => "EagerDfa",
             CompiledInner::CodepointClass(_) => "CodepointClass",
             CompiledInner::BacktrackingVm(_) => "BacktrackingVm",
             CompiledInner::TaggedNfaInterp(_) => "TaggedNfa",
@@ -254,7 +270,17 @@ impl CompiledRegex {
                     |vm| vm.is_match(input),
                 )
             }
-            CompiledInner::EagerDfa(dfa) => dfa.find(input).is_some(),
+            CompiledInner::EagerDfa(dfa, nfa) => match dfa.find(input) {
+                Ok(found) => found.is_some(),
+                Err(EagerScanBudgetExceeded) => {
+                    let mut fallback = eager_scan_fallback(nfa);
+                    lazy_dfa_or_pikevm(
+                        &mut fallback,
+                        |d| d.find(input).map(|found| found.is_some()),
+                        |vm| vm.is_match(input),
+                    )
+                }
+            },
             CompiledInner::CodepointClass(matcher) => matcher.is_match(input),
             CompiledInner::BacktrackingVm(vm) => vm.find(input).is_some(),
             CompiledInner::TaggedNfaInterp(engine) => engine.is_match(input),
@@ -459,7 +485,17 @@ impl CompiledRegex {
                     |vm| vm.find_from(input, from),
                 )
             }
-            CompiledInner::EagerDfa(dfa) => dfa.find_from(input, from),
+            CompiledInner::EagerDfa(dfa, nfa) => match dfa.find_from(input, from) {
+                Ok(result) => result,
+                Err(EagerScanBudgetExceeded) => {
+                    let mut fallback = eager_scan_fallback(nfa);
+                    lazy_dfa_or_pikevm(
+                        &mut fallback,
+                        |d| d.find_from(input, from),
+                        |vm| vm.find_from(input, from),
+                    )
+                }
+            },
             CompiledInner::CodepointClass(matcher) => matcher.find_from(input, from),
             CompiledInner::BacktrackingVm(vm) => vm.find_at(input, from),
             CompiledInner::TaggedNfaInterp(engine) => engine.find_at(input, from),
@@ -528,7 +564,7 @@ impl CompiledRegex {
             CompiledInner::ShiftOr(_)
             | CompiledInner::ShiftOrWide(_)
             | CompiledInner::LazyDfa(_)
-            | CompiledInner::EagerDfa(_) => {
+            | CompiledInner::EagerDfa(_, _) => {
                 // Fast path: if we have BacktrackingVm, use it for single-pass capture extraction
                 if let Some(ref backtracking_vm) = self.backtracking_vm {
                     return backtracking_vm.captures_from(input, from);
@@ -748,7 +784,7 @@ impl CompiledRegex {
                     |vm| vm.find_at(input, pos),
                 )
             }
-            CompiledInner::EagerDfa(dfa) => dfa.find_at(input, pos).map(|end| (pos, end)),
+            CompiledInner::EagerDfa(dfa, _) => dfa.find_at(input, pos).map(|end| (pos, end)),
             CompiledInner::CodepointClass(matcher) => {
                 // CodepointClass doesn't support word boundaries, use sliced input
                 let slice = &input[pos..];
@@ -984,8 +1020,11 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                 // Use EagerDfa for better non-JIT performance on simple patterns.
                 // EagerDfa pre-computes all states upfront, eliminating hash lookups.
                 let mut lazy = LazyDfa::new(nfa);
+                // Already held by `lazy`; cloning the Arc (not the Nfa) so the
+                // scan-budget give-up can rebuild a `LazyDfa` without recompiling.
+                let nfa_arc = lazy.nfa_arc();
                 let eager = EagerDfa::from_lazy(&mut lazy);
-                (CompiledInner::EagerDfa(eager), capture_nfa)
+                (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa)
             }
         }
         #[cfg(feature = "jit")]
@@ -1002,8 +1041,11 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
                 )
             } else {
                 let mut lazy = LazyDfa::new(nfa);
+                // Already held by `lazy`; cloning the Arc (not the Nfa) so the
+                // scan-budget give-up can rebuild a `LazyDfa` without recompiling.
+                let nfa_arc = lazy.nfa_arc();
                 let eager = EagerDfa::from_lazy(&mut lazy);
-                (CompiledInner::EagerDfa(eager), capture_nfa)
+                (CompiledInner::EagerDfa(eager, nfa_arc), capture_nfa)
             }
         }
     };

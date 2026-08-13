@@ -10,7 +10,7 @@
 pub mod eager;
 pub mod lazy;
 
-pub use eager::{EagerDfa, EagerDfaEngine};
+pub use eager::{EagerDfa, EagerDfaEngine, EagerScanBudgetExceeded};
 pub use lazy::{
     CacheCeilingExceeded, CharClass, DfaStateId, LazyDfa, LazyDfaEngine, PositionContext,
 };

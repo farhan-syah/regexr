@@ -6,6 +6,7 @@ use crate::nfa::Nfa;
 
 use super::super::lazy::LazyDfa;
 use super::interpreter::EagerDfa;
+use super::shared::EagerScanBudgetExceeded;
 
 /// Eager DFA engine that wraps the interpreter.
 ///
@@ -42,8 +43,11 @@ impl EagerDfaEngine {
     }
 
     /// Finds the first match, returning (start, end).
+    ///
+    /// `Err` means the unanchored search gave up on its scan budget; see
+    /// [`EagerDfa::find_from`].
     #[inline]
-    pub fn find(&self, input: &[u8]) -> Option<(usize, usize)> {
+    pub fn find(&self, input: &[u8]) -> Result<Option<(usize, usize)>, EagerScanBudgetExceeded> {
         self.dfa.find(input)
     }
 

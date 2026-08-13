@@ -473,6 +473,47 @@ fn long_run_iteration_stays_linear() {
 }
 
 // =============================================================================
+// EagerDfa's unanchored start-position loop does not go quadratic on
+// word-boundary patterns
+// =============================================================================
+// `EagerDfa::find_from` (the non-JIT engine LazyDfa promotes simple patterns
+// to) tries every start position with no single pass covering all of them at
+// once, unlike LazyDfa. A word-boundary pattern whose failed attempts each
+// scan to the end of the input turns that into one full scan per start —
+// quadratic. `\b[a-y ]+\d` over a run of "bb " is exactly that shape: no
+// digit ever appears, so every attempt consumes the rest of the run before
+// dying.
+//
+// This pattern has no anchors and no large Unicode class, so engine selection
+// (`EngineType::LazyDfa` branch in `compile_hir`) sends the interpreted build
+// to `EagerDfa`, not `LazyDfa` — only the "interp" build is exercised here,
+// unlike `LONG_RUN_NON_MATCHING` above (the JIT build takes a different
+// engine for this shape).
+//
+// The length is picked so the pre-fix quadratic cost — measured at roughly
+// 60/248/944 ms for 10/20/40 KB inputs of this same shape — lands far past
+// [`SCALING_DEADLINE`], while the fixed, metered cost stays linear and well
+// within it.
+const WORD_BOUNDARY_LONG_RUN_REPEATS: usize = 200_000;
+
+#[test]
+fn word_boundary_long_run_rejection_stays_linear() {
+    bounded_within(
+        "word_boundary_long_run_rejection_stays_linear",
+        SCALING_DEADLINE,
+        || {
+            let text = "bb ".repeat(WORD_BOUNDARY_LONG_RUN_REPEATS);
+            let re = RegexBuilder::new(r"\b[a-y ]+\d")
+                .jit(false)
+                .build()
+                .expect("pattern should compile");
+            assert!(!re.is_match(&text));
+            assert_eq!(re.find(&text).map(|m| (m.start(), m.end())), None);
+        },
+    );
+}
+
+// =============================================================================
 // Parsing does not overflow the stack on deeply nested patterns
 // =============================================================================
 // The parser is mutually recursive with no explicit stack, so a pattern that

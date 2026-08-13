@@ -55,6 +55,15 @@ pub const DEFAULT_CACHE_LIMIT: usize = 10_000;
 /// enough that a pathological one cannot exhaust memory.
 pub const CACHE_GROWTH_CEILING_FACTOR: usize = 4;
 
+/// How much input the per-start attempts in an unanchored search may walk in
+/// total before a single-pass fallback takes over. A few passes' worth: high
+/// enough that attempts which fail near their start never reach it, low enough
+/// that ones which scan to the end trip it within a handful of tries.
+///
+/// Shared by [`LazyDfa::find_from`](super::interpreter::LazyDfa::find_from)
+/// and `EagerDfa::find_from`'s word-boundary metering, which mirrors it.
+pub(crate) const SCAN_BUDGET_FACTOR: usize = 4;
+
 /// A lazy-DFA search stopped because the state cache could not grow further.
 ///
 /// Distinct from "no match": the transition table is incomplete, so the answer

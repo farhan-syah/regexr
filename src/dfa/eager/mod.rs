@@ -28,6 +28,7 @@ pub(crate) mod shared;
 // Re-exports
 pub use engine::EagerDfaEngine;
 pub use interpreter::EagerDfa;
+pub use shared::EagerScanBudgetExceeded;
 
 #[cfg(test)]
 mod tests {
@@ -55,86 +56,86 @@ mod tests {
     #[test]
     fn test_simple_literal() {
         let dfa = make_eager_dfa("abc");
-        assert_eq!(dfa.find(b"xyzabc123"), Some((3, 6)));
-        assert_eq!(dfa.find(b"abc"), Some((0, 3)));
-        assert_eq!(dfa.find(b"xyz"), None);
+        assert_eq!(dfa.find(b"xyzabc123"), Ok(Some((3, 6))));
+        assert_eq!(dfa.find(b"abc"), Ok(Some((0, 3))));
+        assert_eq!(dfa.find(b"xyz"), Ok(None));
     }
 
     #[test]
     fn test_alternation() {
         let dfa = make_eager_dfa("a|b");
-        assert_eq!(dfa.find(b"xa"), Some((1, 2)));
-        assert_eq!(dfa.find(b"xb"), Some((1, 2)));
-        assert_eq!(dfa.find(b"c"), None);
+        assert_eq!(dfa.find(b"xa"), Ok(Some((1, 2))));
+        assert_eq!(dfa.find(b"xb"), Ok(Some((1, 2))));
+        assert_eq!(dfa.find(b"c"), Ok(None));
     }
 
     #[test]
     fn test_repetition() {
         let dfa = make_eager_dfa("a+");
-        assert_eq!(dfa.find(b"aaa"), Some((0, 3)));
-        assert_eq!(dfa.find(b"baab"), Some((1, 3)));
-        assert_eq!(dfa.find(b"bbb"), None);
+        assert_eq!(dfa.find(b"aaa"), Ok(Some((0, 3))));
+        assert_eq!(dfa.find(b"baab"), Ok(Some((1, 3))));
+        assert_eq!(dfa.find(b"bbb"), Ok(None));
     }
 
     #[test]
     fn test_anchored_pattern() {
         let dfa = make_eager_dfa("^abc$");
-        assert_eq!(dfa.find(b"abc"), Some((0, 3)));
-        assert_eq!(dfa.find(b"abcd"), None);
-        assert_eq!(dfa.find(b"xabc"), None);
+        assert_eq!(dfa.find(b"abc"), Ok(Some((0, 3))));
+        assert_eq!(dfa.find(b"abcd"), Ok(None));
+        assert_eq!(dfa.find(b"xabc"), Ok(None));
     }
 
     #[test]
     fn test_start_anchor() {
         let dfa = make_eager_dfa("^hello");
         assert!(dfa.has_start_anchor());
-        assert_eq!(dfa.find(b"hello world"), Some((0, 5)));
-        assert_eq!(dfa.find(b"say hello"), None);
+        assert_eq!(dfa.find(b"hello world"), Ok(Some((0, 5))));
+        assert_eq!(dfa.find(b"say hello"), Ok(None));
     }
 
     #[test]
     fn test_end_anchor() {
         let dfa = make_eager_dfa("world$");
         assert!(dfa.has_end_anchor());
-        assert_eq!(dfa.find(b"hello world"), Some((6, 11)));
-        assert_eq!(dfa.find(b"world hello"), None);
+        assert_eq!(dfa.find(b"hello world"), Ok(Some((6, 11))));
+        assert_eq!(dfa.find(b"world hello"), Ok(None));
     }
 
     #[test]
     fn test_word_boundary() {
         let dfa = make_eager_dfa(r"\bword\b");
         assert!(dfa.has_word_boundary());
-        assert_eq!(dfa.find(b"a word here"), Some((2, 6)));
-        assert_eq!(dfa.find(b"keyword"), None);
+        assert_eq!(dfa.find(b"a word here"), Ok(Some((2, 6))));
+        assert_eq!(dfa.find(b"keyword"), Ok(None));
     }
 
     #[test]
     fn test_multiline_start() {
         let dfa = make_eager_dfa("(?m)^hello");
         assert!(dfa.has_multiline_anchors());
-        assert_eq!(dfa.find(b"hello"), Some((0, 5)));
-        assert_eq!(dfa.find(b"first\nhello"), Some((6, 11)));
+        assert_eq!(dfa.find(b"hello"), Ok(Some((0, 5))));
+        assert_eq!(dfa.find(b"first\nhello"), Ok(Some((6, 11))));
     }
 
     #[test]
     fn test_multiline_end() {
         let dfa = make_eager_dfa("(?m)world$");
         assert!(dfa.has_multiline_anchors());
-        assert_eq!(dfa.find(b"world\nnext"), Some((0, 5)));
-        assert_eq!(dfa.find(b"hello world"), Some((6, 11)));
+        assert_eq!(dfa.find(b"world\nnext"), Ok(Some((0, 5))));
+        assert_eq!(dfa.find(b"hello world"), Ok(Some((6, 11))));
     }
 
     #[test]
     fn test_email_pattern() {
         let dfa = make_eager_dfa(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$");
-        assert_eq!(dfa.find(b"user@example.com"), Some((0, 16)));
-        assert_eq!(dfa.find(b"invalid-email"), None);
+        assert_eq!(dfa.find(b"user@example.com"), Ok(Some((0, 16))));
+        assert_eq!(dfa.find(b"invalid-email"), Ok(None));
     }
 
     #[test]
     fn test_engine_facade() {
         let engine = make_engine("abc");
-        assert_eq!(engine.find(b"xyzabc123"), Some((3, 6)));
+        assert_eq!(engine.find(b"xyzabc123"), Ok(Some((3, 6))));
         assert!(!engine.is_jit());
     }
 
@@ -151,6 +152,6 @@ mod tests {
         let nfa = compile(&hir).unwrap();
         let mut lazy = LazyDfa::new(nfa);
         let engine = EagerDfaEngine::from_lazy(&mut lazy);
-        assert_eq!(engine.find(b"test"), Some((0, 4)));
+        assert_eq!(engine.find(b"test"), Ok(Some((0, 4))));
     }
 }

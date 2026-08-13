@@ -115,6 +115,12 @@ const PATTERNS: &[&str] = &[
     r"[^\s]+[^\r\n\p{L}\p{N}]*",
     r"\S{1,3}\p{L}",
     r"[^\s]{1,3}\p{N}?",
+    // `EagerDfa`'s metered word-boundary loop hands off to a fresh `LazyDfa`
+    // once its scan budget is exceeded (see `tests/bounded_execution.rs` for
+    // the long-input case that actually exercises the give-up); this keeps
+    // the handoff's output checked against the reference on ordinary-sized
+    // inputs too, matching and non-matching alike.
+    r"\b[a-y ]+\d",
     // The real tiktoken split patterns.
     CL100K,
     O200K,
