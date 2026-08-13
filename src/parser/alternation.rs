@@ -11,6 +11,20 @@ use crate::error::{Error, ErrorKind, Result};
 /// how much automaton one quantifier can ask for.
 pub const MAX_REPETITION: u32 = 65535;
 
+/// Deepest nesting (groups, character classes, and inline flag scopes,
+/// combined) the parser will follow before refusing the pattern.
+///
+/// Parsing is mutually recursive with no explicit stack — each nesting level
+/// costs roughly 5 stack frames across `parse_atom` / `parse_group` /
+/// `parse_alternation` / `parse_concat` / `parse_repeat` — so an unbounded
+/// pattern like `"(?:".repeat(50_000)` overflows the stack, which in Rust is
+/// an uncatchable SIGSEGV/abort rather than an `Err`. 250 levels costs about
+/// 1,250 frames, comfortably inside the 2 MiB stack Rust gives test threads
+/// even in debug builds, while still matching the depth other engines accept:
+/// both the `regex` crate's `nest_limit` and PCRE2's `parens_nest_limit`
+/// default to 250.
+pub const DEFAULT_NEST_LIMIT: u32 = 250;
+
 impl Parser<'_> {
     /// Parses alternation (lowest precedence): a|b|c
     pub(super) fn parse_alternation(&mut self) -> Result<Expr> {
@@ -47,7 +61,16 @@ impl Parser<'_> {
                 // Capture before recursing: a later `(?flags)` in the rest of
                 // the branch moves `self.flags` on again.
                 let scoped_flags = self.flags;
-                let rest = self.parse_concat()?;
+                // This is the parser's one self-recursion outside the
+                // group/class constructs: each `(?flags)` opens a new flag
+                // scope over the rest of the branch, so a run of them
+                // (`(?i)(?-i)(?i)...`) recurses one level per flag change
+                // with nothing bounding it otherwise. Only this call is
+                // wrapped — the recursion below `parse_alternation` already
+                // counts through `parse_group`/`parse_class`, and wrapping
+                // every `parse_concat` call (including once per alternative)
+                // would count sideways breadth as if it were depth.
+                let rest = self.with_nesting(Self::parse_concat)?;
                 exprs.push(Expr::Group(Box::new(Group {
                     expr: rest,
                     kind: GroupKind::Flagged(scoped_flags),

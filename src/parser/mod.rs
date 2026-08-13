@@ -14,6 +14,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use alternation::DEFAULT_NEST_LIMIT;
 pub use ast::*;
 pub use lexer::{EscapeKind, Lexer, Token, TokenKind};
-pub use state::{parse, Parser};
+pub use state::{parse, parse_with_nest_limit, Parser};

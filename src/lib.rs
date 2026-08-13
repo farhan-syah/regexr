@@ -49,6 +49,9 @@ pub struct RegexBuilder {
     backtrack_limit: u64,
     /// Elements the pattern may expand to; see [`RegexBuilder::size_limit`].
     size_limit: u32,
+    /// How deeply groups/classes/flag-scopes may nest; see
+    /// [`RegexBuilder::nest_limit`].
+    nest_limit: u32,
 }
 
 impl RegexBuilder {
@@ -60,6 +63,7 @@ impl RegexBuilder {
             optimize_prefixes: false,
             backtrack_limit: vm::backtracking::DEFAULT_BACKTRACK_LIMIT,
             size_limit: hir::builder::DEFAULT_EXPANDED_SIZE,
+            nest_limit: parser::DEFAULT_NEST_LIMIT,
         }
     }
 
@@ -94,6 +98,34 @@ impl RegexBuilder {
     /// ```
     pub fn size_limit(mut self, limit: u32) -> Self {
         self.size_limit = limit;
+        self
+    }
+
+    /// Sets how deeply groups, character classes, and inline flag scopes
+    /// (`(?i)...`) may nest before a pattern is refused.
+    ///
+    /// The parser is mutually recursive with no explicit stack, so nesting
+    /// depth is bounded by the call stack, not by memory the pattern itself
+    /// controls. Left unbounded, a pattern like `"(?:".repeat(50_000) +
+    /// ")".repeat(50_000)` overflows the stack — which in Rust is an
+    /// uncatchable SIGSEGV/abort, not an `Err` a caller can handle. The
+    /// default, [`parser::DEFAULT_NEST_LIMIT`], matches the `regex` crate's
+    /// `nest_limit` and PCRE2's `parens_nest_limit`.
+    ///
+    /// Raise it only for patterns you own and trust; a caller compiling an
+    /// untrusted pattern should keep the default.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regexr::RegexBuilder;
+    ///
+    /// let deep = format!("{}a{}", "(?:".repeat(300), ")".repeat(300));
+    /// assert!(RegexBuilder::new(&deep).build().is_err());
+    /// assert!(RegexBuilder::new(&deep).nest_limit(400).build().is_ok());
+    /// ```
+    pub fn nest_limit(mut self, limit: u32) -> Self {
+        self.nest_limit = limit;
         self
     }
 
@@ -167,7 +199,7 @@ impl RegexBuilder {
 
     /// Builds the regex with the configured options.
     pub fn build(self) -> Result<Regex> {
-        let ast = parser::parse(&self.pattern)?;
+        let ast = parser::parse_with_nest_limit(&self.pattern, self.nest_limit)?;
         let mut hir_result = hir::translate_with_limit(&ast, self.size_limit)?;
 
         // Apply prefix optimization if enabled

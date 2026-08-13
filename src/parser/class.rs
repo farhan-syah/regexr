@@ -18,7 +18,16 @@ impl Parser<'_> {
     /// which falls out naturally here — `negated` is only ever consumed by
     /// the caller once `ranges` is final, so it is applied last regardless
     /// of how many operators preceded it.
+    ///
+    /// Wrapped in [`Parser::with_nesting`] since every `[` is one nesting
+    /// level: a nested class (`[a[b[c...`, see `parse_class_term`) recurses
+    /// back into this same entry point, so wrapping it here covers that path
+    /// without a separate counter.
     pub(super) fn parse_class(&mut self) -> Result<Expr> {
+        self.with_nesting(Self::parse_class_inner)
+    }
+
+    fn parse_class_inner(&mut self) -> Result<Expr> {
         let start_span = self.current.span;
         // Set in_class BEFORE advancing so the next token is lexed correctly
         self.lexer.set_in_class(true);

@@ -471,3 +471,103 @@ fn long_run_iteration_stays_linear() {
         }
     });
 }
+
+// =============================================================================
+// Parsing does not overflow the stack on deeply nested patterns
+// =============================================================================
+// The parser is mutually recursive with no explicit stack, so a pattern that
+// nests deeply enough overflows the real call stack — which in Rust is an
+// uncatchable SIGSEGV/abort, not a `Result::Err` a caller can handle. That
+// makes `assert!(Regex::new(deep).is_err())` unsafe as a standalone test: if
+// the depth guard ever regresses, the process crashes instead of the assertion
+// failing, taking down the rest of the `cargo test` binary with it. Each case
+// below is isolated in a child process for exactly that reason (see the module
+// doc comment above).
+//
+// Patterns are held well past `parser::DEFAULT_NEST_LIMIT` (250) so the cases
+// stay meaningful even if the limit is later raised somewhat.
+
+/// A run of unmatched `(` is malformed — parsing would eventually reach an
+/// unmatched-paren error — but the depth guard must reject it long before
+/// that, on the way down through the nesting, not on the way back up.
+#[test]
+fn many_unmatched_open_parens_is_rejected_not_crashed() {
+    bounded("many_unmatched_open_parens_is_rejected_not_crashed", || {
+        let pattern = "(".repeat(50_000);
+        let err = Regex::new(&pattern)
+            .expect_err("unbounded nesting must not compile")
+            .to_string();
+        assert!(
+            err.contains("nest"),
+            "expected a nesting error, got {err:?}"
+        );
+    });
+}
+
+/// A well-formed pattern nested via `(?:...)` recurses just as deeply while
+/// parsing the opening half, so the guard must catch it there rather than
+/// relying on the (never reached) closing half to bound anything.
+#[test]
+fn many_well_formed_non_capturing_groups_is_rejected_not_crashed() {
+    bounded(
+        "many_well_formed_non_capturing_groups_is_rejected_not_crashed",
+        || {
+            let pattern = format!("{}{}", "(?:".repeat(50_000), ")".repeat(50_000));
+            let err = Regex::new(&pattern)
+                .expect_err("unbounded nesting must not compile")
+                .to_string();
+            assert!(
+                err.contains("nest"),
+                "expected a nesting error, got {err:?}"
+            );
+        },
+    );
+}
+
+/// Character classes recurse on their own path (`parse_class` <->
+/// `parse_class_term`), separate from the group/alternation cycle, and must be
+/// bounded independently: `[a[a[a...` opens a fresh nested class after every
+/// literal `a`.
+#[test]
+fn many_nested_classes_is_rejected_not_crashed() {
+    bounded("many_nested_classes_is_rejected_not_crashed", || {
+        let pattern = "[a".repeat(50_000);
+        let err = Regex::new(&pattern)
+            .expect_err("unbounded class nesting must not compile")
+            .to_string();
+        assert!(
+            err.contains("nest"),
+            "expected a nesting error, got {err:?}"
+        );
+    });
+}
+
+/// A bare `(?flags)` opens a new flag scope over the rest of its branch by
+/// recursing into `parse_concat` again — a third recursion path, distinct from
+/// both the group cycle and the class path, that a long run of flag changes
+/// can walk arbitrarily deep.
+#[test]
+fn many_inline_flag_changes_is_rejected_not_crashed() {
+    bounded("many_inline_flag_changes_is_rejected_not_crashed", || {
+        let pattern = "(?i)(?-i)".repeat(50_000);
+        let err = Regex::new(&pattern)
+            .expect_err("unbounded flag-scope nesting must not compile")
+            .to_string();
+        assert!(
+            err.contains("nest"),
+            "expected a nesting error, got {err:?}"
+        );
+    });
+}
+
+/// The other side of the same guard: nesting one level under the default
+/// limit must still compile cleanly. This is what catches an off-by-one that
+/// rejects legitimate patterns, which the crash-only cases above cannot show.
+#[test]
+fn nesting_just_under_the_limit_still_compiles() {
+    bounded("nesting_just_under_the_limit_still_compiles", || {
+        let depth = (regexr::parser::DEFAULT_NEST_LIMIT - 1) as usize;
+        let pattern = format!("{}a{}", "(?:".repeat(depth), ")".repeat(depth));
+        Regex::new(&pattern).expect("nesting one under the limit must compile");
+    });
+}

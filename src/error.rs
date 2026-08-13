@@ -93,6 +93,14 @@ pub enum ErrorKind {
         /// The largest bound accepted.
         limit: u32,
     },
+    /// The pattern nests groups, character classes, and/or inline flag scopes
+    /// deeper than the parser will follow.
+    NestingTooDeep {
+        /// The nesting depth the pattern reached.
+        depth: u32,
+        /// The deepest nesting accepted.
+        limit: u32,
+    },
     /// Repetition quantifier on nothing.
     RepetitionOnNothing,
     /// Invalid character class range (e.g., z-a).
@@ -249,6 +257,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::RepetitionTooLarge { bound, limit } => write!(
                 f,
                 "repetition count {bound} exceeds the limit of {limit}"
+            ),
+            ErrorKind::NestingTooDeep { depth, limit } => write!(
+                f,
+                "pattern nests {depth} levels deep, exceeding the limit of {limit}"
             ),
             ErrorKind::RepetitionOnNothing => write!(f, "quantifier on nothing"),
             ErrorKind::InvalidClassRange { start, end } => {

@@ -7,7 +7,16 @@ use crate::error::{Error, ErrorKind, Result, Span};
 
 impl Parser<'_> {
     /// Parses a group: (...), (?:...), (?=...), etc.
+    ///
+    /// Wrapped in [`Parser::with_nesting`] since every `(` is one nesting
+    /// level, regardless of which group flavor it turns out to be — that
+    /// covers the mutual recursion back through `parse_alternation` at every
+    /// one of this function's call sites into it.
     pub(super) fn parse_group(&mut self) -> Result<Expr> {
+        self.with_nesting(Self::parse_group_inner)
+    }
+
+    fn parse_group_inner(&mut self) -> Result<Expr> {
         let start_span = self.current.span;
         self.advance()?; // consume '('
 
