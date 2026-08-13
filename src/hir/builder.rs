@@ -1326,13 +1326,26 @@ pub const DEFAULT_EXPANDED_SIZE: u32 = 10_000;
 
 /// How many elements the engines will emit for this expression.
 ///
-/// Counts what actually gets duplicated — a class or a literal byte is one
-/// element, and a repetition multiplies its body by the number of copies it
-/// forces. Saturating throughout, so an overflowing product reports the ceiling
-/// and is rejected rather than wrapping to a small number.
+/// Invariant: every leaf costs at least what the NFA builders (`nfa::thompson`)
+/// will actually allocate for it, so no node is ever free. This matters even for
+/// nodes that duplicate no *text* — `Empty`, `Anchor`, `Backref` still cost one or
+/// more NFA states per copy — because a zero-cost leaf lets `Repeat` multiply it
+/// by any copy count and still report zero, letting `(?:(?:\b){N}){M}` sail past
+/// the limit while emitting `N * M` states. When adding a new `HirExpr` variant,
+/// give it the state count its builder allocates, never `0`.
+///
+/// Above the leaves, a class or a literal byte is one element, and a repetition
+/// multiplies its body by the number of copies it forces. Saturating throughout,
+/// so an overflowing product reports the ceiling and is rejected rather than
+/// wrapping to a small number.
 fn expanded_size(expr: &HirExpr) -> u32 {
     match expr {
-        HirExpr::Empty | HirExpr::Anchor(_) | HirExpr::Backref(_) => 0,
+        // 1 state: `nfa::thompson::build_empty`.
+        HirExpr::Empty => 1,
+        // 1 state: `nfa::thompson::build_anchor`.
+        HirExpr::Anchor(_) => 1,
+        // 2 states: `nfa::thompson::build_backref`.
+        HirExpr::Backref(_) => 2,
         HirExpr::Class(_) | HirExpr::UnicodeCpClass(_) => 1,
         HirExpr::Literal(bytes) => u32::try_from(bytes.len()).unwrap_or(u32::MAX),
         HirExpr::Concat(exprs) | HirExpr::Alt(exprs) => exprs
@@ -1369,6 +1382,35 @@ mod tests {
             assert_eq!(cls.ranges, vec![(b'a', b'z')]);
         } else {
             panic!("Expected Class");
+        }
+    }
+
+    /// No leaf `HirExpr` may cost 0 elements: `Repeat` multiplies a body's
+    /// `expanded_size` by its copy count, so a zero-cost leaf lets any number
+    /// of copies collapse back to zero and evade `DEFAULT_EXPANDED_SIZE`
+    /// entirely — which is exactly what let
+    /// `(?:(?:\b){65535}){65535}` emit ~4.3e9 NFA states for free.
+    ///
+    /// A newly added variant cannot slip past this silently: `expanded_size`
+    /// matches without a wildcard arm, so it fails to compile until the variant
+    /// is given the state count its builder allocates.
+    #[test]
+    fn expanded_size_never_returns_zero_for_a_leaf() {
+        let leaves = [
+            HirExpr::Empty,
+            HirExpr::Literal(vec![b'a']),
+            HirExpr::Class(HirClass::new(vec![(b'a', b'z')], false)),
+            HirExpr::UnicodeCpClass(CodepointClass::new(vec![(0x61, 0x7a)], false)),
+            HirExpr::Anchor(HirAnchor::WordBoundary),
+            HirExpr::Backref(1),
+        ];
+
+        for leaf in &leaves {
+            assert!(
+                expanded_size(leaf) > 0,
+                "{leaf:?} must cost at least one NFA state, matching what \
+                 nfa::thompson actually allocates for it"
+            );
         }
     }
 

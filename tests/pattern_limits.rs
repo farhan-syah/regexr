@@ -49,6 +49,35 @@ fn nested_repetitions_are_bounded_by_their_product() {
     }
 }
 
+/// Purely zero-width repeated bodies — anchors and backreferences — must not
+/// be free.
+///
+/// `expanded_size` used to return 0 for `Empty`, `Anchor`, and `Backref`
+/// nodes, so `Repeat` multiplying a zero-cost body by any copy count still
+/// reported 0 and sailed past the limit, while the NFA builders still emitted
+/// one state per copy. `(?:(?:\b){65535}){65535}` hit that bug's worst case
+/// (~4.3e9 NFA states, hanging `Regex::new`); these patterns are a fraction
+/// of that size — 250_000 and 500_001 elements against the default 10_000
+/// limit — so they must still be refused promptly, before any NFA is built.
+#[test]
+fn zero_width_repetition_bodies_are_not_free() {
+    let cases = [
+        (r"(?:(?:\b){500}){500}", 250_000u32),
+        (r"(?:(?:^){500}){500}", 250_000u32),
+        (r"(a)(?:(?:\1){500}){500}", 500_001u32),
+    ];
+
+    for (pattern, size) in cases {
+        let error = regexr::Regex::new(pattern)
+            .expect_err(&format!("{pattern} must not compile"))
+            .to_string();
+        let expected = format!(
+            "regex error: pattern expands to {size} elements, exceeding the limit of 10000"
+        );
+        assert_eq!(error, expected, "{pattern}: unexpected error message");
+    }
+}
+
 /// The ceiling has to leave ordinary patterns alone.
 #[test]
 fn ordinary_repetitions_still_compile() {
