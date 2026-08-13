@@ -322,37 +322,60 @@ impl Parser<'_> {
             TokenKind::Escape(esc) => {
                 match esc {
                     // Perl character classes - expand to ranges
+                    // `\d`/`\w` (and their negations) are ASCII-only unless
+                    // `(?u)` is in scope, matching the standalone `\d`/`\w`
+                    // behaviour in `hir::builder::translate_perl_class` — see
+                    // that function's doc comment for the rationale. When
+                    // Unicode mode is on, these reuse the same
+                    // `PERL_DECIMAL`/`PERL_WORD` tables the standalone form
+                    // uses, so `\w` and `[\w]` can never drift apart.
                     EscapeKind::Digit => {
                         self.advance()?;
-                        Ok(ClassItem::Ranges(vec![ClassRange::new('0', '9')]))
+                        Ok(ClassItem::Ranges(if self.flags.unicode {
+                            codepoints_to_ranges(unicode_data::PERL_DECIMAL)
+                        } else {
+                            vec![ClassRange::new('0', '9')]
+                        }))
                     }
                     EscapeKind::NotDigit => {
                         self.advance()?;
-                        // [^\d] = everything except 0-9
-                        Ok(ClassItem::Ranges(vec![
-                            ClassRange::new('\x00', '/'),       // 0x00-0x2F
-                            ClassRange::new(':', '\u{10FFFF}'), // 0x3A onwards
-                        ]))
+                        Ok(ClassItem::Ranges(if self.flags.unicode {
+                            complement_ranges(&codepoints_to_ranges(unicode_data::PERL_DECIMAL))
+                        } else {
+                            // [^\d] = everything except 0-9
+                            vec![
+                                ClassRange::new('\x00', '/'),       // 0x00-0x2F
+                                ClassRange::new(':', '\u{10FFFF}'), // 0x3A onwards
+                            ]
+                        }))
                     }
                     EscapeKind::Word => {
                         self.advance()?;
-                        Ok(ClassItem::Ranges(vec![
-                            ClassRange::new('a', 'z'),
-                            ClassRange::new('A', 'Z'),
-                            ClassRange::new('0', '9'),
-                            ClassRange::single('_'),
-                        ]))
+                        Ok(ClassItem::Ranges(if self.flags.unicode {
+                            codepoints_to_ranges(unicode_data::PERL_WORD)
+                        } else {
+                            vec![
+                                ClassRange::new('a', 'z'),
+                                ClassRange::new('A', 'Z'),
+                                ClassRange::new('0', '9'),
+                                ClassRange::single('_'),
+                            ]
+                        }))
                     }
                     EscapeKind::NotWord => {
                         self.advance()?;
-                        // [^\w] = everything except [a-zA-Z0-9_]
-                        Ok(ClassItem::Ranges(vec![
-                            ClassRange::new('\x00', '/'),       // before '0'
-                            ClassRange::new(':', '@'),          // between '9' and 'A'
-                            ClassRange::new('[', '^'),          // between 'Z' and '_'
-                            ClassRange::single('`'),            // between '_' and 'a'
-                            ClassRange::new('{', '\u{10FFFF}'), // after 'z'
-                        ]))
+                        Ok(ClassItem::Ranges(if self.flags.unicode {
+                            complement_ranges(&codepoints_to_ranges(unicode_data::PERL_WORD))
+                        } else {
+                            // [^\w] = everything except [a-zA-Z0-9_]
+                            vec![
+                                ClassRange::new('\x00', '/'),       // before '0'
+                                ClassRange::new(':', '@'),          // between '9' and 'A'
+                                ClassRange::new('[', '^'),          // between 'Z' and '_'
+                                ClassRange::single('`'),            // between '_' and 'a'
+                                ClassRange::new('{', '\u{10FFFF}'), // after 'z'
+                            ]
+                        }))
                     }
                     EscapeKind::Whitespace => {
                         self.advance()?;
@@ -1061,5 +1084,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Parses `pattern` (which must be a single bracketed class, e.g.
+    /// `[\w]`) with `unicode` forced as the parser's `(?u)` state, and
+    /// returns the resulting [`Class`]. Bypasses `(?u)` syntax entirely so
+    /// the unicode/non-unicode paths can be pinned independently of flag
+    /// parsing.
+    fn parse_class_expr(pattern: &str, unicode: bool) -> Class {
+        let mut parser = Parser::new(pattern).unwrap();
+        parser.flags.unicode = unicode;
+        match parser.parse_class().unwrap() {
+            Expr::Class(cls) => *cls,
+            other => panic!("expected a character class, got {other:?}"),
+        }
+    }
+
+    /// Whether `c` is a member of `cls`, honoring the class-level `^`
+    /// negation (item-level negation, e.g. `\W`, is already baked into
+    /// `cls.ranges` by the parser).
+    fn class_contains(cls: &Class, c: char) -> bool {
+        let member = cls.ranges.iter().any(|r| r.contains(c));
+        member != cls.negated
+    }
+
+    // `(?u)[\w]` / `(?u)[\d]` (and negations) must reach the same Unicode
+    // tables as standalone `(?u)\w` / `(?u)\d` — regression tests for the
+    // bug where `parse_class_item` hardcoded ASCII ranges regardless of
+    // `self.flags.unicode`.
+
+    #[test]
+    fn unicode_w_in_class_matches_unicode_word_chars() {
+        let cls = parse_class_expr("[\\w]", true);
+        assert!(class_contains(&cls, '\u{4E2D}')); // 中
+        assert!(class_contains(&cls, '\u{00E9}')); // é
+        assert!(class_contains(&cls, 'a'));
+        assert!(!class_contains(&cls, ' '));
+    }
+
+    #[test]
+    fn unicode_not_w_in_class_excludes_unicode_word_chars() {
+        let cls = parse_class_expr("[\\W]", true);
+        assert!(!class_contains(&cls, '\u{4E2D}')); // 中
+        assert!(!class_contains(&cls, 'a'));
+        assert!(class_contains(&cls, ' '));
+    }
+
+    #[test]
+    fn unicode_d_in_class_matches_unicode_decimal_digits() {
+        let cls = parse_class_expr("[\\d]", true);
+        assert!(class_contains(&cls, '\u{0660}')); // ٠ Arabic-Indic zero
+        assert!(class_contains(&cls, '5'));
+        assert!(!class_contains(&cls, 'a'));
+    }
+
+    #[test]
+    fn unicode_not_d_in_class_excludes_unicode_decimal_digits() {
+        let cls = parse_class_expr("[\\D]", true);
+        assert!(!class_contains(&cls, '\u{0660}')); // ٠ Arabic-Indic zero
+        assert!(!class_contains(&cls, '5'));
+        assert!(class_contains(&cls, 'a'));
+    }
+
+    #[test]
+    fn ascii_w_in_class_still_excludes_unicode_word_chars() {
+        let cls = parse_class_expr("[\\w]", false);
+        assert!(!class_contains(&cls, '\u{4E2D}')); // 中
+        assert!(!class_contains(&cls, '\u{00E9}')); // é
+        assert!(class_contains(&cls, 'a'));
+    }
+
+    #[test]
+    fn ascii_d_in_class_still_excludes_unicode_decimal_digits() {
+        let cls = parse_class_expr("[\\d]", false);
+        assert!(!class_contains(&cls, '\u{0660}')); // ٠ Arabic-Indic zero
+        assert!(class_contains(&cls, '5'));
+    }
+
+    #[test]
+    fn ascii_control_char_is_never_a_word_char_in_class_either_mode() {
+        let unicode_w = parse_class_expr("[\\w]", true);
+        let ascii_w = parse_class_expr("[\\w]", false);
+        assert!(!class_contains(&unicode_w, '\x01'));
+        assert!(!class_contains(&ascii_w, '\x01'));
+    }
+
+    // Regression guard: the non-unicode path must stay byte-identical to
+    // today's hardcoded ASCII ranges, range for range and in order, not just
+    // membership-equivalent.
+
+    #[test]
+    fn non_unicode_w_in_class_ranges_unchanged() {
+        let cls = parse_class_expr("[\\w]", false);
+        assert_eq!(
+            cls.ranges,
+            vec![
+                ClassRange::new('a', 'z'),
+                ClassRange::new('A', 'Z'),
+                ClassRange::new('0', '9'),
+                ClassRange::single('_'),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_unicode_not_w_in_class_ranges_unchanged() {
+        let cls = parse_class_expr("[\\W]", false);
+        assert_eq!(
+            cls.ranges,
+            vec![
+                ClassRange::new('\x00', '/'),
+                ClassRange::new(':', '@'),
+                ClassRange::new('[', '^'),
+                ClassRange::single('`'),
+                ClassRange::new('{', '\u{10FFFF}'),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_unicode_d_in_class_ranges_unchanged() {
+        let cls = parse_class_expr("[\\d]", false);
+        assert_eq!(cls.ranges, vec![ClassRange::new('0', '9')]);
+    }
+
+    #[test]
+    fn non_unicode_not_d_in_class_ranges_unchanged() {
+        let cls = parse_class_expr("[\\D]", false);
+        assert_eq!(
+            cls.ranges,
+            vec![
+                ClassRange::new('\x00', '/'),
+                ClassRange::new(':', '\u{10FFFF}'),
+            ]
+        );
     }
 }
