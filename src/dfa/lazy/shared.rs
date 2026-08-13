@@ -275,6 +275,19 @@ pub struct LazyDfaContext {
     /// would still pass the equality check.
     #[cfg(test)]
     pub(crate) per_byte_computations: usize,
+    /// How many distinct runs `compute_all_transitions_with_context` computed
+    /// a closure for, as opposed to skipping (cached/dead) or extending an
+    /// existing run.
+    ///
+    /// Exists to pin the run-merge sweep's effectiveness: adjacent bytes that
+    /// lead to the same target set are expected to collapse into one run
+    /// rather than being recomputed one byte at a time, so this counter
+    /// should stay near "one run per class of bytes" rather than climbing
+    /// toward one run per byte. See the note in
+    /// `compute_all_transitions_with_context` for why the target sets it
+    /// compares are deliberately left uncanonicalised.
+    #[cfg(test)]
+    pub(crate) context_run_computations: usize,
 }
 
 impl LazyDfaContext {
@@ -327,6 +340,8 @@ impl LazyDfaContext {
             has_clean_accept,
             #[cfg(test)]
             per_byte_computations: 0,
+            #[cfg(test)]
+            context_run_computations: 0,
         };
 
         // Create the start state
@@ -499,14 +514,24 @@ pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool, bool) {
 /// - Word boundaries: Follow epsilons only when boundary condition matches
 /// - START anchors: Follow epsilons only when at valid start position
 /// - END anchors: Always follow epsilons (checked at match time)
-pub fn epsilon_closure_with_context(
+///
+/// Generic over the seed container so both a `&BTreeSet<NfaStateId>` (an
+/// interned DFA state's subset) and a `&[NfaStateId]`/`&Vec<NfaStateId>` (an
+/// accumulation-order, possibly-duplicated run of per-byte targets) can be
+/// passed directly, with neither shape needing to be copied into the other
+/// first. Duplicates in the seeds are harmless: `closure.insert` below only
+/// pushes a seed onto the stack the first time it is seen.
+pub fn epsilon_closure_with_context<'a, I>(
     nfa: &Nfa,
-    seeds: &BTreeSet<NfaStateId>,
+    seeds: I,
     is_at_boundary: Option<bool>,
     pos_ctx: Option<PositionContext>,
-) -> BTreeSet<NfaStateId> {
+) -> BTreeSet<NfaStateId>
+where
+    I: IntoIterator<Item = &'a NfaStateId>,
+{
     let mut closure = BTreeSet::new();
-    let mut stack: Vec<NfaStateId> = seeds.iter().copied().collect();
+    let mut stack: Vec<NfaStateId> = seeds.into_iter().copied().collect();
 
     while let Some(state_id) = stack.pop() {
         // Always add state to closure (even if assertion doesn't match)
@@ -572,14 +597,23 @@ pub fn epsilon_closure_with_context(
 /// and `EndOfLine` instead of stepping through them. If a match state is reached
 /// anyway, some branch gets there without asking for `$`, and a match in this
 /// state stands wherever it ends.
-pub fn match_reachable_without_end_assertion(
+///
+/// Generic over the seed container for the same reason as
+/// [`epsilon_closure_with_context`]: both an interned `&BTreeSet<NfaStateId>`
+/// and a `&[NfaStateId]`/`&Vec<NfaStateId>` run of targets (accumulation
+/// order, possibly with duplicates) can be passed directly, with no
+/// intermediate allocation to bridge between the two.
+pub fn match_reachable_without_end_assertion<'a, I>(
     nfa: &Nfa,
-    seeds: &BTreeSet<NfaStateId>,
+    seeds: I,
     is_at_boundary: Option<bool>,
     pos_ctx: Option<PositionContext>,
-) -> bool {
+) -> bool
+where
+    I: IntoIterator<Item = &'a NfaStateId>,
+{
     let mut visited = BTreeSet::new();
-    let mut stack: Vec<NfaStateId> = seeds.iter().copied().collect();
+    let mut stack: Vec<NfaStateId> = seeds.into_iter().copied().collect();
 
     while let Some(state_id) = stack.pop() {
         if !visited.insert(state_id) {
@@ -631,15 +665,28 @@ pub fn get_or_create_state_with_class(
     prev_class: CharClass,
     match_without_end_assertion: bool,
 ) -> DfaStateId {
+    // The probe key moves `nfa_states` in rather than cloning it: on the hit
+    // path (the common case — most bytes land on an already-cached state)
+    // the key is simply dropped afterwards, so only one `BTreeSet` is ever
+    // built. Only the miss path below needs a second, owned copy — one for
+    // the map key, one for the stored `DfaState` — so that is where the
+    // clone happens.
     let key = if ctx.has_word_boundary {
-        StateKey::WithClass(nfa_states.clone(), prev_class)
+        StateKey::WithClass(nfa_states, prev_class)
     } else {
-        StateKey::Simple(nfa_states.clone())
+        StateKey::Simple(nfa_states)
     };
 
     if let Some(&id) = ctx.state_map.get(&key) {
         return id;
     }
+
+    // Miss: recover the owned NFA state set from the probe key so it can be
+    // reused below, first for the (rare) post-flush reprobe and then for the
+    // stored state and the final insertion key.
+    let nfa_states = match key {
+        StateKey::WithClass(states, _) | StateKey::Simple(states) => states,
+    };
 
     // Cache full. Flushing invalidates every premultiplied ID in flight, so it
     // is only safe between searches; under a running one the cache grows
@@ -647,7 +694,12 @@ pub fn get_or_create_state_with_class(
     if ctx.states.len() >= ctx.cache_limit {
         if ctx.search_depth == 0 {
             flush_cache(ctx);
-            if let Some(&id) = ctx.state_map.get(&key) {
+            let reprobe_key = if ctx.has_word_boundary {
+                StateKey::WithClass(nfa_states.clone(), prev_class)
+            } else {
+                StateKey::Simple(nfa_states.clone())
+            };
+            if let Some(&id) = ctx.state_map.get(&reprobe_key) {
                 return id;
             }
         } else if ctx.states.len() >= ctx.cache_ceiling() {
@@ -666,6 +718,12 @@ pub fn get_or_create_state_with_class(
 
     let state_index = ctx.states.len();
     let premul_id = (state_index as u32) * STRIDE;
+
+    let key = if ctx.has_word_boundary {
+        StateKey::WithClass(nfa_states.clone(), prev_class)
+    } else {
+        StateKey::Simple(nfa_states.clone())
+    };
 
     ctx.states.push(DfaState::new(
         nfa_states,

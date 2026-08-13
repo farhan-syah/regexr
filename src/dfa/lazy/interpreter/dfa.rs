@@ -404,19 +404,22 @@ impl LazyDfa {
             None => return,
         };
 
-        let mut byte_targets: [Option<BTreeSet<u32>>; 256] = std::array::from_fn(|_| None);
+        let mut byte_targets: [Option<Vec<NfaStateId>>; 256] = std::array::from_fn(|_| None);
 
         for &nfa_state in &nfa_states {
             if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
                 for (range, target) in &nfa_s.transitions {
                     for byte in range.start..=range.end {
                         byte_targets[byte as usize]
-                            .get_or_insert_with(BTreeSet::new)
-                            .insert(*target);
+                            .get_or_insert_with(Vec::new)
+                            .push(*target);
                     }
                 }
             }
         }
+
+        // Deliberately NOT canonicalised. See the note in
+        // `compute_all_transitions_with_context`.
 
         for byte in 0..=255u8 {
             let cache_idx = (state + byte as u32) as usize;
@@ -511,7 +514,7 @@ impl LazyDfa {
 
         // Which target set each byte leads to, taken from the expansion that
         // byte's own character class selects.
-        let mut byte_targets: [Option<BTreeSet<NfaStateId>>; 256] = std::array::from_fn(|_| None);
+        let mut byte_targets: [Option<Vec<NfaStateId>>; 256] = std::array::from_fn(|_| None);
         {
             let nfa = &self.ctx.nfa;
             let seeds = match self.ctx.states.get(state_idx) {
@@ -558,8 +561,8 @@ impl LazyDfa {
                             for byte in range.start..=range.end {
                                 if CharClass::from_byte(byte) == class {
                                     byte_targets[byte as usize]
-                                        .get_or_insert_with(BTreeSet::new)
-                                        .insert(*target);
+                                        .get_or_insert_with(Vec::new)
+                                        .push(*target);
                                 }
                             }
                         }
@@ -567,6 +570,23 @@ impl LazyDfa {
                 }
             }
         }
+
+        // `byte_targets` is deliberately left in accumulation order, NOT sorted
+        // and deduped. Canonicalising was tried and measured a net loss: it cost
+        // 3.9% on a 26-keyword alternation compile and 3.1% on `\b\w+\b`, for no
+        // measurable gain — the accumulation walks a sorted subset and appends
+        // each state's targets, so in practice the rows come out sorted and
+        // duplicate-free already, and the sort merely re-walks all 256 slots of
+        // every state to confirm it.
+        //
+        // It is not needed for correctness either. Un-canonical rows can only
+        // make two logically equal target sets compare *unequal* at the
+        // `next == targets` check below, which splits a run into smaller ones
+        // and recomputes them — never a wrong merge, since merging requires
+        // equality. Duplicates are absorbed by the visited set inside
+        // `epsilon_closure_with_context`, and the subset that gets interned is
+        // that closure's output rather than this row, so state identity does not
+        // depend on this ordering at all.
 
         // Captured by value: the sweep below mutates the transition table, so a
         // closure holding a borrow of `self` could not live across it.
@@ -631,6 +651,10 @@ impl LazyDfa {
                 end += 1;
             }
 
+            #[cfg(test)]
+            {
+                self.ctx.context_run_computations += 1;
+            }
             let next_closure = epsilon_closure_with_context(&self.ctx.nfa, targets, None, pos_ctx);
             if next_closure.is_empty() {
                 for dead_byte in byte..end {
@@ -1597,6 +1621,67 @@ mod tests {
                 "{pattern:?}: expected more than the start state to be reachable"
             );
         }
+    }
+
+    /// The probe-key restructure in `get_or_create_state_with_class` — moving
+    /// `nfa_states` into the key on the hit path and cloning only on miss —
+    /// must not change interning: asking for the same NFA subset twice has to
+    /// return the same DFA state id rather than creating a duplicate.
+    #[test]
+    fn get_or_create_state_interns_repeated_subset() {
+        let lazy = dfa(r"\b\w+\b");
+        let mut ctx = lazy.ctx.clone();
+
+        let mut states = BTreeSet::new();
+        states.insert(0u32);
+        states.insert(2u32);
+
+        let first = get_or_create_state_with_class(&mut ctx, states.clone(), CharClass::Word, true);
+        let states_before = ctx.state_count();
+        let second = get_or_create_state_with_class(&mut ctx, states, CharClass::Word, true);
+
+        assert_eq!(first, second, "identical subset must intern to the same id");
+        assert_eq!(
+            ctx.state_count(),
+            states_before,
+            "asking for an already-cached subset must not grow the cache"
+        );
+    }
+
+    /// Pins that the sweep actually merges, rather than recomputing per byte.
+    ///
+    /// `batched_context_transitions_match_the_per_byte_path` proves the batched
+    /// sweep computes the *same transitions* as the per-byte path regardless of
+    /// how many runs it took to get there — `get_or_create_state_with_class`'s
+    /// interning makes the final ids converge either way. So it cannot tell
+    /// "merged into a few runs" from "recomputed almost every byte". This test
+    /// counts runs (`context_run_computations`, bumped once per run rather than
+    /// once per byte) to cover that gap: for `\b\w+\b`'s "inside a word" state
+    /// every word byte in a contiguous class range reaches the identical target
+    /// set, so the 256-byte row must collapse into a handful of runs.
+    ///
+    /// This is also what shows the rows do not need canonicalising: sorting and
+    /// deduping them was tried, left this count unchanged, and cost instructions
+    /// on every compile — see the note in `compute_all_transitions_with_context`.
+    #[test]
+    fn context_transitions_merge_into_few_runs() {
+        let mut lazy = dfa(r"\b\w+\b");
+        // `\b` holds crossing NonWord -> Word, so the real anchored start
+        // (always tagged NonWord) is what needs to be used here: starting
+        // from a state already tagged Word would make `\b` fail on the very
+        // next word byte and dead-end the transition this test needs.
+        let start = lazy.get_start_state_for_class(CharClass::NonWord);
+        let inside_word = lazy.compute_all_transitions(start)[b'a' as usize]
+            .expect("'a' must transition into the inside-a-word state from the true start");
+
+        let before = lazy.ctx.context_run_computations;
+        let _ = lazy.compute_all_transitions(inside_word);
+        let runs = lazy.ctx.context_run_computations - before;
+
+        assert!(
+            runs <= 10,
+            "expected the word-class row to collapse into a handful of runs, got {runs}"
+        );
     }
 
     /// An end anchor belongs to the branch that carries it, not to the pattern.

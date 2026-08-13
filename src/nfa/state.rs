@@ -239,7 +239,18 @@ impl Nfa {
     }
 
     /// Computes the epsilon closure of a set of states.
-    pub fn epsilon_closure(&self, states: &BTreeSet<StateId>) -> BTreeSet<StateId> {
+    ///
+    /// Generic over the seed container so both a `&BTreeSet<StateId>` (the
+    /// interned NFA subset representation) and a `&[StateId]`/`&Vec<StateId>`
+    /// (a freshly accumulated run of targets, in accumulation order and
+    /// possibly with duplicates) can be passed directly — neither shape
+    /// needs to be copied into the other just to call this. Duplicate seeds
+    /// are harmless: the dedup guard below only stacks a state the first
+    /// time it is seen.
+    pub fn epsilon_closure<'a, I>(&self, states: I) -> BTreeSet<StateId>
+    where
+        I: IntoIterator<Item = &'a StateId>,
+    {
         // Fast path: if we have precomputed closures, use them
         if let Some(ref precomputed) = self.epsilon_closures {
             let mut closure = BTreeSet::new();
@@ -252,8 +263,13 @@ impl Nfa {
         }
 
         // Slow path: compute epsilon closure on the fly
-        let mut closure = states.clone();
-        let mut stack: Vec<StateId> = states.iter().copied().collect();
+        let mut closure = BTreeSet::new();
+        let mut stack: Vec<StateId> = Vec::new();
+        for &state_id in states {
+            if closure.insert(state_id) {
+                stack.push(state_id);
+            }
+        }
 
         while let Some(state_id) = stack.pop() {
             if let Some(state) = self.get(state_id) {
