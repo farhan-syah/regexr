@@ -316,12 +316,6 @@ fn test_captures() {
     assert_eq!(&caps[2], "456");
 }
 
-/// The one-pass capture engine is compiled lazily, on the first `captures()`
-/// call, rather than during `Regex::new` (see `CompiledRegex::one_pass` in
-/// `src/engine/executor.rs`). A freshly compiled regex must still produce
-/// correct groups on that first call, and the memoized engine used by a second
-/// call must agree with it exactly.
-
 // =============================================================================
 // captures_iter
 // =============================================================================
