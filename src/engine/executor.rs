@@ -1007,6 +1007,16 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
 
     let (inner, capture_nfa) = match engine {
         EngineType::PikeVm => (CompiledInner::PikeVm(PikeVm::new(nfa)), None),
+        EngineType::TaggedNfa => {
+            // `select_engine` works from the NFA alone and never returns this
+            // (only `select_engine_from_hir` inspects the HIR for codepoint
+            // classes), but the tagged engine needs nothing but an NFA, so this
+            // stays a real route rather than a downgrade.
+            (
+                CompiledInner::TaggedNfaInterp(TaggedNfaEngine::new(nfa)),
+                None,
+            )
+        }
         EngineType::BacktrackingVm => {
             // NFA-based compilation can't use BacktrackingVm (needs HIR)
             // Fall back to PikeVm which also handles backrefs
@@ -1052,6 +1062,33 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
     })
 }
 
+/// Builds the tagged-NFA interpreter for `hir` from its already-compiled `nfa`.
+///
+/// Shared by every route that lands on the tagged interpreter — lookaround,
+/// codepoint classes, and the JIT paths' fallbacks — so they cannot drift apart
+/// in prefilter or capture handling. The NFA is passed in rather than compiled
+/// here because the JIT fallback already holds one.
+///
+/// Safe for any pattern without backreferences: step extraction is bounded by
+/// `MAX_EXTRACTED_STEPS`, and when it declines `TaggedNfaEngine` runs the PikeVM
+/// it constructs regardless. Captures are single-pass and native to the tagged
+/// engine, so no capture NFA is retained.
+fn compile_tagged_nfa_interp(hir: &Hir, nfa: Nfa) -> CompiledRegex {
+    let literals = extract_literals(hir);
+    let prefilter = Prefilter::from_literals(&literals);
+    CompiledRegex {
+        inner: CompiledInner::TaggedNfaInterp(TaggedNfaEngine::new(nfa)),
+        prefilter,
+        capture_nfa: RwLock::new(None),
+        one_pass: OnceLock::new(),
+        capture_vm: RwLock::new(None),
+        capture_ctx: RwLock::new(None),
+        backtracking_vm: None,
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        backtracking_jit: None,
+    }
+}
+
 /// Compiles an HIR into an executable regex.
 /// This is the preferred API as it can use Shift-Or for small patterns
 /// and prefilters for SIMD-accelerated candidate detection.
@@ -1081,21 +1118,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
     // zero), so any non-greedy pattern falls through to `select_engine_from_hir`,
     // which routes it to PikeVm. (Non-greedy is not on the tiktoken hot path.)
     if hir.props.has_lookaround && !hir.props.has_non_greedy {
-        let literals = extract_literals(hir);
-        let prefilter = Prefilter::from_literals(&literals);
-        let nfa = nfa::compile(hir)?;
-        let engine = TaggedNfaEngine::new(nfa);
-        return Ok(CompiledRegex {
-            inner: CompiledInner::TaggedNfaInterp(engine),
-            prefilter,
-            capture_nfa: RwLock::new(None),
-            one_pass: OnceLock::new(),
-            capture_vm: RwLock::new(None),
-            capture_ctx: RwLock::new(None),
-            backtracking_vm: None,
-            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            backtracking_jit: None,
-        });
+        return Ok(compile_tagged_nfa_interp(hir, nfa::compile(hir)?));
     }
 
     // Extract literals for prefilter
@@ -1131,6 +1154,14 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         EngineType::PikeVm => {
             let nfa = nfa::compile(hir)?;
             (CompiledInner::PikeVm(PikeVm::new(nfa)), None)
+        }
+        EngineType::TaggedNfa => {
+            // Codepoint-class patterns: the same engine `compile_with_jit`
+            // builds for them, with the PikeVM kept as the tagged engine's own
+            // fallback (see `compile_tagged_nfa_interp`). Returned directly
+            // because the tagged engine owns its capture extraction and needs no
+            // separate capture NFA.
+            return Ok(compile_tagged_nfa_interp(hir, nfa::compile(hir)?));
         }
         EngineType::BacktrackingVm => {
             // BacktrackingVm for patterns with backreferences
@@ -1399,17 +1430,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                 // TaggedNfa JIT failed - fall back to TaggedNfa interpreter
                 #[cfg(debug_assertions)]
                 eprintln!("[regexr] TaggedNfaJit failed for large unicode class, falling back to interpreter: {}", _e);
-                let engine = TaggedNfaEngine::new(nfa);
-                return Ok(CompiledRegex {
-                    inner: CompiledInner::TaggedNfaInterp(engine),
-                    prefilter,
-                    capture_nfa: RwLock::new(None),
-                    one_pass: OnceLock::new(),
-                    capture_vm: RwLock::new(None),
-                    capture_ctx: RwLock::new(None),
-                    backtracking_vm: None,
-                    backtracking_jit: None,
-                });
+                return Ok(compile_tagged_nfa_interp(hir, nfa));
             }
         }
     }
@@ -1418,19 +1439,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
     // backreference patterns — TaggedNfa can't handle backrefs).
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     if hir.props.has_large_unicode_class && !hir.props.has_backrefs {
-        let literals = extract_literals(hir);
-        let prefilter = Prefilter::from_literals(&literals);
-        let nfa = nfa::compile(hir)?;
-        let engine = TaggedNfaEngine::new(nfa);
-        return Ok(CompiledRegex {
-            inner: CompiledInner::TaggedNfaInterp(engine),
-            prefilter,
-            capture_nfa: RwLock::new(None),
-            one_pass: OnceLock::new(),
-            capture_vm: RwLock::new(None),
-            capture_ctx: RwLock::new(None),
-            backtracking_vm: None,
-        });
+        return Ok(compile_tagged_nfa_interp(hir, nfa::compile(hir)?));
     }
 
     // 2. Patterns with backreferences → Backtracking JIT (only way to handle backrefs)
@@ -1507,17 +1516,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     "[regexr] TaggedNfaJit failed, falling back to interpreter: {}",
                     _e
                 );
-                let engine = TaggedNfaEngine::new(nfa);
-                return Ok(CompiledRegex {
-                    inner: CompiledInner::TaggedNfaInterp(engine),
-                    prefilter,
-                    capture_nfa: RwLock::new(None),
-                    one_pass: OnceLock::new(),
-                    capture_vm: RwLock::new(None),
-                    capture_ctx: RwLock::new(None),
-                    backtracking_vm: None,
-                    backtracking_jit: None,
-                });
+                return Ok(compile_tagged_nfa_interp(hir, nfa));
             }
         }
     }
@@ -1526,19 +1525,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
     // Note: TaggedNfa interpreter is now always available (faster than PikeVm for lookaround)
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     if hir.props.has_lookaround || hir.props.has_non_greedy {
-        let literals = extract_literals(hir);
-        let prefilter = Prefilter::from_literals(&literals);
-        let nfa = nfa::compile(hir)?;
-        let engine = TaggedNfaEngine::new(nfa);
-        return Ok(CompiledRegex {
-            inner: CompiledInner::TaggedNfaInterp(engine),
-            prefilter,
-            capture_nfa: RwLock::new(None),
-            one_pass: OnceLock::new(),
-            capture_vm: RwLock::new(None),
-            capture_ctx: RwLock::new(None),
-            backtracking_vm: None,
-        });
+        return Ok(compile_tagged_nfa_interp(hir, nfa::compile(hir)?));
     }
 
     // Backreferences without the JIT go to the same `BacktrackingVm` that

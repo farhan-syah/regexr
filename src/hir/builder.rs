@@ -798,8 +798,9 @@ impl HirTranslator {
     /// to start or end in the middle of a codepoint.
     ///
     /// Deliberately *not* a `HirExpr::UnicodeCpClass`: that node forces the
-    /// PikeVM (see `engine::selector::hir_uses_codepoint_class`), which would
-    /// drag every pattern containing `.` onto the slowest engine. The trie is
+    /// tagged NFA (see `engine::selector::hir_uses_codepoint_class`), which
+    /// would drag every pattern containing `.` off the byte engines that run it
+    /// best — and onto the PikeVM whenever step extraction declines. The trie is
     /// three fixed sequences, so `has_large_unicode_class` stays unset too.
     ///
     /// `\n` is 0x0A, which is never a UTF-8 lead or continuation byte, so

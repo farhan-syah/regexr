@@ -736,3 +736,34 @@ fn nullable_repetition_does_not_blow_up_compile_time() {
         Regex::new("(?:a?){2000}").expect("pattern is well-formed and must compile");
     });
 }
+
+/// `\X{4}` is the shape the engine selector cites as its reason for routing
+/// every codepoint-class pattern to the PikeVM: `\X` is a nested alternation,
+/// and the tagged step extractor copies each branch's continuation into every
+/// branch, so repeating it compounds multiplicatively.
+///
+/// That reasoning predates `MAX_EXTRACTED_STEPS`, which now bounds the emitted
+/// program and declines — falling back to the PikeVM — rather than letting it
+/// grow without limit. This pins the outcome the budget is supposed to
+/// guarantee: whichever engine ends up running it, compiling and searching
+/// `\X{4}` terminates. It is checked on the tagged path explicitly, because
+/// that is the path the selector is avoiding.
+#[test]
+fn repeated_grapheme_cluster_terminates_on_the_tagged_path() {
+    bounded(
+        "repeated_grapheme_cluster_terminates_on_the_tagged_path",
+        || {
+            let haystack = "a\u{0301}e\u{0302}i\u{0303}o\u{0304}".repeat(64);
+            for pattern in [r"\X{4}", r"\X{2,4}", r"\X{4}z"] {
+                for jit in [false, true] {
+                    let re = RegexBuilder::new(pattern)
+                        .jit(jit)
+                        .build()
+                        .expect("pattern is well-formed and must compile");
+                    let count = re.find_iter(&haystack).count();
+                    std::hint::black_box(count);
+                }
+            }
+        },
+    );
+}

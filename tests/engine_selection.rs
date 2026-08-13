@@ -194,6 +194,94 @@ fn requesting_jit_never_downgrades_the_engine() {
     }
 }
 
+/// A codepoint class must reach the tagged NFA in a plain, non-`jit` build.
+///
+/// `\p{L}` and friends lower to a `CodepointClass` instruction, which the DFA
+/// and Shift-Or families cannot execute at all — so the choice is between the
+/// PikeVM and the tagged NFA, and `select_engine_from_hir` used to return the
+/// PikeVM for every one of them. `\p{L}+` extracts to a single greedy codepoint
+/// step on the tagged path against ~481 instructions per byte of PikeVM thread
+/// bookkeeping, and `compile_with_jit` had been taking that path all along.
+///
+/// Asserted on the selection, not on the output: the PikeVM answers all of these
+/// correctly too, so no `find()` result distinguishes the two engines.
+#[test]
+fn codepoint_class_patterns_select_the_tagged_nfa() {
+    const CODEPOINT_CLASS_PATTERNS: &[&str] = &[
+        r"\p{L}+",
+        r"\p{N}{1,3}",
+        r"\P{L}+",
+        // The shape the cl100k tokenizer pattern is built from.
+        r"[^\r\n\p{L}\p{N}]?\p{L}+",
+    ];
+
+    for pattern in CODEPOINT_CLASS_PATTERNS {
+        let re = regexr::Regex::new(pattern).unwrap();
+        assert_eq!(
+            re.engine_name(),
+            "TaggedNfa",
+            "{pattern}: a codepoint class belongs on the tagged NFA, not the PikeVM"
+        );
+    }
+
+    // The engine change must not move the answers.
+    let re = regexr::Regex::new(r"\p{L}+").unwrap();
+    let spans: Vec<_> = re
+        .find_iter("ab \u{4e2d}\u{6587}1 \u{3b1}")
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(spans, vec![(0, 2), (3, 9), (11, 13)]);
+}
+
+/// The tagged route keeps the PikeVM as its own fallback.
+///
+/// Step extraction is budgeted (`MAX_EXTRACTED_STEPS`): an `Alt` copies every
+/// step after it into both branches, so k sequential alternation groups would
+/// emit ~2^k steps. Past the budget the extractor returns `None` and
+/// `TaggedNfaEngine` runs the PikeVM it constructs regardless — which is why
+/// routing codepoint classes here does not give up the linear bound. This pins
+/// both halves: that the pattern really does decline extraction, and that it
+/// still selects the tagged engine and answers correctly through the fallback.
+#[test]
+fn codepoint_class_pattern_declining_extraction_falls_back_to_the_pikevm() {
+    use regexr::hir::translate;
+    use regexr::nfa::tagged::StepExtractor;
+    use regexr::parser::parse;
+
+    // A codepoint class followed by 24 sequential alternation groups.
+    let groups = ["(?:ab|cd)", "(?:ef|gh)", "(?:ij|kl)", "(?:mn|op)"];
+    let mut pattern = String::from(r"\p{L}");
+    let mut haystack = String::from("x");
+    for i in 0..24 {
+        let group = groups[i % groups.len()];
+        pattern.push_str(group);
+        // The group's first branch, e.g. "ab" out of "(?:ab|cd)".
+        haystack.push_str(&group[3..5]);
+    }
+
+    let hir = parse(&pattern)
+        .and_then(|ast| translate(&ast))
+        .expect("pattern should compile");
+    let nfa = regexr::nfa::compile(&hir).expect("NFA should build");
+    assert!(
+        StepExtractor::new(&nfa).extract().is_none(),
+        "the fallback under test is only exercised while this shape declines extraction"
+    );
+
+    let re = regexr::Regex::new(&pattern).expect("pattern should compile");
+    assert_eq!(
+        re.engine_name(),
+        "TaggedNfa",
+        "declining extraction is the tagged engine's internal fallback, not a different selection"
+    );
+    assert_eq!(
+        re.find(&haystack).map(|m| (m.start(), m.end())),
+        Some((0, haystack.len())),
+        "the PikeVM fallback must still find the match"
+    );
+    assert!(!re.is_match("x ab cd ef gh"));
+}
+
 // =============================================================================
 // Byte-Wise Quantifiers Crossing Multi-Byte Codepoints
 // =============================================================================

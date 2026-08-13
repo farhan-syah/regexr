@@ -5,8 +5,10 @@ use crate::nfa::Nfa;
 use crate::vm::{is_shift_or_compatible, is_shift_or_wide_compatible};
 
 /// Recursively checks if an HIR expression contains UnicodeCpClass nodes.
-/// These require PikeVM because they use the CodepointClass instruction
-/// which does codepoint-level matching instead of byte-level DFA transitions.
+/// These rule out the byte-level engines because they use the CodepointClass
+/// instruction, which matches a whole codepoint (UTF-8 decode + range check)
+/// instead of taking byte-level DFA transitions. Only the tagged NFA and the
+/// PikeVM execute that instruction.
 fn hir_uses_codepoint_class(expr: &HirExpr) -> bool {
     match expr {
         HirExpr::UnicodeCpClass(_) => true,
@@ -176,6 +178,10 @@ pub fn hir_has_alternation(expr: &HirExpr) -> bool {
 pub enum EngineType {
     /// PikeVM - for patterns with lookarounds or non-greedy quantifiers.
     PikeVm,
+    /// Tagged NFA interpreter - for patterns using CodepointClass instructions,
+    /// which the byte-level engines cannot execute. Falls back internally to the
+    /// PikeVM when step extraction declines (see `select_engine_from_hir`).
+    TaggedNfa,
     /// BacktrackingVm - for patterns with backreferences (parity with BacktrackingJit).
     BacktrackingVm,
     /// Shift-Or - for small patterns (≤64 character positions).
@@ -220,18 +226,30 @@ pub fn select_engine_from_hir(hir: &Hir) -> EngineType {
         return EngineType::PikeVm;
     }
 
-    // Large Unicode classes that use CodepointClass instruction.
+    // Large Unicode classes that use the CodepointClass instruction.
     // CodepointClass does codepoint-level matching (UTF-8 decode + range check)
-    // instead of byte-level DFA transitions. LazyDFA cannot handle these -
-    // only PikeVM and TaggedNFA support CodepointClass instructions.
+    // instead of byte-level DFA transitions. LazyDFA and Shift-Or cannot run
+    // these patterns at all — only the PikeVM and the tagged NFA can.
     //
-    // The tagged NFA also handles them and is much faster on a simple class like
-    // `\p{L}+`, but its step interpreter backtracks: `\X{4}` (a grapheme cluster,
-    // which lowers to codepoint classes) does not terminate in reasonable time
-    // there. The PikeVM's linear bound is not worth trading for that, so the
-    // tagged NFA stays opt-in via `RegexBuilder::jit`.
+    // Of those two the tagged NFA is far the faster: `\p{L}+` extracts to a
+    // single greedy codepoint step, against the PikeVM's per-byte thread
+    // bookkeeping. It is also safe for any shape reaching here. The blow-up the
+    // tagged path can suffer is at *extraction* time, not match time — an `Alt`
+    // copies everything after it into each branch, so `\X{4}` (a grapheme
+    // cluster, which lowers to codepoint classes) would emit an exponential step
+    // program. `MAX_EXTRACTED_STEPS` (`nfa::tagged::steps`) caps that: extraction
+    // returns `None`, and `TaggedNfaEngine` then runs the PikeVM it constructs
+    // regardless. The linear bound is therefore kept exactly where it is needed,
+    // instead of being paid for on every codepoint class.
+    //
+    // Do not restore a blanket PikeVM route here. `compile_with_jit` has taken
+    // the tagged path for these patterns all along, and
+    // `tests/bounded_execution.rs`'s
+    // `repeated_grapheme_cluster_terminates_on_the_tagged_path` holds the
+    // grapheme-cluster shape that motivated the old route to a deadline on both
+    // build configurations.
     if hir_uses_codepoint_class(&hir.expr) {
-        return EngineType::PikeVm;
+        return EngineType::TaggedNfa;
     }
 
     // A word boundary guarding an empty match cannot be expressed by the DFA
