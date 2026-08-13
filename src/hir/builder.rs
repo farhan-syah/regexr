@@ -543,9 +543,6 @@ impl HirTranslator {
     /// above U+0080), returns an alternation of concatenations representing the
     /// valid byte sequences.
     fn translate_class(&mut self, class: &Class) -> Result<HirExpr> {
-        let mut byte_ranges: Vec<(u8, u8)> = Vec::new();
-        let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
-
         // Under `(?i)`, a character class matches all case variants of its members
         // (e.g. `(?i:[sdmt])` must match `M`). Single literals are folded in
         // `translate_literal`; classes are folded here by adding case-equivalent
@@ -605,34 +602,51 @@ impl HirTranslator {
             &class.ranges
         };
 
-        // Collect codepoint ranges for potential fast matching
-        let mut codepoint_ranges: Vec<(u32, u32)> = Vec::new();
+        // A negated class is built from the *complement* of its members, so the
+        // UTF-8 expansion of the members themselves is never used — computing it
+        // would be pure waste (`\p{L}` alone is 684 ranges pushed through
+        // `compile_utf8_range` and `optimize_sequences`, all of it discarded).
+        // The code points are needed either way, so both are gathered in one
+        // pass over `ranges`: splitting them into two passes costs a second walk
+        // of a list that is routinely several hundred entries long.
+        let negated = class.negated;
+        let mut codepoint_ranges: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        let mut byte_ranges: Vec<(u8, u8)> = Vec::new();
+        let mut utf8_sequences: Vec<Utf8Sequence> = Vec::new();
         for range in ranges {
             codepoint_ranges.push((range.start as u32, range.end as u32));
-            self.collect_class_ranges(range, &mut byte_ranges, &mut utf8_sequences);
+            if !negated {
+                self.collect_class_ranges(range, &mut byte_ranges, &mut utf8_sequences);
+            }
         }
 
-        // Sort and merge codepoint ranges
+        // Sort and merge codepoint ranges. This is the canonical, exact form of
+        // the class — every downstream consumer that needs code points takes it
+        // from here rather than re-deriving it.
         codepoint_ranges.sort_by_key(|r| r.0);
         let merged_codepoints = merge_codepoint_ranges(codepoint_ranges);
-
-        // Store for potential use by CodepointClassMatcher
-        self.current_class_codepoints = Some((merged_codepoints, class.negated));
-
-        // Sort and merge single-byte ranges
-        byte_ranges.sort_by_key(|r| r.0);
-        let merged_bytes = merge_byte_ranges(byte_ranges);
-
-        // Optimize multi-byte sequences
-        let optimized_seqs = optimize_sequences(utf8_sequences);
 
         // Whether this class is "large" is decided by how it actually lowers, not
         // by the mere presence of multi-byte members: the branches that emit a
         // codepoint node set the flag themselves. Setting it here as well would
         // push a class that lowered to a small trie off the DFA for no reason.
 
-        // Build the final expression
-        let expr = self.build_class_expr(merged_bytes, optimized_seqs, class.negated);
+        let expr = if negated {
+            self.build_negated_class_expr(&merged_codepoints)
+        } else {
+            // Sort and merge single-byte ranges
+            byte_ranges.sort_by_key(|r| r.0);
+            let merged_bytes = merge_byte_ranges(byte_ranges);
+
+            // Optimize multi-byte sequences
+            let optimized_seqs = optimize_sequences(utf8_sequences);
+
+            self.build_class_expr(merged_bytes, optimized_seqs, false)
+        };
+
+        // Store for potential use by CodepointClassMatcher
+        self.current_class_codepoints = Some((merged_codepoints, class.negated));
+
         Ok(expr)
     }
 
@@ -651,6 +665,44 @@ impl HirTranslator {
         );
     }
 
+    /// Builds the HIR for a negated character class from the exact code points
+    /// it excludes.
+    ///
+    /// The negated case only ever needs the *complement* of its members, so it
+    /// is built straight from the merged code-point ranges the class was parsed
+    /// into. That is both cheaper and more accurate than the route through
+    /// `build_class_expr`'s negated branch, which reconstructs the excluded set
+    /// by decoding UTF-8 sequences with `utf8_sequence_to_code_point_range`:
+    /// that decode takes the byte-range hull of a sequence, and once
+    /// `optimize_sequences` has merged two sequences on a byte position whose
+    /// successors are partial ranges, the hull is a strict *superset* of what
+    /// the sequence encodes. For a negated class a superset means excluding
+    /// characters the class never named.
+    ///
+    /// The three outcomes mirror `build_class_expr` exactly, including their
+    /// order: an all-ASCII excluded set complements within ASCII (equivalent to
+    /// that function's "no multi-byte sequences" test, since only ASCII code
+    /// points ever reach its `byte_ranges`), otherwise the complement is lowered
+    /// to a byte trie, and otherwise the class becomes a code-point node.
+    fn build_negated_class_expr(&mut self, excluded: &[(u32, u32)]) -> HirExpr {
+        if excluded.iter().all(|&(_, hi)| hi <= 0x7f) {
+            let ascii: Vec<(u8, u8)> = excluded
+                .iter()
+                .map(|&(lo, hi)| (lo as u8, hi as u8))
+                .collect();
+            let surviving_ascii = merge_byte_ranges(complement_within_ascii(&ascii));
+            return self.build_ascii_or_non_ascii(surviving_ascii);
+        }
+
+        if let Some(expr) = self.lower_complement_to_bytes(excluded) {
+            return expr;
+        }
+
+        // Mark as large unicode class for engine selection.
+        self.props.has_large_unicode_class = true;
+        HirExpr::UnicodeCpClass(CodepointClass::new(excluded.to_vec(), true))
+    }
+
     /// Builds the final HIR expression for a character class.
     fn build_class_expr(
         &mut self,
@@ -659,6 +711,12 @@ impl HirTranslator {
         negated: bool,
     ) -> HirExpr {
         // If negated and we have multi-byte sequences, compute the complement.
+        //
+        // Reached only from `translate_ranges_to_hir`, i.e. the Unicode-mode
+        // negated Perl classes (`\S`, `\W`, `\D`, `\H`); `translate_class`
+        // takes `build_negated_class_expr` instead, which knows the exact
+        // excluded code points and does not have to decode them back out of
+        // the sequences.
         //
         // `[^\s<>]` and friends are worth lowering to bytes rather than taking
         // the codepoint node: the excluded set is small, so its complement is a
