@@ -80,6 +80,15 @@ pub struct CompiledRegex {
     /// candidate is then the literal, and the match begins that many bytes
     /// after it.
     prefix_offset: usize,
+    /// Whether [`CompiledRegex::find_from_with`] can skip straight to
+    /// [`EagerDfa::find_from_simple`].
+    ///
+    /// Set only where a `CompiledInner::EagerDfa` is built (`compile_from_hir`)
+    /// and only when there is no prefilter to consult and the DFA takes the
+    /// plain unanchored loop — see [`EagerDfa::is_simple_scan`]. Every other
+    /// engine leaves this `false` and keeps the generic dispatch chain, which
+    /// remains the only path that can answer for them.
+    simple_eager_scan: bool,
     /// Fallback NFA for captures when using Shift-Or or LazyDfa.
     /// Populated at construction (or left permanently `None` for engines that
     /// extract captures themselves) — the `RwLock` exists for interior mutability
@@ -442,12 +451,58 @@ impl CompiledRegex {
         if from > input.len() {
             return None;
         }
-        // A match never starts inside a codepoint. Byte-level constructs (`.`,
-        // byte classes) can match a single continuation byte, so an engine
-        // scanning start positions will happily report one; the PikeVM and the
-        // tagged NFA already refuse those starts, and this makes the rest agree.
-        // Rejecting a match and resuming one byte later converges on the
-        // leftmost match that does start at a boundary.
+        // Iteration pays the generic chain below — a prefilter test, a 12-arm
+        // engine dispatch and the anchor re-checks inside `EagerDfa::find_from`
+        // — once per match, all of it invariant for the whole search. When the
+        // flag says those questions are already answered, go straight to the
+        // scan loop; the codepoint-boundary rule below still applies, so it is
+        // repeated here rather than falling back into the generic path for the
+        // retry.
+        if self.simple_eager_scan {
+            if let CompiledInner::EagerDfa(eager, _) = &self.inner {
+                return Self::find_from_simple_scan(eager, input, from);
+            }
+        }
+        self.find_from_generic(input, from, dfa)
+    }
+
+    /// The straight-line scan for [`CompiledRegex::find_from_with`]'s
+    /// specialized case.
+    ///
+    /// Kept in its own frame rather than inlined beside the generic loop: the
+    /// two share nothing, and merging them makes one frame whose register and
+    /// spill pressure is the union of both, which costs the generic path
+    /// measurably even though it never executes this.
+    fn find_from_simple_scan(
+        eager: &EagerDfa,
+        input: &[u8],
+        from: usize,
+    ) -> Option<(usize, usize)> {
+        let mut from = from;
+        loop {
+            let (start, end) = eager.find_from_simple(input, from)?;
+            if crate::nfa::is_utf8_boundary(input, start) {
+                return Some((start, end));
+            }
+            from = start + 1;
+        }
+    }
+
+    /// The engine-agnostic search, for every case
+    /// [`CompiledRegex::find_from_with`] does not specialize.
+    ///
+    /// A match never starts inside a codepoint. Byte-level constructs (`.`,
+    /// byte classes) can match a single continuation byte, so an engine
+    /// scanning start positions will happily report one; the PikeVM and the
+    /// tagged NFA already refuse those starts, and this makes the rest agree.
+    /// Rejecting a match and resuming one byte later converges on the leftmost
+    /// match that does start at a boundary.
+    fn find_from_generic(
+        &self,
+        input: &[u8],
+        from: usize,
+        mut dfa: Option<&mut LazyDfa>,
+    ) -> Option<(usize, usize)> {
         let mut from = from;
         loop {
             let (start, end) = self.find_from_inner(input, from, dfa.as_deref_mut())?;
@@ -1024,6 +1079,7 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
         inner,
         prefilter: Prefilter::None, // Can't extract literals from NFA
         prefix_offset: 0,
+        simple_eager_scan: false,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1052,6 +1108,7 @@ fn compile_tagged_nfa_interp(hir: &Hir, nfa: Nfa) -> CompiledRegex {
         inner: CompiledInner::TaggedNfaInterp(TaggedNfaEngine::new(nfa)),
         prefilter,
         prefix_offset: literals.prefix_offset,
+        simple_eager_scan: false,
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1075,6 +1132,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             )),
             prefilter: Prefilter::None,
             prefix_offset: 0,
+            simple_eager_scan: false,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1271,10 +1329,19 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         None
     };
 
+    // The only place an `EagerDfa` is built, and so the only place the
+    // specialized scan can apply: it needs the prefilter out of the way (no
+    // candidates to consult, nothing to translate) and a DFA whose search is
+    // the plain unanchored loop.
+    let simple_eager_scan = prefilter.is_none()
+        && literals.prefix_offset == 0
+        && matches!(&inner, CompiledInner::EagerDfa(dfa, _) if dfa.is_simple_scan());
+
     Ok(CompiledRegex {
         inner,
         prefilter,
         prefix_offset: literals.prefix_offset,
+        simple_eager_scan,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1305,6 +1372,7 @@ pub fn compile_with_pikevm(hir: &Hir) -> Result<CompiledRegex> {
         inner: CompiledInner::PikeVm(PikeVm::new(nfa)),
         prefilter,
         prefix_offset: literals.prefix_offset,
+        simple_eager_scan: false,
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1334,6 +1402,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             )),
             prefilter: Prefilter::None,
             prefix_offset: 0,
+            simple_eager_scan: false,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1396,6 +1465,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
                     prefix_offset: literals.prefix_offset,
+                    simple_eager_scan: false,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1432,6 +1502,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::Backtracking(jit_regex),
                     prefilter,
                     prefix_offset: literals.prefix_offset,
+                    simple_eager_scan: false,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1452,6 +1523,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
                     prefilter,
                     prefix_offset: literals.prefix_offset,
+                    simple_eager_scan: false,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1481,6 +1553,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::TaggedNfaJit(engine),
                     prefilter,
                     prefix_offset: literals.prefix_offset,
+                    simple_eager_scan: false,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1526,6 +1599,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             inner: CompiledInner::BacktrackingVm(BacktrackingVm::new(hir)),
             prefilter: Prefilter::from_literals(&literals),
             prefix_offset: literals.prefix_offset,
+            simple_eager_scan: false,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1626,6 +1700,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                         inner: CompiledInner::JitShiftOr(jit_shift_or),
                         prefilter,
                         prefix_offset: literals.prefix_offset,
+                        simple_eager_scan: false,
                         capture_nfa: RwLock::new(capture_nfa),
                         one_pass: OnceLock::new(),
                         capture_vm: RwLock::new(None),
@@ -1662,6 +1737,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     inner: CompiledInner::Jit(jit_regex),
                     prefilter,
                     prefix_offset: literals.prefix_offset,
+                    simple_eager_scan: false,
                     capture_nfa: RwLock::new(capture_nfa),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),

@@ -268,6 +268,17 @@ impl EagerDfa {
         self.has_multiline_anchors
     }
 
+    /// Returns whether searches on this DFA take the plain unanchored loop —
+    /// the one branch of [`EagerDfa::find_from`] that is unmetered and needs
+    /// neither a start-state choice nor a per-attempt anchor check.
+    ///
+    /// This is the precondition of [`EagerDfa::find_from_simple`]. An end
+    /// anchor is allowed: it is handled inside the attempt itself.
+    #[inline]
+    pub fn is_simple_scan(&self) -> bool {
+        !self.has_start_anchor && !self.has_word_boundary && !self.has_multiline_anchors
+    }
+
     /// Finds the first match in the input, returning (start, end).
     ///
     /// `Err` means the unanchored search gave up on its scan budget; see
@@ -356,6 +367,25 @@ impl EagerDfa {
             }
             Ok(None)
         }
+    }
+
+    /// [`EagerDfa::find_from`]'s unanchored branch, specialized.
+    ///
+    /// Only valid when [`EagerDfa::is_simple_scan`] holds, which is exactly the
+    /// `else` branch above: no start anchor to re-check per attempt, no word
+    /// boundary — so `start_state_at` is `self.start` unconditionally and
+    /// `find_at` always dispatches to `find_at_fast` — and therefore no scan
+    /// budget either, which is why the return type is a plain `Option`.
+    ///
+    /// The caller guarantees `from <= input.len()`.
+    #[inline]
+    pub fn find_from_simple(&self, input: &[u8], from: usize) -> Option<(usize, usize)> {
+        for start_pos in from..=input.len() {
+            if let Some(end) = self.find_at_fast(input, start_pos, self.start) {
+                return Some((start_pos, end));
+            }
+        }
+        None
     }
 
     /// Picks the start state for an attempt beginning at `start`, from the
