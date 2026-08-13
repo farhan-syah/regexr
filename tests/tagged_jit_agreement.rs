@@ -12,7 +12,10 @@
 use regexr::{Regex, RegexBuilder};
 
 /// Shapes that reach `PatternStep::GreedyPlusLookahead` / `GreedyStarLookahead`,
-/// plus the adjacent-greedy shapes that must stay deferred.
+/// plus the adjacent-greedy shapes that must stay deferred, plus lookbehind over
+/// classes with more than one candidate width — the JIT emits one attempt per
+/// candidate there, and picking the wrong one returns wrong spans rather than
+/// failing loudly.
 const PATTERNS: &[&str] = &[
     r"[\r\n]+(?=\S)",
     r"\S+\S+\S",
@@ -46,6 +49,33 @@ const PATTERNS: &[&str] = &[
     r"a+(?!\S)",
     r"a+(?=\S)",
     r"\w+(?!\p{L})",
+    // Lookbehind, both polarities, over classes whose members encode to more
+    // than one UTF-8 width. The JIT emits one attempt per candidate total, so
+    // these are the shapes where picking the wrong width — or ordering the
+    // attempts wrongly, or short-circuiting the negative case on the first
+    // failing width — returns wrong spans rather than crashing.
+    r"(?<=\s)\w+",
+    r"(?<!\s)\w+",
+    r"(?<=\p{L})x",
+    r"(?<!\p{L})x",
+    r"(?<=\s)x",
+    r"(?<=\p{L})\w",
+    // A class spanning all four UTF-8 widths: 'a', Cyrillic 'а', CJK '中',
+    // emoji '😀' — four candidate widths, so four attempts.
+    "(?<=[a\u{430}\u{4e2d}\u{1F600}])x",
+    "(?<![a\u{430}\u{4e2d}\u{1F600}])x",
+    // Two candidate widths (1 for 'a', 2 for 'é') that can succeed against
+    // *different* bytes: on "aXb" the 2-byte attempt starts on the 'a', matches
+    // it as a 1-byte codepoint and stops one byte short of the assertion
+    // position. Only requiring the walk to land exactly on that position
+    // rejects it; an implementation that just runs out of steps reports a match
+    // the interpreter does not.
+    "(?<=[a\u{e9}])b",
+    "(?<![a\u{e9}])b",
+    // A multi-width class followed by a fixed byte, so the candidate totals
+    // (2 and 3) both sit above zero and the wrong one lands off by one.
+    "(?<=[a\u{e9}]x)y",
+    "(?<![a\u{e9}]x)y",
     // The tokenizer pattern this engine was built for.
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
 ];
@@ -90,6 +120,50 @@ const INPUTS: &[&str] = &[
     "e.aae00 a\u{4e2d}\u{4e2d}\n",
     "a\u{3000}",
     "MiXeD CaSe 42",
+    // A lookbehind is checked by walking forwards from `pos - width`, so a wrong
+    // width shows up as reading from the middle of the character *immediately
+    // before* the assertion position. Every input above puts its multi-byte
+    // characters at the end or next to each other, which never exercises that;
+    // these put one directly before the ASCII the assertion is anchored on, at
+    // each of the four UTF-8 widths.
+    "\u{430}x",
+    "\u{4e2d}x",
+    "\u{1F600}x",
+    "a\u{4e2d}x",
+    "\u{4e2d}\u{4e2d}x",
+    "x\u{4e2d}x\u{4e2d}",
+    // Multi-byte whitespace (ideographic space, NBSP) directly before word
+    // characters, which is the `\s` lookbehind case: widths 1, 2 and 3 for one
+    // class.
+    "\u{3000}word",
+    "a\u{a0}word b",
+    "\u{3000}x \u{a0}x x",
+    // 'é' (2 bytes) and 'a' (1 byte) before the assertion point, plus the
+    // one-byte-short case where a wrong candidate width can match unrelated
+    // bytes and stop early.
+    "\u{e9}b",
+    "ab",
+    "aXb",
+    "a\u{e9}b",
+    "\u{e9}\u{e9}b",
+    "\u{e9}xy",
+    "axy",
+    "aXxy",
+    "1x x \u{4e2d}x",
+    // The wrong-width trap for a class that really is compiled as a codepoint
+    // class (`\p{L}`, `\s`): the character before the assertion point does NOT
+    // satisfy it, but the one before *that* does. A wide candidate starts on the
+    // satisfying character, matches it at its own (narrower) length and stops a
+    // byte short of the assertion position, so only requiring the walk to land
+    // exactly on that position keeps these non-matches non-matching.
+    "a.x",
+    "ab.x",
+    "a x",
+    "1.x",
+    " .x",
+    "\u{4e2d}.x",
+    "\u{4e2d} x",
+    "\u{1F600}.x",
 ];
 
 #[test]
