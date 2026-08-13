@@ -646,3 +646,33 @@ fn nested_concat_in_lookahead_literal_extraction_terminates() {
         },
     );
 }
+
+// =============================================================================
+// Tagged-NFA step extraction does not cost exponential time on sequential
+// alternation groups
+// =============================================================================
+// `StepExtractor` (src/nfa/tagged/steps.rs) emits an `Alt` step whose branches
+// each carry a full copy of everything after the alternation. That is not just
+// explored exponentially, the *emitted program itself* is exponentially sized:
+// `k` sequential alternation groups produce ~2^k steps. Without a cap on the
+// extraction budget, `Regex::new` on a pattern with a lookaround (which forces
+// the tagged-NFA path) and enough sequential groups does not return in any
+// reasonable time - 24 groups measured at ~18s and ~16.7M emitted steps before
+// the fix. `MAX_EXTRACTED_STEPS` bounds that work by bailing out of extraction
+// early, which sends the pattern to the PikeVm instead: `Regex::new` returns
+// immediately, matching just costs more per search.
+
+#[test]
+fn pathological_sequential_alternations_do_not_blow_up_compile_time() {
+    bounded(
+        "pathological_sequential_alternations_do_not_blow_up_compile_time",
+        || {
+            let groups = ["(?:ab|cd)", "(?:ef|gh)", "(?:ij|kl)", "(?:mn|op)"];
+            let mut pattern = String::from("(?=a)");
+            for i in 0..32 {
+                pattern.push_str(groups[i % groups.len()]);
+            }
+            Regex::new(&pattern).expect("pattern is well-formed and must compile");
+        },
+    );
+}

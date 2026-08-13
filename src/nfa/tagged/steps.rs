@@ -437,15 +437,53 @@ fn count_step_kinds(steps: &[PatternStep]) -> StepKinds {
     counts
 }
 
+/// Upper bound on the number of NFA states the extractor may visit (and thus
+/// steps it may emit) while building a single step program.
+///
+/// The emitted program is not merely explored exponentially, it IS exponential:
+/// at an `Alt`, everything after the alternation is copied into every branch,
+/// so `k` sequential alternation groups (`(?:ab|cd)` repeated `k` times, as in
+/// tokenizer-style patterns gone pathological) produce a step program of size
+/// ~2^k. Left unbounded, a ~220-character pattern with 24 such groups costs
+/// ~18s and ~16.7M emitted `PatternStep`s just to build a program that is then
+/// thrown away. Above this cap, extraction gives up and returns `None`, which
+/// routes the pattern to the PikeVm — correct, just slower per search, and
+/// already the fallback this extractor uses for every other shape it declines.
+const MAX_EXTRACTED_STEPS: usize = 200_000;
+
 /// Extracts pattern steps from an NFA for fast matching.
 pub struct StepExtractor<'a> {
     nfa: &'a Nfa,
+    /// Remaining budget of states/steps this extraction may still spend. See
+    /// [`MAX_EXTRACTED_STEPS`]. `Cell` because the extraction methods take
+    /// `&self` (they thread a mutable `visited` slice instead of `&mut self`),
+    /// but every recursive call must observe and deplete the same budget.
+    budget: std::cell::Cell<usize>,
 }
 
 impl<'a> StepExtractor<'a> {
     /// Creates a new step extractor for the given NFA.
     pub fn new(nfa: &'a Nfa) -> Self {
-        Self { nfa }
+        Self {
+            nfa,
+            budget: std::cell::Cell::new(MAX_EXTRACTED_STEPS),
+        }
+    }
+
+    /// Charges one state visit against the extraction budget, returning
+    /// `false` once it is exhausted. Called at the top of every loop
+    /// iteration in `extract_from_state`, `extract_branch`, and
+    /// `extract_lookaround_steps` — including inside recursive `Alt` branch
+    /// extraction — so a pathologically-branching pattern is caught and
+    /// unwound while the program is still being built, not after.
+    fn charge(&self) -> bool {
+        let remaining = self.budget.get();
+        if remaining == 0 {
+            false
+        } else {
+            self.budget.set(remaining - 1);
+            true
+        }
     }
 
     /// Extracts pattern steps, returning None if pattern is too complex.
@@ -525,6 +563,13 @@ impl<'a> StepExtractor<'a> {
                 if iteration > 1000 {
                     return Vec::new();
                 }
+            }
+
+            // Extraction-budget check: see `MAX_EXTRACTED_STEPS`. Must fire
+            // before any work is done for this state, so a program that would
+            // blow the cap never finishes being built.
+            if !self.charge() {
+                return Vec::new();
             }
 
             if current as usize >= self.nfa.states.len() {
@@ -720,6 +765,15 @@ impl<'a> StepExtractor<'a> {
                 if iteration > 10000 {
                     return None;
                 }
+            }
+
+            // Extraction-budget check: see `MAX_EXTRACTED_STEPS`. This is the
+            // function alternation branches recurse through, so it is what
+            // catches the exponential case — the check fires before the
+            // recursive `Alt` branch calls that would otherwise double the
+            // work at every nested alternation.
+            if !self.charge() {
+                return None;
             }
 
             if current as usize >= self.nfa.states.len() {
@@ -975,6 +1029,13 @@ impl<'a> StepExtractor<'a> {
                 }
             }
 
+            // Extraction-budget check: see `MAX_EXTRACTED_STEPS`. Shares the
+            // same budget as the outer walk, since a lookaround interior is
+            // still part of the same extraction attempt.
+            if !self.charge() {
+                return Vec::new();
+            }
+
             if current as usize >= inner_nfa.states.len() {
                 return Vec::new();
             }
@@ -1132,6 +1193,12 @@ impl<'a> StepExtractor<'a> {
     /// This is simpler than lookahead extraction - it doesn't recognize GreedyStar/Plus
     /// because check_lookbehind uses fixed-length matching.
     /// Patterns with repetitions in lookbehind will return empty, causing fallback to PikeVM.
+    ///
+    /// Not charged against [`MAX_EXTRACTED_STEPS`]: unlike `extract_from_state` /
+    /// `extract_branch`, this walk never emits `PatternStep::Alt` or recurses into
+    /// a branch extractor — any epsilon fan-out it meets is rejected outright (see
+    /// the loop-back check below) rather than expanded — so it cannot itself
+    /// contribute to the exponential blowup the budget guards against.
     fn extract_lookbehind_steps(&self, inner_nfa: &Nfa) -> Vec<PatternStep> {
         // Same reason as `extract_lookaround_steps`: refuse a nested assertion
         // rather than silently dropping it.
@@ -1398,5 +1465,53 @@ mod fixed_byte_len_tests {
             fixed_byte_len(&[PatternStep::Byte(b'a'), PatternStep::Backref(1)]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod extraction_budget_tests {
+    use super::*;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn build_nfa(pattern: &str) -> Nfa {
+        let ast = parse(pattern).unwrap();
+        let hir = translate(&ast).unwrap();
+        crate::nfa::compile(&hir).unwrap()
+    }
+
+    // The real tiktoken split patterns (cl100k/o200k-style). Guarding these
+    // against `MAX_EXTRACTED_STEPS` matters: regexr backs a BPE tokenizer whose
+    // throughput depends on these specific patterns staying on the step-based
+    // fast path rather than falling back to the PikeVm. Reused verbatim from
+    // `tests/reference_conformance.rs`.
+    const CL100K: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    #[test]
+    fn tokenizer_patterns_stay_under_the_budget() {
+        for pattern in [CL100K, O200K] {
+            let nfa = build_nfa(pattern);
+            assert!(
+                StepExtractor::new(&nfa).extract().is_some(),
+                "extraction budget pushed a real tokenizer pattern to the PikeVm fallback: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn pathological_sequential_alternations_are_declined_not_built() {
+        // (?=a) + k sequential alternation groups. Each group duplicates every
+        // step after it into both branches, so unbounded extraction is ~2^k
+        // steps. Comfortably above `MAX_EXTRACTED_STEPS`, this must decline
+        // (`None`) rather than spend seconds building a multi-million-step
+        // program that is then discarded.
+        let groups = ["(?:ab|cd)", "(?:ef|gh)", "(?:ij|kl)", "(?:mn|op)"];
+        let mut pattern = String::from("(?=a)");
+        for i in 0..24 {
+            pattern.push_str(groups[i % groups.len()]);
+        }
+        let nfa = build_nfa(&pattern);
+        assert!(StepExtractor::new(&nfa).extract().is_none());
     }
 }
