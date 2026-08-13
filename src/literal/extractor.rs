@@ -380,6 +380,22 @@ impl LiteralExtractor {
                 // un-extracted `(b)`; splicing "c" on would claim the pattern
                 // starts with "ac", which it never does, and the prefilter would
                 // then find no candidates and report no match at all.
+                // If the extend-loop below bails out on a non-literal element,
+                // remember which node it was and what `extract` returned for
+                // it. The trailing-element check further down often lands on
+                // that exact same node (e.g. a `[Literal, Tail]` concat where
+                // `Tail` is both "the element that stopped extension" and
+                // "the last element") and would otherwise walk it a second
+                // time, which is what makes deeply nested concats like
+                // `a(?:a(?:a...)))` exponential.
+                //
+                // The pointer is only ever compared for identity (`ptr::eq`)
+                // below, never dereferenced, and it does not outlive this
+                // match arm's borrow of `exprs` - both `expr` and
+                // `actual_last` are references into the same `exprs` slice
+                // for the lifetime of this call.
+                let mut break_node: Option<(*const HirExpr, ExtractionResult)> = None;
+
                 if result.complete && !result.has_nullable_suffix {
                     // Try to extend prefixes with subsequent literals
                     for expr in &exprs[start_idx + 1..] {
@@ -414,6 +430,7 @@ impl LiteralExtractor {
                             if sub.has_nullable_suffix {
                                 result.has_nullable_suffix = true;
                             }
+                            break_node = Some((expr as *const HirExpr, sub));
                             break;
                         }
                     }
@@ -436,7 +453,22 @@ impl LiteralExtractor {
                         .find(|e| !matches!(e, HirExpr::Anchor(_)))
                         .unwrap_or(last);
 
-                    let last_result = self.extract(actual_last);
+                    let actual_last_ptr: *const HirExpr = actual_last;
+                    let last_result = match break_node {
+                        // Reusing `sub_result` is sound because `extract` is
+                        // a pure function of `expr` (see module-level notes
+                        // in the PR/report): `self` carries only the two
+                        // `usize` limits set once in `new()`, and `extract`
+                        // never mutates the tree or clones nodes, so calling
+                        // it twice on the same `&HirExpr` reference is
+                        // guaranteed to reproduce the exact same result.
+                        // Matched by value (not `&break_node`) since
+                        // `break_node` is not read again after this, so the
+                        // already-computed result can be moved out instead
+                        // of cloned.
+                        Some((ptr, sub_result)) if std::ptr::eq(ptr, actual_last_ptr) => sub_result,
+                        _ => self.extract(actual_last),
+                    };
                     if last_result.has_nullable_suffix {
                         result.has_nullable_suffix = true;
                     }
@@ -457,23 +489,31 @@ impl LiteralExtractor {
                 let mut all_complete = true;
                 let mut any_nullable_suffix = false;
 
+                // Branches already extracted by this loop, in order. Passed
+                // to `extract_common_prefix` on either bail-out below so it
+                // never re-walks a branch this loop already walked - only
+                // the not-yet-extracted branches are new work there.
+                let mut done: Vec<ExtractionResult> = Vec::with_capacity(exprs.len());
+
                 for expr in exprs {
                     let sub_result = self.extract(expr);
 
                     if sub_result.prefixes.is_empty() {
                         // One branch has no prefix - can't use multi-prefix
                         // Try to find common prefix instead
-                        return self.extract_common_prefix(exprs);
+                        done.push(sub_result);
+                        return self.extract_common_prefix(exprs, done);
                     }
 
                     all_complete = all_complete && sub_result.complete;
                     any_nullable_suffix = any_nullable_suffix || sub_result.has_nullable_suffix;
-                    all_prefixes.extend(sub_result.prefixes);
+                    all_prefixes.extend(sub_result.prefixes.clone());
+                    done.push(sub_result);
 
                     // Check if we've exceeded the limit
                     if all_prefixes.len() > self.max_prefixes {
                         // Too many prefixes - fall back to common prefix
-                        return self.extract_common_prefix(exprs);
+                        return self.extract_common_prefix(exprs, done);
                     }
                 }
 
@@ -524,10 +564,31 @@ impl LiteralExtractor {
     }
 
     /// Extracts the common prefix from alternation branches.
-    fn extract_common_prefix(&mut self, exprs: &[HirExpr]) -> ExtractionResult {
+    ///
+    /// `done` holds the `ExtractionResult`s the `Alt` arm's own loop already
+    /// computed, in branch order, for `exprs[..done.len()]` - including the
+    /// branch that triggered the bail-out into this function. Only the
+    /// remaining `exprs[done.len()..]` are walked here, so no branch is ever
+    /// extracted twice (walking every branch from scratch here as well as in
+    /// the caller was the second exponential-blowup site).
+    fn extract_common_prefix(
+        &mut self,
+        exprs: &[HirExpr],
+        done: Vec<ExtractionResult>,
+    ) -> ExtractionResult {
         let mut all_prefixes: Vec<Vec<u8>> = Vec::new();
+        let done_len = done.len();
 
-        for expr in exprs {
+        // `done` is owned and not read again after this loop, so its
+        // prefixes can be moved into `all_prefixes` instead of cloned.
+        for sub_result in done {
+            if sub_result.prefixes.is_empty() {
+                return ExtractionResult::default();
+            }
+            all_prefixes.extend(sub_result.prefixes);
+        }
+
+        for expr in &exprs[done_len..] {
             let sub_result = self.extract(expr);
             if sub_result.prefixes.is_empty() {
                 return ExtractionResult::default();
@@ -830,5 +891,79 @@ mod tests {
         let lits = get_literals("hello[0-9]+");
         assert_eq!(lits.prefixes.len(), 1);
         assert_eq!(lits.prefixes[0], b"hello");
+    }
+
+    /// The exact `Concat` doubling shape that used to make `extract` cost
+    /// `T(depth) = 2*T(depth-1)`: every level is `[Literal, Tail]`, and
+    /// `Tail` is both the element that stops the extend-loop and the
+    /// trailing-element check's `actual_last`.
+    ///
+    /// Hand-traced against the algorithm: `a` chars never merge into one
+    /// `Literal` node (each is its own single-char `HirExpr::Literal`, see
+    /// the HIR builder's 1:1 `Concat` translation), so nesting one level
+    /// gives `Concat[Literal(a), Concat[Literal(a), Concat[Literal(a),
+    /// Literal(b)]]]`. The innermost `Concat[Literal(a), Literal(b)]`
+    /// extracts and extends to `"ab"`, complete. One level up, the
+    /// extend-loop's first (and only) non-anchor sibling is that whole
+    /// inner `Concat` — not a `Literal` — so it stops extension immediately
+    /// without folding "ab" in; the prefix stays `"a"` and `complete`
+    /// becomes `false` because the trailing element is neither complete nor
+    /// a literal. That same one-`Literal`-then-stop shape repeats at every
+    /// level, so the outermost prefix is `"a"`, incomplete, all the way out.
+    #[test]
+    fn test_concat_doubling_shape_extracts_leading_literal_only() {
+        let lits = get_literals(r"a(?:a(?:ab))");
+        assert_eq!(lits.prefixes, vec![b"a".to_vec()]);
+        assert!(!lits.prefix_complete);
+    }
+
+    /// The exact `Alt` doubling shape that used to make `extract_common_prefix`
+    /// re-walk branches its caller had already extracted: a `\d` branch (no
+    /// literal prefix) forces the bail-out at every nesting level, and the
+    /// other branch is itself a nested alternation with the same shape.
+    ///
+    /// Hand-traced: `(a|\d)` is `Alt[Literal(a), Class(0x30..=0x39)]` (`a` is
+    /// a literal, `\d` in ASCII mode is a digit class — not a literal), and
+    /// a non-capturing group adds no wrapper node, but `(a|(a|\d))` uses
+    /// *capturing* groups (no `?:`), so it is `Capture(Alt[Literal(a),
+    /// Capture(Alt[Literal(a), Class(digit)])])`. `Capture` is transparent
+    /// to `extract`. At the inner `Alt`, the `\d` branch's `Class` extracts
+    /// to an empty-prefix `ExtractionResult`, which immediately bails the
+    /// whole inner `Alt` to `ExtractionResult::default()` (empty prefixes) —
+    /// `find_common_prefix` never runs because the fallback path returns
+    /// `default()` as soon as any one branch has no prefix at all, before
+    /// trying to find a common one. That empty result then makes the outer
+    /// `Alt`'s second branch empty too, which bails the outer `Alt` to
+    /// `default()` the same way. So the whole pattern extracts no prefix at
+    /// any level.
+    #[test]
+    fn test_alt_doubling_shape_has_no_prefix() {
+        let lits = get_literals(r"(a|(a|\d))");
+        assert!(lits.prefixes.is_empty());
+        assert!(!lits.prefix_complete);
+    }
+
+    /// The Concat variant that must NOT double, and must keep behaving
+    /// exactly as before the fix: siblings follow the non-literal element
+    /// that stops the extend-loop, so the loop's break node (`[0-9]`) and
+    /// the trailing-element check's `actual_last` (`c`) are different
+    /// nodes — `ptr::eq` returns false and `actual_last` is extracted fresh,
+    /// same as pre-fix.
+    ///
+    /// Hand-traced: `a[0-9]bc` is `Concat[Literal(a), Class(0-9), Literal(b),
+    /// Literal(c)]`. The extend-loop extracts `"a"`, then meets `[0-9]` and
+    /// stops (not a literal), leaving the prefix at `"a"` with `complete`
+    /// already `false`; `Literal(b)` and `Literal(c)` are never visited by
+    /// that loop, matching the pre-fix `break` semantics. The
+    /// trailing-element check walks back from the end past no anchors,
+    /// lands on `Literal(c)` — a different node from the break's `[0-9]` —
+    /// extracts it fresh (`"c"`, complete), and since it's a complete
+    /// literal the completeness check does not re-flip `complete`, which
+    /// was already `false`.
+    #[test]
+    fn test_concat_break_then_trailing_literal_does_not_double() {
+        let lits = get_literals(r"a[0-9]bc");
+        assert_eq!(lits.prefixes, vec![b"a".to_vec()]);
+        assert!(!lits.prefix_complete);
     }
 }

@@ -571,3 +571,78 @@ fn nesting_just_under_the_limit_still_compiles() {
         Regex::new(&pattern).expect("nesting one under the limit must compile");
     });
 }
+
+// =============================================================================
+// Literal extraction does not cost exponential time on deeply nested patterns
+// =============================================================================
+// `LiteralExtractor::extract` walks the HIR once per `Regex::new`. Two sites
+// used to walk the same subtree twice: the `Concat` arm's extend-loop and its
+// trailing-element check can land on the same node, and the `Alt` arm's
+// bail-out into `extract_common_prefix` used to re-walk every branch from
+// scratch, including the ones its own loop had already extracted. Either one
+// gives `T(depth) = 2*T(depth-1)`, which crosses into "does not return"
+// around depth 40-60 - well under the parser's 250-level nesting cap, so a
+// pattern the parser happily accepts could still hang `Regex::new` itself,
+// before any matching happens.
+//
+// Each case nests to depth 60: comfortably past the exponential crossover,
+// comfortably under `DEFAULT_NEST_LIMIT`. Exponential behaviour hangs and
+// trips the harness deadline; linear behaviour returns instantly.
+
+/// Nesting depth for the extractor-doubling cases: past the exponential
+/// crossover, under the parser's nesting cap.
+const EXTRACTOR_DOUBLING_DEPTH: usize = 60;
+
+/// `a(?:a(?:a(?:...(?:ab)...)))` - the `Concat` shape that doubles: every
+/// level is a two-element `Concat[Literal, Tail]`, exactly the shape where
+/// the extend-loop's break node and the trailing-element check's
+/// `actual_last` are the same node.
+fn nested_concat_doubling_pattern(depth: usize) -> String {
+    format!("{}ab{}", "a(?:".repeat(depth), ")".repeat(depth))
+}
+
+/// Nested `(?:a...|\d)` alternations - the `Alt` shape that doubles: at
+/// every level the `\d` branch has no literal prefix and forces a bail into
+/// `extract_common_prefix`, which used to re-walk every branch - including
+/// the nested alternation in the other branch - from scratch.
+fn nested_alt_doubling_pattern(depth: usize) -> String {
+    let mut pattern = String::from(r"\d");
+    for _ in 0..depth {
+        pattern = format!(r"(?:a{pattern}|\d)");
+    }
+    pattern
+}
+
+#[test]
+fn nested_concat_literal_extraction_terminates() {
+    bounded("nested_concat_literal_extraction_terminates", || {
+        let pattern = nested_concat_doubling_pattern(EXTRACTOR_DOUBLING_DEPTH);
+        Regex::new(&pattern).expect("well under the nesting cap, must compile");
+    });
+}
+
+#[test]
+fn nested_alt_literal_extraction_terminates() {
+    bounded("nested_alt_literal_extraction_terminates", || {
+        let pattern = nested_alt_doubling_pattern(EXTRACTOR_DOUBLING_DEPTH);
+        Regex::new(&pattern).expect("well under the nesting cap, must compile");
+    });
+}
+
+/// `required_literal`'s `Lookaround` arm (`src/literal/extractor.rs:601-606`)
+/// reaches `LiteralExtractor::extract` on the lookahead's inner expression
+/// directly, independent of the top-level prefix extraction - the outer
+/// `x(?=...)` concat never doubles on its own (a lookaround is zero-width, so
+/// the extend-loop `continue`s past it rather than breaking on it), so this
+/// isolates that call path from the one the two cases above already cover.
+#[test]
+fn nested_concat_in_lookahead_literal_extraction_terminates() {
+    bounded(
+        "nested_concat_in_lookahead_literal_extraction_terminates",
+        || {
+            let inner = nested_concat_doubling_pattern(EXTRACTOR_DOUBLING_DEPTH);
+            let pattern = format!("x(?={inner})");
+            Regex::new(&pattern).expect("well under the nesting cap, must compile");
+        },
+    );
+}
