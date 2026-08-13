@@ -41,12 +41,11 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, mut bytes: &[u8]) {
-        // Generic fallback for types that hash raw bytes (e.g. derived `Hash`
-        // impls that go through `write` instead of the `write_u*` methods).
-        // Not the hot path for this crate's actual call sites, but must stay
-        // correct: `StateKey` derives `Hash` over a `BTreeSet<u32>` and a
-        // `CharClass` enum, and other `Hash` impls are free to route through
-        // here.
+        // Bulk path for types that hash raw bytes rather than going through the
+        // `write_u*` methods. `StateKey` derives `Hash` over an `Arc<[u32]>`
+        // and a `CharClass` enum, and slices of integers hash their elements as
+        // one byte run, so this is where the DFA state map's keys are actually
+        // mixed — two state ids per `add` instead of one.
         while bytes.len() >= 8 {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&bytes[..8]);

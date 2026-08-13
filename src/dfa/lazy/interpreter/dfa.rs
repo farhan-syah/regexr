@@ -28,10 +28,11 @@ use std::sync::Arc;
 use crate::nfa::{Nfa, NfaInstruction, StateId as NfaStateId};
 
 use super::super::shared::{
-    epsilon_closure_with_context, flush_cache, get_or_create_state_with_class, is_dead_state,
-    is_tagged_match, is_unknown_state, match_reachable_without_end_assertion, state_index,
-    tag_state, untag_state, CacheCeilingExceeded, CharClass, DfaStateId, LazyDfaContext,
-    PositionContext, DEAD_STATE, SCAN_BUDGET_FACTOR, UNKNOWN_STATE,
+    epsilon_closure_subset, epsilon_closure_with_context, flush_cache,
+    get_or_create_state_with_class, is_dead_state, is_tagged_match, is_unknown_state,
+    match_reachable_without_end_assertion, state_index, tag_state, untag_state,
+    CacheCeilingExceeded, CharClass, DfaStateId, LazyDfaContext, NfaSubset, PositionContext,
+    DEAD_STATE, SCAN_BUDGET_FACTOR, UNKNOWN_STATE,
 };
 
 /// A lazy DFA that builds states on demand.
@@ -205,7 +206,9 @@ impl LazyDfa {
 
         let state_idx = state_index(state);
         let dfa_state = self.ctx.states.get(state_idx)?;
-        let nfa_states = dfa_state.nfa_states.clone();
+        // Refcount bump, and it releases the borrow of `self.ctx.states` so the
+        // closure walk below can borrow the scratch mutably.
+        let nfa_states = Arc::clone(&dfa_state.nfa_states);
         let prev_class = dfa_state.prev_class;
 
         let curr_class = CharClass::from_byte(byte);
@@ -222,15 +225,21 @@ impl LazyDfa {
             None
         };
 
-        let expanded_nfa_states = if self.ctx.has_word_boundary || self.ctx.has_anchors {
-            epsilon_closure_with_context(&self.ctx.nfa, &nfa_states, is_at_boundary, pos_ctx)
+        let expanded_nfa_states: NfaSubset = if self.ctx.has_word_boundary || self.ctx.has_anchors {
+            epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                &nfa_states[..],
+                is_at_boundary,
+                pos_ctx,
+            )
         } else {
             nfa_states
         };
 
         let mut next_states = BTreeSet::new();
 
-        for &nfa_state in &expanded_nfa_states {
+        for &nfa_state in expanded_nfa_states.iter() {
             if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
                 for (range, target) in &nfa_s.transitions {
                     if range.contains(byte) {
@@ -260,9 +269,15 @@ impl LazyDfa {
         };
 
         let next_closure = if self.ctx.has_word_boundary || self.ctx.has_anchors {
-            epsilon_closure_with_context(&self.ctx.nfa, &next_states, None, target_pos_ctx)
+            epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                &next_states,
+                None,
+                target_pos_ctx,
+            )
         } else {
-            self.ctx.nfa.epsilon_closure(&next_states)
+            epsilon_closure_subset(&self.ctx.nfa, &mut self.ctx.scratch, &next_states)
         };
 
         if next_closure.is_empty() {
@@ -272,8 +287,11 @@ impl LazyDfa {
             return None;
         }
 
+        // Safe to reuse the scratch: `next_closure` is already an owned subset,
+        // independent of the buffer it was built in.
         let next_clean = match_reachable_without_end_assertion(
             &self.ctx.nfa,
+            &mut self.ctx.scratch,
             &next_states,
             None,
             target_pos_ctx,
@@ -400,13 +418,13 @@ impl LazyDfa {
     ) {
         let state_idx = state_index(state);
         let nfa_states = match self.ctx.states.get(state_idx) {
-            Some(s) => s.nfa_states.clone(),
+            Some(s) => Arc::clone(&s.nfa_states),
             None => return,
         };
 
         let mut byte_targets: [Option<Vec<NfaStateId>>; 256] = std::array::from_fn(|_| None);
 
-        for &nfa_state in &nfa_states {
+        for &nfa_state in nfa_states.iter() {
             if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
                 for (range, target) in &nfa_s.transitions {
                     for byte in range.start..=range.end {
@@ -442,7 +460,8 @@ impl LazyDfa {
                     continue;
                 }
 
-                let next_closure = self.ctx.nfa.epsilon_closure(targets);
+                let next_closure =
+                    epsilon_closure_subset(&self.ctx.nfa, &mut self.ctx.scratch, targets);
                 if next_closure.is_empty() {
                     if cache_idx < self.ctx.transitions.len() {
                         self.ctx.transitions[cache_idx] = DEAD_STATE;
@@ -450,8 +469,13 @@ impl LazyDfa {
                     continue;
                 }
 
-                let next_clean =
-                    match_reachable_without_end_assertion(&self.ctx.nfa, targets, None, None);
+                let next_clean = match_reachable_without_end_assertion(
+                    &self.ctx.nfa,
+                    &mut self.ctx.scratch,
+                    targets,
+                    None,
+                    None,
+                );
                 let flushes_before = self.ctx.flush_count;
                 let next_id = get_or_create_state_with_class(
                     &mut self.ctx,
@@ -516,9 +540,10 @@ impl LazyDfa {
         // byte's own character class selects.
         let mut byte_targets: [Option<Vec<NfaStateId>>; 256] = std::array::from_fn(|_| None);
         {
-            let nfa = &self.ctx.nfa;
+            // Refcount bump rather than a borrow of `self.ctx.states`, so the
+            // walks below can take `self.ctx.scratch` mutably.
             let seeds = match self.ctx.states.get(state_idx) {
-                Some(s) => &s.nfa_states,
+                Some(s) => Arc::clone(&s.nfa_states),
                 None => return,
             };
 
@@ -527,22 +552,31 @@ impl LazyDfa {
             } else {
                 None
             };
+            // Read out by value: a closure capturing `self.ctx` would collide
+            // with the mutable borrow of the scratch.
+            let has_word_boundary = self.ctx.has_word_boundary;
             let boundary = |curr_class: CharClass| {
-                if self.ctx.has_word_boundary {
+                if has_word_boundary {
                     Some(prev_class != curr_class)
                 } else {
                     None
                 }
             };
 
-            let expanded_non_word =
-                epsilon_closure_with_context(nfa, seeds, boundary(CharClass::NonWord), pos_ctx);
+            let expanded_non_word = epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                &seeds[..],
+                boundary(CharClass::NonWord),
+                pos_ctx,
+            );
             // Without `\b`/`\B` the boundary answer is `None` either way, so the
             // two classes share one expansion.
-            let expanded_word = if self.ctx.has_word_boundary {
+            let expanded_word = if has_word_boundary {
                 Some(epsilon_closure_with_context(
-                    nfa,
-                    seeds,
+                    &self.ctx.nfa,
+                    &mut self.ctx.scratch,
+                    &seeds[..],
                     boundary(CharClass::Word),
                     pos_ctx,
                 ))
@@ -555,8 +589,8 @@ impl LazyDfa {
                 (CharClass::NonWord, &expanded_non_word),
                 (CharClass::Word, expanded_word_ref),
             ] {
-                for &nfa_state in expanded {
-                    if let Some(nfa_s) = nfa.get(nfa_state) {
+                for &nfa_state in expanded.iter() {
+                    if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
                         for (range, target) in &nfa_s.transitions {
                             for byte in range.start..=range.end {
                                 if CharClass::from_byte(byte) == class {
@@ -655,7 +689,13 @@ impl LazyDfa {
             {
                 self.ctx.context_run_computations += 1;
             }
-            let next_closure = epsilon_closure_with_context(&self.ctx.nfa, targets, None, pos_ctx);
+            let next_closure = epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                targets,
+                None,
+                pos_ctx,
+            );
             if next_closure.is_empty() {
                 for dead_byte in byte..end {
                     let idx = (state + dead_byte as u32) as usize;
@@ -667,8 +707,13 @@ impl LazyDfa {
                 continue;
             }
 
-            let next_clean =
-                match_reachable_without_end_assertion(&self.ctx.nfa, targets, None, pos_ctx);
+            let next_clean = match_reachable_without_end_assertion(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                targets,
+                None,
+                pos_ctx,
+            );
             let flushes_before = self.ctx.flush_count;
             let next_id =
                 get_or_create_state_with_class(&mut self.ctx, next_closure, curr_class, next_clean);
@@ -914,20 +959,21 @@ impl LazyDfa {
                 PositionContext::middle()
             };
 
-            let mut start_set = BTreeSet::new();
-            start_set.insert(self.ctx.nfa.start);
+            let start_seed = [self.ctx.nfa.start];
 
             let is_at_boundary: Option<bool> = None;
 
             let start_closure = epsilon_closure_with_context(
                 &self.ctx.nfa,
-                &start_set,
+                &mut self.ctx.scratch,
+                &start_seed,
                 is_at_boundary,
                 Some(pos_ctx),
             );
             let start_clean = match_reachable_without_end_assertion(
                 &self.ctx.nfa,
-                &start_set,
+                &mut self.ctx.scratch,
+                &start_seed,
                 is_at_boundary,
                 Some(pos_ctx),
             );
@@ -945,12 +991,22 @@ impl LazyDfa {
             return self.ctx.start;
         }
 
-        let mut start_set = BTreeSet::new();
-        start_set.insert(self.ctx.nfa.start);
+        let start_seed = [self.ctx.nfa.start];
 
-        let start_closure = epsilon_closure_with_context(&self.ctx.nfa, &start_set, None, None);
-        let start_clean =
-            match_reachable_without_end_assertion(&self.ctx.nfa, &start_set, None, None);
+        let start_closure = epsilon_closure_with_context(
+            &self.ctx.nfa,
+            &mut self.ctx.scratch,
+            &start_seed,
+            None,
+            None,
+        );
+        let start_clean = match_reachable_without_end_assertion(
+            &self.ctx.nfa,
+            &mut self.ctx.scratch,
+            &start_seed,
+            None,
+            None,
+        );
         get_or_create_state_with_class(&mut self.ctx, start_closure, prev_class, start_clean)
     }
 
@@ -1156,7 +1212,7 @@ impl LazyDfa {
     fn compute_transition_unanchored(&mut self, state: DfaStateId, byte: u8) -> DfaStateId {
         let state_idx = state_index(state);
         let (nfa_states, prev_class) = match self.ctx.states.get(state_idx) {
-            Some(st) => (st.nfa_states.clone(), st.prev_class),
+            Some(st) => (Arc::clone(&st.nfa_states), st.prev_class),
             None => return self.ctx.start,
         };
 
@@ -1173,14 +1229,20 @@ impl LazyDfa {
             None
         };
 
-        let expanded = if self.ctx.has_word_boundary || self.ctx.has_anchors {
-            epsilon_closure_with_context(&self.ctx.nfa, &nfa_states, is_at_boundary, pos_ctx)
+        let expanded: NfaSubset = if self.ctx.has_word_boundary || self.ctx.has_anchors {
+            epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                &nfa_states[..],
+                is_at_boundary,
+                pos_ctx,
+            )
         } else {
             nfa_states
         };
 
         let mut next_states = BTreeSet::new();
-        for &nfa_state in &expanded {
+        for &nfa_state in expanded.iter() {
             if let Some(nfa_s) = self.ctx.nfa.get(nfa_state) {
                 for (range, target) in &nfa_s.transitions {
                     if range.contains(byte) {
@@ -1202,12 +1264,19 @@ impl LazyDfa {
         };
 
         let next_closure = if self.ctx.has_word_boundary || self.ctx.has_anchors {
-            epsilon_closure_with_context(&self.ctx.nfa, &next_states, None, target_pos_ctx)
+            epsilon_closure_with_context(
+                &self.ctx.nfa,
+                &mut self.ctx.scratch,
+                &next_states,
+                None,
+                target_pos_ctx,
+            )
         } else {
-            self.ctx.nfa.epsilon_closure(&next_states)
+            epsilon_closure_subset(&self.ctx.nfa, &mut self.ctx.scratch, &next_states)
         };
         let next_clean = match_reachable_without_end_assertion(
             &self.ctx.nfa,
+            &mut self.ctx.scratch,
             &next_states,
             None,
             target_pos_ctx,
@@ -1411,7 +1480,7 @@ impl LazyDfa {
     /// After matching, the DFA state may include states from both branches.
     /// If EndOfLine was filtered out during epsilon closure (because we're not at EOL),
     /// we shouldn't require it - branch 1's path is still valid.
-    fn state_needs_assertion<F>(&self, nfa_states: &BTreeSet<NfaStateId>, pred: F) -> bool
+    fn state_needs_assertion<F>(&self, nfa_states: &[NfaStateId], pred: F) -> bool
     where
         F: Fn(&NfaInstruction) -> bool,
     {
@@ -1486,6 +1555,7 @@ impl LazyDfa {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dfa::lazy::shared::ClosureScratch;
     use crate::dfa::EagerDfa;
     use crate::hir::translate;
     use crate::parser::parse;
@@ -1627,16 +1697,20 @@ mod tests {
     /// `nfa_states` into the key on the hit path and cloning only on miss —
     /// must not change interning: asking for the same NFA subset twice has to
     /// return the same DFA state id rather than creating a duplicate.
+    ///
+    /// Note that the two asks here share one allocation (`Arc::clone` is a
+    /// refcount bump), so this would still pass if state identity were pointer
+    /// based. `independently_built_identical_subsets_intern_to_one_state` is
+    /// what covers that.
     #[test]
     fn get_or_create_state_interns_repeated_subset() {
         let lazy = dfa(r"\b\w+\b");
         let mut ctx = lazy.ctx.clone();
 
-        let mut states = BTreeSet::new();
-        states.insert(0u32);
-        states.insert(2u32);
+        let states: NfaSubset = Arc::from(&[0u32, 2u32][..]);
 
-        let first = get_or_create_state_with_class(&mut ctx, states.clone(), CharClass::Word, true);
+        let first =
+            get_or_create_state_with_class(&mut ctx, Arc::clone(&states), CharClass::Word, true);
         let states_before = ctx.state_count();
         let second = get_or_create_state_with_class(&mut ctx, states, CharClass::Word, true);
 
@@ -1645,6 +1719,108 @@ mod tests {
             ctx.state_count(),
             states_before,
             "asking for an already-cached subset must not grow the cache"
+        );
+    }
+
+    /// State identity is the subset's *contents*, never its allocation.
+    ///
+    /// Storing the subset behind an `Arc` makes that a real question: the map
+    /// key and the stored `DfaState` deliberately share one allocation, so it
+    /// would be easy to slip into treating the pointer as the identity. Two
+    /// closure walks that happen to produce the same subset return two separate
+    /// allocations, and they must still intern to one DFA state — otherwise the
+    /// cache grows a duplicate for every re-derivation of the same state, and
+    /// the whole subset construction stops converging.
+    ///
+    /// `Arc<[u32]>`'s `PartialEq`/`Hash` both go through the pointee, which is
+    /// what makes this hold; this test is what stops it from being quietly
+    /// traded away.
+    #[test]
+    fn independently_built_identical_subsets_intern_to_one_state() {
+        let lazy = dfa(r"\b\w+\b");
+        let mut ctx = lazy.ctx.clone();
+
+        let first_subset: NfaSubset = Arc::from(&[0u32, 2u32][..]);
+        let second_subset: NfaSubset = Arc::from(&[0u32, 2u32][..]);
+        assert!(
+            !Arc::ptr_eq(&first_subset, &second_subset),
+            "the two subsets must be separate allocations for this test to mean anything"
+        );
+
+        let first = get_or_create_state_with_class(&mut ctx, first_subset, CharClass::Word, true);
+        let states_before = ctx.state_count();
+        let second = get_or_create_state_with_class(&mut ctx, second_subset, CharClass::Word, true);
+
+        assert_eq!(
+            first, second,
+            "equal subsets in separate allocations must intern to the same id"
+        );
+        assert_eq!(
+            ctx.state_count(),
+            states_before,
+            "the second ask must not create a duplicate state"
+        );
+    }
+
+    /// The shared closure scratch must not carry one walk into the next.
+    ///
+    /// Two failure modes, both invisible to every other test because they only
+    /// show up in the *second* of two consecutive walks:
+    ///
+    /// - the touched list is not cleared, so walk two's subset also contains
+    ///   walk one's states;
+    /// - the generation counter is not bumped, so walk one's marks still read
+    ///   as current and walk two skips every state they cover.
+    ///
+    /// The seeds are chosen so both bite. `seed_b` is taken from inside
+    /// `seed_a`'s closure and has a strictly smaller closure of its own, so a
+    /// stale touched list yields `seed_a`'s (too large) subset and stale marks
+    /// yield an empty one — while the correct answer is neither.
+    #[test]
+    fn closure_scratch_does_not_leak_between_calls() {
+        let lazy = dfa(r"(?m)^(foo|bar)+baz$");
+        let nfa = lazy.nfa();
+        let pos_ctx = Some(PositionContext::start_of_input());
+
+        // Each oracle walk gets its OWN scratch. Sharing one across the oracle
+        // calls would corrupt the expected values in exactly the same way the
+        // buffer under test is corrupted, so a missing reset would agree with
+        // itself and the test would pass — which is precisely what happened
+        // before: dropping the generation bump left this green.
+        let fresh = |seed: &[NfaStateId]| {
+            let mut scratch = ClosureScratch::new(nfa.states.len());
+            epsilon_closure_with_context(nfa, &mut scratch, seed, None, pos_ctx)
+        };
+
+        let seed_a = [nfa.start];
+        let closure_a = fresh(&seed_a);
+
+        // A member of closure(A) whose own closure is a proper subset of it —
+        // so it is both reachable from A (stale marks bite) and different from
+        // A (a stale touched list bites).
+        let (seed_b, closure_b) = closure_a
+            .iter()
+            .map(|&id| {
+                let seed = [id];
+                let closure = fresh(&seed);
+                (seed, closure)
+            })
+            .find(|(_, closure)| closure.len() < closure_a.len())
+            .expect("some state in the start closure must have a strictly smaller closure");
+
+        // Now the same two walks through one shared buffer.
+        let mut shared = ClosureScratch::new(nfa.states.len());
+        let first = epsilon_closure_with_context(nfa, &mut shared, &seed_a, None, pos_ctx);
+        let second = epsilon_closure_with_context(nfa, &mut shared, &seed_b, None, pos_ctx);
+
+        assert_eq!(first, closure_a, "the first walk must be unaffected");
+        assert_eq!(
+            second, closure_b,
+            "the second walk must equal what a fresh scratch produces"
+        );
+        assert_ne!(
+            first, second,
+            "the two walks must differ for this test to mean anything"
         );
     }
 

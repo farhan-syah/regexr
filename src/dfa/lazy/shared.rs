@@ -2,7 +2,6 @@
 //!
 //! Contains types used by both the interpreter and potentially a JIT backend.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::hash::FxHashMap;
@@ -142,15 +141,109 @@ impl CharClass {
     }
 }
 
+/// An NFA state subset, canonicalised: sorted ascending and duplicate-free.
+///
+/// Two subsets built independently from the same states therefore compare and
+/// hash equal, which is what lets [`get_or_create_state_with_class`] intern them
+/// to one DFA state. The `Arc` is not part of that identity — `Arc`'s `PartialEq`
+/// and `Hash` both go through the pointee — it is only there so the same subset
+/// can be the map key and the stored state's member list without being copied
+/// twice.
+///
+/// Immutable once built. Under the sharing above, mutating one in place would
+/// silently rewrite the other half of the pair, including a key already hashed
+/// into the state map.
+pub type NfaSubset = Arc<[NfaStateId]>;
+
+/// Reusable scratch space for one epsilon-closure walk.
+///
+/// A walk needs a visited set over NFA state ids and a worklist. Both used to be
+/// allocated fresh per call — a `BTreeSet` plus a `Vec` — which is most of what
+/// subset construction spends its time on. This replaces them with a
+/// generation-tagged sparse set: `stamp[id] == generation` means "seen in this
+/// walk", so starting a walk costs a counter bump instead of an O(V) wipe, and
+/// `touched` serves as both the worklist and the accumulator the canonical
+/// subset is sorted out of.
+///
+/// One buffer per context is enough. No closure walk nests inside another, and
+/// each one turns `touched` into an owned, buffer-independent value before the
+/// next one starts.
+#[derive(Debug, Clone)]
+pub(crate) struct ClosureScratch {
+    /// Generation in which each NFA state was last marked. `0` is "never".
+    stamp: Vec<u32>,
+    /// Generation of the walk in progress; never `0` once one has begun.
+    generation: u32,
+    /// States marked in this walk, in discovery order. Both the worklist (read
+    /// through an advancing cursor) and the accumulated result.
+    touched: Vec<NfaStateId>,
+}
+
+impl ClosureScratch {
+    /// Creates scratch space for an NFA with `state_count` states.
+    pub(crate) fn new(state_count: usize) -> Self {
+        Self {
+            stamp: vec![0; state_count],
+            generation: 0,
+            touched: Vec::new(),
+        }
+    }
+
+    /// Starts a walk, retiring everything the previous one left behind.
+    ///
+    /// Both halves matter: the counter bump is what invalidates the previous
+    /// walk's marks, and the clear is what stops its states from leaking into
+    /// this walk's result.
+    fn begin(&mut self) {
+        self.touched.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped. Stamps still holding the old top-of-range generation
+            // would now alias the new one, so retire them all — once every
+            // ~4 billion walks.
+            self.stamp.iter_mut().for_each(|slot| *slot = 0);
+            self.generation = 1;
+        }
+    }
+
+    /// Records `id` as seen in this walk, enqueuing it if it is new.
+    fn mark(&mut self, id: NfaStateId) {
+        let generation = self.generation;
+        match self.stamp.get_mut(id as usize) {
+            Some(slot) if *slot == generation => return,
+            Some(slot) => *slot = generation,
+            // No such NFA state, so it has no epsilon edges and cannot cycle.
+            // Recorded anyway, because the `BTreeSet` walk this replaces
+            // recorded it too; `finish` dedups, so a repeat cannot survive into
+            // the subset.
+            None => {}
+        }
+        self.touched.push(id);
+    }
+
+    /// The walk's result as an [`NfaSubset`], owned independently of this buffer.
+    ///
+    /// Canonicalisation is a sort of the touched states: O(k log k) in the
+    /// closure's own size. Scanning `stamp` in id order instead would be O(V) in
+    /// the whole NFA, which loses badly exactly where it matters — tokenizer
+    /// shaped patterns have a large NFA and small closures, so every walk would
+    /// pay for states it never touched.
+    fn finish(&mut self) -> NfaSubset {
+        self.touched.sort_unstable();
+        self.touched.dedup();
+        Arc::from(self.touched.as_slice())
+    }
+}
+
 /// Key for the state map.
 /// For patterns without word boundaries: just the NFA state set.
 /// For patterns with word boundaries: NFA state set + previous character class.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum StateKey {
     /// Simple key without character class (for patterns without word boundaries)
-    Simple(BTreeSet<NfaStateId>),
+    Simple(NfaSubset),
     /// Key with character class (for patterns with word boundaries)
-    WithClass(BTreeSet<NfaStateId>, CharClass),
+    WithClass(NfaSubset, CharClass),
 }
 
 /// A DFA state (metadata only, transitions are in dense table).
@@ -159,7 +252,10 @@ pub struct DfaState {
     /// Whether this is a match state.
     pub is_match: bool,
     /// The set of NFA states this DFA state represents.
-    pub nfa_states: BTreeSet<NfaStateId>,
+    ///
+    /// Shares its allocation with this state's key in
+    /// [`LazyDfaContext::state_map`], so it must never be mutated in place.
+    pub nfa_states: NfaSubset,
     /// The character class this state was created with (for word boundary patterns).
     /// This is the class of the byte that transitioned INTO this state.
     pub prev_class: CharClass,
@@ -177,7 +273,7 @@ pub struct DfaState {
 impl DfaState {
     /// Creates a new DFA state.
     pub fn new(
-        nfa_states: BTreeSet<NfaStateId>,
+        nfa_states: NfaSubset,
         is_match: bool,
         prev_class: CharClass,
         match_without_end_assertion: bool,
@@ -202,6 +298,14 @@ pub struct LazyDfaContext {
     /// Shared rather than owned so a fallback engine — the PikeVM, when a search
     /// gives up on the cache ceiling — can be built from it without copying it.
     pub(crate) nfa: Arc<Nfa>,
+    /// Scratch space shared by every epsilon-closure walk this context runs.
+    ///
+    /// Kept as its own field rather than passed around, so a call site can
+    /// borrow it mutably alongside a shared borrow of [`LazyDfaContext::nfa`]
+    /// and [`LazyDfaContext::states`]. That only works when the fields are
+    /// named directly at the call — a `&mut self` method that hands out the
+    /// scratch would borrow the whole context.
+    pub(crate) scratch: ClosureScratch,
     /// DFA states metadata (NFA state set, match status, etc.).
     pub(crate) states: Vec<DfaState>,
     /// Dense transition table: transitions[state_id + byte] = tagged next state.
@@ -319,8 +423,11 @@ impl LazyDfaContext {
                 )
         });
 
+        let scratch = ClosureScratch::new(nfa.states.len());
+
         let mut ctx = Self {
             nfa: Arc::new(nfa),
+            scratch,
             states: Vec::new(),
             transitions: Vec::new(),
             transitions_unanchored: Vec::new(),
@@ -345,8 +452,7 @@ impl LazyDfaContext {
         };
 
         // Create the start state
-        let mut start_set = BTreeSet::new();
-        start_set.insert(ctx.nfa.start);
+        let start_seed = [ctx.nfa.start];
 
         // Whether position 0 is a word boundary depends on the byte that follows
         // it, which is not known while the start state is being built: `\b` holds
@@ -357,20 +463,25 @@ impl LazyDfaContext {
         // `\b.` match at 0 in "  ".
         let is_at_boundary = None;
 
+        // Field-split borrows: the scratch is taken mutably while the NFA is
+        // taken shared. `ctx` is still a plain local here, so this is the same
+        // disjoint-field borrow the rest of the engine uses.
         let start_closure = if has_word_boundary || has_anchors {
             epsilon_closure_with_context(
                 &ctx.nfa,
-                &start_set,
+                &mut ctx.scratch,
+                &start_seed,
                 is_at_boundary,
                 Some(PositionContext::start_of_input()),
             )
         } else {
-            ctx.nfa.epsilon_closure(&start_set)
+            epsilon_closure_subset(&ctx.nfa, &mut ctx.scratch, &start_seed)
         };
 
         let start_clean = match_reachable_without_end_assertion(
             &ctx.nfa,
-            &start_set,
+            &mut ctx.scratch,
+            &start_seed,
             is_at_boundary,
             Some(PositionContext::start_of_input()),
         );
@@ -515,30 +626,44 @@ pub fn nfa_anchor_info(nfa: &Nfa) -> (bool, bool, bool, bool, bool) {
 /// - START anchors: Follow epsilons only when at valid start position
 /// - END anchors: Always follow epsilons (checked at match time)
 ///
-/// Generic over the seed container so both a `&BTreeSet<NfaStateId>` (an
-/// interned DFA state's subset) and a `&[NfaStateId]`/`&Vec<NfaStateId>` (an
+/// Generic over the seed container so both an [`NfaSubset`] (an interned DFA
+/// state's members) and a `&[NfaStateId]`/`&Vec<NfaStateId>` (an
 /// accumulation-order, possibly-duplicated run of per-byte targets) can be
 /// passed directly, with neither shape needing to be copied into the other
-/// first. Duplicates in the seeds are harmless: `closure.insert` below only
-/// pushes a seed onto the stack the first time it is seen.
+/// first. Duplicates in the seeds are harmless: `scratch.mark` below only
+/// enqueues a state the first time it is seen.
+///
+/// The walk marks a state when it is *enqueued* rather than when it is dequeued;
+/// the previous `BTreeSet` walk did the reverse. That does not change the result
+/// — whether a state's epsilons are followed depends only on the state and the
+/// fixed `is_at_boundary`/`pos_ctx`, never on the path taken to it, so the
+/// visited set is the same reachable set either way — and it lets the marked
+/// list double as the worklist.
 pub fn epsilon_closure_with_context<'a, I>(
     nfa: &Nfa,
+    scratch: &mut ClosureScratch,
     seeds: I,
     is_at_boundary: Option<bool>,
     pos_ctx: Option<PositionContext>,
-) -> BTreeSet<NfaStateId>
+) -> NfaSubset
 where
     I: IntoIterator<Item = &'a NfaStateId>,
 {
-    let mut closure = BTreeSet::new();
-    let mut stack: Vec<NfaStateId> = seeds.into_iter().copied().collect();
+    scratch.begin();
+    for &seed in seeds {
+        scratch.mark(seed);
+    }
 
-    while let Some(state_id) = stack.pop() {
-        // Always add state to closure (even if assertion doesn't match)
-        if !closure.insert(state_id) {
-            continue;
-        }
+    let mut cursor = 0usize;
+    // Copied out so the read of the worklist ends before the body marks into
+    // it. The cursor only advances, and `mark` only appends, so a state
+    // enqueued later in this walk is still reached.
+    while let Some(state_id) = scratch.touched.get(cursor).copied() {
+        cursor += 1;
 
+        // The state is already in the closure (marked on enqueue) even if its
+        // assertion does not hold; that only decides whether its epsilons are
+        // followed.
         let state = match nfa.get(state_id) {
             Some(s) => s,
             None => continue,
@@ -581,14 +706,59 @@ where
 
         if should_follow_epsilons {
             for &eps_target in &state.epsilon {
-                if !closure.contains(&eps_target) {
-                    stack.push(eps_target);
-                }
+                scratch.mark(eps_target);
             }
         }
     }
 
-    closure
+    scratch.finish()
+}
+
+/// Epsilon closure for patterns with no word boundary and no anchor, as an
+/// [`NfaSubset`].
+///
+/// The assertion-free counterpart of [`epsilon_closure_with_context`], and the
+/// exact walk [`Nfa::epsilon_closure`] performs — including its use of the
+/// precomputed per-state closures. Those are built by an unconditional DFS that
+/// never consults an assertion, which is right for the patterns this is called
+/// on and wrong the moment a pattern has one; that is why
+/// [`epsilon_closure_with_context`] must never reach for them.
+///
+/// Exists so this path also produces a canonical subset through the shared
+/// scratch, instead of building a `BTreeSet` and then copying it into one.
+pub fn epsilon_closure_subset<'a, I>(nfa: &Nfa, scratch: &mut ClosureScratch, seeds: I) -> NfaSubset
+where
+    I: IntoIterator<Item = &'a NfaStateId>,
+{
+    scratch.begin();
+
+    if let Some(precomputed) = nfa.epsilon_closures.as_ref() {
+        for &seed in seeds {
+            if let Some(state_closure) = precomputed.get(seed as usize) {
+                for &member in state_closure {
+                    scratch.mark(member);
+                }
+            }
+        }
+        return scratch.finish();
+    }
+
+    for &seed in seeds {
+        scratch.mark(seed);
+    }
+
+    let mut cursor = 0usize;
+    while let Some(state_id) = scratch.touched.get(cursor).copied() {
+        cursor += 1;
+
+        if let Some(state) = nfa.get(state_id) {
+            for &next in &state.epsilon {
+                scratch.mark(next);
+            }
+        }
+    }
+
+    scratch.finish()
 }
 
 /// Whether a match is reachable from `seeds` without passing an end assertion.
@@ -599,12 +769,19 @@ where
 /// state stands wherever it ends.
 ///
 /// Generic over the seed container for the same reason as
-/// [`epsilon_closure_with_context`]: both an interned `&BTreeSet<NfaStateId>`
-/// and a `&[NfaStateId]`/`&Vec<NfaStateId>` run of targets (accumulation
-/// order, possibly with duplicates) can be passed directly, with no
-/// intermediate allocation to bridge between the two.
+/// [`epsilon_closure_with_context`]: both an interned [`NfaSubset`] and a
+/// `&[NfaStateId]`/`&Vec<NfaStateId>` run of targets (accumulation order,
+/// possibly with duplicates) can be passed directly, with no intermediate
+/// allocation to bridge between the two.
+///
+/// Shares the caller's [`ClosureScratch`] as its visited set — it never runs
+/// while a closure walk is in flight, and it returns a `bool` that outlives
+/// nothing in the buffer. The answer does not depend on the traversal order:
+/// it is "does the reachable set contain a match state that is not itself an
+/// end assertion", which is a property of the set, not of how it is walked.
 pub fn match_reachable_without_end_assertion<'a, I>(
     nfa: &Nfa,
+    scratch: &mut ClosureScratch,
     seeds: I,
     is_at_boundary: Option<bool>,
     pos_ctx: Option<PositionContext>,
@@ -612,13 +789,15 @@ pub fn match_reachable_without_end_assertion<'a, I>(
 where
     I: IntoIterator<Item = &'a NfaStateId>,
 {
-    let mut visited = BTreeSet::new();
-    let mut stack: Vec<NfaStateId> = seeds.into_iter().copied().collect();
+    scratch.begin();
+    for &seed in seeds {
+        scratch.mark(seed);
+    }
 
-    while let Some(state_id) = stack.pop() {
-        if !visited.insert(state_id) {
-            continue;
-        }
+    let mut cursor = 0usize;
+    while let Some(state_id) = scratch.touched.get(cursor).copied() {
+        cursor += 1;
+
         let Some(state) = nfa.get(state_id) else {
             continue;
         };
@@ -648,9 +827,7 @@ where
 
         if follow {
             for &target in &state.epsilon {
-                if !visited.contains(&target) {
-                    stack.push(target);
-                }
+                scratch.mark(target);
             }
         }
     }
@@ -661,16 +838,16 @@ where
 /// Gets or creates a DFA state for a set of NFA states with a given character class.
 pub fn get_or_create_state_with_class(
     ctx: &mut LazyDfaContext,
-    nfa_states: BTreeSet<NfaStateId>,
+    nfa_states: NfaSubset,
     prev_class: CharClass,
     match_without_end_assertion: bool,
 ) -> DfaStateId {
     // The probe key moves `nfa_states` in rather than cloning it: on the hit
     // path (the common case — most bytes land on an already-cached state)
-    // the key is simply dropped afterwards, so only one `BTreeSet` is ever
-    // built. Only the miss path below needs a second, owned copy — one for
-    // the map key, one for the stored `DfaState` — so that is where the
-    // clone happens.
+    // the key is simply dropped afterwards. On the miss path the same subset
+    // has to be both the map key and the stored `DfaState`'s member list; with
+    // `Arc` that second copy is a refcount bump onto the one allocation the
+    // closure walk already produced, not a second subset.
     let key = if ctx.has_word_boundary {
         StateKey::WithClass(nfa_states, prev_class)
     } else {
@@ -694,10 +871,15 @@ pub fn get_or_create_state_with_class(
     if ctx.states.len() >= ctx.cache_limit {
         if ctx.search_depth == 0 {
             flush_cache(ctx);
+            // The flush wiped the map, so the only key that can still be there
+            // is the reinstated start state's — this reprobe exists so a subset
+            // that *is* the start state's does not get a second, duplicate DFA
+            // state. Both key clones are refcount bumps on the subset already
+            // in hand, so the cold path costs no copying.
             let reprobe_key = if ctx.has_word_boundary {
-                StateKey::WithClass(nfa_states.clone(), prev_class)
+                StateKey::WithClass(Arc::clone(&nfa_states), prev_class)
             } else {
-                StateKey::Simple(nfa_states.clone())
+                StateKey::Simple(Arc::clone(&nfa_states))
             };
             if let Some(&id) = ctx.state_map.get(&reprobe_key) {
                 return id;
@@ -719,10 +901,13 @@ pub fn get_or_create_state_with_class(
     let state_index = ctx.states.len();
     let premul_id = (state_index as u32) * STRIDE;
 
+    // Key and stored state share one allocation: `Arc::clone` is a refcount
+    // bump, not a second subset. Which is also why neither side may ever be
+    // mutated in place — the map key is already hashed.
     let key = if ctx.has_word_boundary {
-        StateKey::WithClass(nfa_states.clone(), prev_class)
+        StateKey::WithClass(Arc::clone(&nfa_states), prev_class)
     } else {
-        StateKey::Simple(nfa_states.clone())
+        StateKey::Simple(Arc::clone(&nfa_states))
     };
 
     ctx.states.push(DfaState::new(
@@ -744,13 +929,21 @@ pub fn get_or_create_state_with_class(
 
 /// Flushes the cache, keeping only the start state.
 pub fn flush_cache(ctx: &mut LazyDfaContext) {
-    ctx.flush_count += 1;
-
+    // Lifted out whole rather than field by field: with the subset behind an
+    // `Arc`, cloning the whole `DfaState` copies three scalars and bumps one
+    // refcount, and the reinstated state is then bit-for-bit the one that was
+    // there — no chance of reassembling it with a field left behind.
     let start_index = state_index(ctx.start);
-    let start_nfa_states = ctx.states[start_index].nfa_states.clone();
-    let start_is_match = ctx.states[start_index].is_match;
-    let start_prev_class = ctx.states[start_index].prev_class;
-    let start_clean = ctx.states[start_index].match_without_end_assertion;
+    let Some(start_state) = ctx.states.get(start_index).cloned() else {
+        // `ctx.start` always names a live state, so this cannot happen. If it
+        // somehow did, clearing the cache would leave nothing to rebuild the
+        // start from, so leave it exactly as it is — and do not report a flush,
+        // since callers use `flush_count` to detect that state IDs were
+        // renumbered.
+        return;
+    };
+
+    ctx.flush_count += 1;
 
     ctx.states.clear();
     ctx.transitions.clear();
@@ -758,16 +951,11 @@ pub fn flush_cache(ctx: &mut LazyDfaContext) {
     ctx.state_map.clear();
 
     let key = if ctx.has_word_boundary {
-        StateKey::WithClass(start_nfa_states.clone(), start_prev_class)
+        StateKey::WithClass(Arc::clone(&start_state.nfa_states), start_state.prev_class)
     } else {
-        StateKey::Simple(start_nfa_states.clone())
+        StateKey::Simple(Arc::clone(&start_state.nfa_states))
     };
-    ctx.states.push(DfaState::new(
-        start_nfa_states,
-        start_is_match,
-        start_prev_class,
-        start_clean,
-    ));
+    ctx.states.push(start_state);
     ctx.transitions.resize(STRIDE as usize, UNKNOWN_STATE);
     ctx.state_map.insert(key, 0);
     ctx.start = 0;
