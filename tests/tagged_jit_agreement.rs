@@ -76,6 +76,31 @@ const PATTERNS: &[&str] = &[
     // (2 and 3) both sit above zero and the wrong one lands off by one.
     "(?<=[a\u{e9}]x)y",
     "(?<![a\u{e9}]x)y",
+    // Nullable greedy runs (`X*`). Both step extractors — the interpreter's and
+    // the JIT's own — recognise this shape structurally and emit one
+    // `GreedyStar`; before that it became an `Alt` that duplicated or dropped
+    // whatever followed. The trailing step is what the two models disagree
+    // about, so vary it: a lookahead, a literal, a class, an anchor.
+    r"\w*(?=ing)",
+    r"\w*a",
+    r"[a-z]*x",
+    r"[a-z]*",
+    r"\w*\b",
+    r"\w*$",
+    r"a*b",
+    // The shapes the star recognition must NOT swallow: a genuine alternation
+    // whose first branch is a `+` loop. Its loop exits to the plus fragment's
+    // end, not to the state the second branch starts at, so the recognition
+    // declines it. See `greedy_star_recognition_does_not_swallow_alternation`
+    // for the hard-coded expectations that catch a loosened check.
+    r"(?:a+|b)",
+    r"(?:a+|b)c",
+    r"(?:[a-z]+|0)x",
+    // Non-greedy stars stay non-greedy: their split prefers the exit and routes
+    // it through a `NonGreedyExit` marker, which the recognition refuses.
+    r"\w*?a",
+    r"\w*?(?=ing)",
+    r"a*?b",
     // The tokenizer pattern this engine was built for.
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
 ];
@@ -164,6 +189,27 @@ const INPUTS: &[&str] = &[
     "\u{4e2d}.x",
     "\u{4e2d} x",
     "\u{1F600}.x",
+    // Nullable-star haystacks: nothing to match, everything matching, and the
+    // one-branch-or-the-other inputs an alternation misread as a star gets
+    // wrong ("aa" has no `b`, so `a*b` finds nothing where `(?:a+|b)` finds the
+    // whole run).
+    "aaaa",
+    "zzzz",
+    "aab c",
+    "bc",
+    "aac",
+    "cb",
+    "bbb",
+    "zzzx",
+    "abcx",
+    "x",
+    "0x 1x",
+    "sing",
+    "singing ing",
+    "ingesting",
+    "\u{4e2d}ing",
+    "a\u{4e2d}b",
+    "\u{4e2d}\u{4e2d}",
 ];
 
 #[test]
@@ -266,6 +312,103 @@ fn greedy_with_attached_lookahead_is_jit_compiled() {
             jitted.engine_name(),
             "TaggedNfaJit",
             "{pattern} carries its lookahead in one step and should be JIT-compiled"
+        );
+    }
+}
+
+/// An alternation whose first branch is a `+` loop must stay an alternation.
+///
+/// `X*` is recognised structurally at a split state whose epsilons are exactly
+/// `[enter, exit]`; what separates that split from a genuine alternation is the
+/// demand that the body loop's own exit is *the same state* as the split's exit.
+/// Drop that demand and `(?:a+|b)` compiles as `a*b` — the star swallows the
+/// second branch and turns it into a mandatory suffix.
+///
+/// The expectations here are hard-coded rather than compared against the
+/// interpreter on purpose: the recognition is shared code, so loosening it
+/// breaks both engines identically and a differential check would still pass.
+/// Both engines are asserted, because both walk through the same recogniser.
+///
+/// It does NOT by itself catch a loosened check, and should not be read as the
+/// guard: these patterns carry no assertion, so engine selection sends every one
+/// of them to the eager DFA and the tagged extractor is never consulted. Checked
+/// by loosening the demand — this test still passed. What bites is
+/// `steps::nullable_run_with_assertion_tests::a_genuine_alternation_is_not_recognised_as_a_star`,
+/// which inspects the extracted program directly. Kept here as a plain
+/// end-to-end assertion that these shapes match correctly whichever engine runs
+/// them.
+#[test]
+fn greedy_star_recognition_does_not_swallow_alternation() {
+    /// Pattern, haystack, and the exact spans `find_iter` must yield.
+    type Case = (&'static str, &'static str, &'static [(usize, usize)]);
+
+    let cases: &[Case] = &[
+        // `a*b` finds nothing in a run of `a`s; `(?:a+|b)` takes the run.
+        (r"(?:a+|b)", "aa", &[(0, 2)]),
+        (r"(?:a+|b)", "aab", &[(0, 2), (2, 3)]),
+        (r"(?:a+|b)", "b", &[(0, 1)]),
+        (r"(?:a+|b)", "cb", &[(1, 2)]),
+        (r"(?:a+|b)", "bbb", &[(0, 1), (1, 2), (2, 3)]),
+        // With a suffix, the misreading `a*bc` loses the `a+` branch entirely.
+        (r"(?:a+|b)c", "aac", &[(0, 3)]),
+        (r"(?:a+|b)c", "ac", &[(0, 2)]),
+        (r"(?:a+|b)c", "bc", &[(0, 2)]),
+        (r"(?:a+|b)c", "c", &[]),
+        (r"(?:a+|b)c", "aa", &[]),
+        // A class branch rather than a literal one, so the misreading is
+        // `[a-z]*0x` and the letters-only input stops matching.
+        (r"(?:[a-z]+|0)x", "abx", &[(0, 3)]),
+        (r"(?:[a-z]+|0)x", "0x", &[(0, 2)]),
+        (r"(?:[a-z]+|0)x", "x", &[]),
+    ];
+
+    for &(pattern, input, expected) in cases {
+        for jit in [false, true] {
+            let re = RegexBuilder::new(pattern).jit(jit).build().unwrap();
+            let got: Vec<_> = re.find_iter(input).map(|m| (m.start(), m.end())).collect();
+            assert_eq!(
+                got,
+                expected,
+                "{pattern:?} on {input:?} with jit={jit} (engine {})",
+                re.engine_name()
+            );
+        }
+    }
+}
+
+/// A nullable greedy run carrying a lookahead must reach the JIT.
+///
+/// This is the point of teaching the JIT's own step extractor the `X*` shape:
+/// `\w*(?=ing)` previously extracted as an `Alt` whose branch ended on a
+/// lookaround compiled onto the match state, which the walk could not represent,
+/// so the pattern silently ran on the interpreter even with the JIT requested —
+/// while `\w+(?=ing\b)` right next to it was compiled.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn nullable_greedy_run_is_jit_compiled() {
+    // The lookahead keeps this on the tagged engine, so it names the tagged JIT
+    // specifically — that is the selection this change is about.
+    let jitted = RegexBuilder::new(r"\w*(?=ing)").jit(true).build().unwrap();
+    assert_eq!(
+        jitted.engine_name(),
+        "TaggedNfaJit",
+        r"\w*(?=ing) is a recognised greedy star and should reach the tagged JIT"
+    );
+
+    // Without an assertion to satisfy, a recognised star is free to take a
+    // cheaper engine still — `\w*a` and `[a-z]*x` select `JitShiftOr`. Assert
+    // only that they reach *some* JIT engine, so this does not fail the day
+    // selection legitimately improves again.
+    for pattern in [r"\w*a", r"[a-z]*x"] {
+        let name = RegexBuilder::new(pattern)
+            .jit(true)
+            .build()
+            .unwrap()
+            .engine_name()
+            .to_string();
+        assert!(
+            name.contains("Jit"),
+            "{pattern} is a recognised greedy star and should be JIT-compiled, got {name}"
         );
     }
 }

@@ -516,6 +516,69 @@ fn count_step_kinds(steps: &[PatternStep]) -> StepKinds {
     counts
 }
 
+/// Recognises the NFA shape a *greedy* `X*` over a byte class compiles to,
+/// at a split state whose epsilons are exactly `[enter, exit]`.
+///
+/// On success returns the repeated class's byte ranges and the loop state,
+/// so the caller can emit one `GreedyStar` and continue the walk at `exit`.
+///
+/// Shared deliberately: `StepExtractor::extract_from_state` and the JIT
+/// backends' own step extractors (`jit::x86_64` / `jit::aarch64`) must model
+/// `X*` identically, or the JIT's soundness gate — which asks the interpreter's
+/// `StepExtractor` for permission and then generates code from its own walk —
+/// no longer means what it says. One definition, three callers.
+///
+/// `ThompsonBuilder::build_star` emits, for the greedy form, a split state
+/// preferring the body (`epsilon = [body.start, end]`) and a body-end state
+/// preferring another iteration (`epsilon = [body.start, end]` again). The
+/// non-greedy form reverses both orders *and* routes the exit through a
+/// `NonGreedyExit` marker state, so demanding the greedy order exactly is
+/// what keeps `X*?` out of this path — a marker carries an instruction and
+/// no byte transitions, and is refused below.
+///
+/// The demand that the loop's own exit is *the same state* as the split's
+/// exit is what separates a quantifier split from a genuine alternation: in
+/// `(?:a+|b)` the `a+` loop leaves to the plus fragment's end, not to the
+/// state the `b` branch starts at, so this answers `None` and the caller
+/// keeps its `Alt` treatment. Without that check the pattern would be
+/// silently miscompiled as `a*b`.
+///
+/// The body must be a bare byte class and nothing else: an instruction, an
+/// epsilon or a match flag on it would mean something a `GreedyStar` does
+/// not carry, so those shapes are declined too (`\p{L}*`, `(?:ab)*`, `\s*`
+/// where the class expands to an alternation of UTF-8 shapes).
+pub(crate) fn greedy_star_body(
+    nfa: &Nfa,
+    enter: StateId,
+    exit: StateId,
+) -> Option<(Vec<ByteRange>, StateId)> {
+    let body = nfa.get(enter)?;
+    if !body.epsilon.is_empty() || body.instruction.is_some() || body.is_match {
+        return None;
+    }
+    let &(_, loop_id) = body.transitions.first()?;
+    if !body.transitions.iter().all(|(_, t)| *t == loop_id) {
+        return None;
+    }
+
+    let loop_state = nfa.get(loop_id)?;
+    if !loop_state.transitions.is_empty() || loop_state.instruction.is_some() || loop_state.is_match
+    {
+        return None;
+    }
+    // Greedy order: another iteration first, the exit second — and that
+    // exit is the split's own exit.
+    let [loop_back, loop_exit] = loop_state.epsilon.as_slice() else {
+        return None;
+    };
+    if *loop_back != enter || *loop_exit != exit {
+        return None;
+    }
+
+    let ranges = body.transitions.iter().map(|(r, _)| *r).collect();
+    Some((ranges, loop_id))
+}
+
 /// Upper bound on the number of NFA states the extractor may visit (and thus
 /// steps it may emit) while building a single step program.
 ///
@@ -629,61 +692,6 @@ impl<'a> StepExtractor<'a> {
             stack.extend(next.transitions.iter().map(|&(_, target)| target));
         }
         false
-    }
-
-    /// Recognises the NFA shape a *greedy* `X*` over a byte class compiles to,
-    /// at a split state whose epsilons are exactly `[enter, exit]`.
-    ///
-    /// On success returns the repeated class's byte ranges and the loop state,
-    /// so the caller can emit one `GreedyStar` and continue the walk at `exit`.
-    ///
-    /// `ThompsonBuilder::build_star` emits, for the greedy form, a split state
-    /// preferring the body (`epsilon = [body.start, end]`) and a body-end state
-    /// preferring another iteration (`epsilon = [body.start, end]` again). The
-    /// non-greedy form reverses both orders *and* routes the exit through a
-    /// `NonGreedyExit` marker state, so demanding the greedy order exactly is
-    /// what keeps `X*?` out of this path — a marker carries an instruction and
-    /// no byte transitions, and is refused below.
-    ///
-    /// The demand that the loop's own exit is *the same state* as the split's
-    /// exit is what separates a quantifier split from a genuine alternation: in
-    /// `(?:a+|b)` the `a+` loop leaves to the plus fragment's end, not to the
-    /// state the `b` branch starts at, so this answers `None` and the caller
-    /// keeps its `Alt` treatment. Without that check the pattern would be
-    /// silently miscompiled as `a*b`.
-    ///
-    /// The body must be a bare byte class and nothing else: an instruction, an
-    /// epsilon or a match flag on it would mean something a `GreedyStar` does
-    /// not carry, so those shapes are declined too (`\p{L}*`, `(?:ab)*`, `\s*`
-    /// where the class expands to an alternation of UTF-8 shapes).
-    fn greedy_star_body(&self, enter: StateId, exit: StateId) -> Option<(Vec<ByteRange>, StateId)> {
-        let body = self.nfa.get(enter)?;
-        if !body.epsilon.is_empty() || body.instruction.is_some() || body.is_match {
-            return None;
-        }
-        let &(_, loop_id) = body.transitions.first()?;
-        if !body.transitions.iter().all(|(_, t)| *t == loop_id) {
-            return None;
-        }
-
-        let loop_state = self.nfa.get(loop_id)?;
-        if !loop_state.transitions.is_empty()
-            || loop_state.instruction.is_some()
-            || loop_state.is_match
-        {
-            return None;
-        }
-        // Greedy order: another iteration first, the exit second — and that
-        // exit is the split's own exit.
-        let [loop_back, loop_exit] = loop_state.epsilon.as_slice() else {
-            return None;
-        };
-        if *loop_back != enter || *loop_exit != exit {
-            return None;
-        }
-
-        let ranges = body.transitions.iter().map(|(r, _)| *r).collect();
-        Some((ranges, loop_id))
     }
 
     fn extract_from_state(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
@@ -881,7 +889,7 @@ impl<'a> StepExtractor<'a> {
             // below unchanged.
             if let [enter, exit] = state.epsilon.as_slice() {
                 let (enter, exit) = (*enter, *exit);
-                if let Some((ranges, loop_state)) = self.greedy_star_body(enter, exit) {
+                if let Some((ranges, loop_state)) = greedy_star_body(self.nfa, enter, exit) {
                     // Same cycle rule as the `GreedyPlus` case above: every
                     // state this step consumes must be fresh, or a cyclic NFA
                     // could walk it forever.

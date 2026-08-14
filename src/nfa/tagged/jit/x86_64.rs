@@ -5598,6 +5598,48 @@ impl TaggedNfaJitCompiler {
                 continue;
             }
 
+            // A nullable greedy run (`\w*`) is a split state. Left to the
+            // alternation path below it is modelled as an `Alt` that either
+            // duplicates a trailing assertion into both branches or, when the
+            // branch ends on a lookaround compiled onto the match state, yields
+            // nothing at all — so `\w*(?=ing)` failed to extract and the whole
+            // pattern fell back to the interpreter. Recognising the shape here
+            // emits one `GreedyStar` and keeps the walk linear.
+            //
+            // The recognition itself is `crate::nfa::tagged::greedy_star_body`,
+            // shared verbatim with the interpreter's `StepExtractor` (and with
+            // the aarch64 backend) so all three model `X*` identically — which
+            // is what the interpreter-authority gate in `compile()` assumes.
+            // Only the exact greedy `X*` shape takes this path: `X*?` routes its
+            // exit through a `NonGreedyExit` marker, which carries an
+            // instruction and is refused, and a genuine alternation fails the
+            // exit-convergence check, so both fall through unchanged.
+            // (Byte transitions are handled above and always leave the loop, so
+            // this state has none.)
+            if let [enter, exit] = state.epsilon.as_slice() {
+                let (enter, exit) = (*enter, *exit);
+                if let Some((ranges, loop_state)) =
+                    crate::nfa::tagged::greedy_star_body(&self.nfa, enter, exit)
+                {
+                    // Same cycle rule as the `GreedyPlus` case above: every
+                    // state this step consumes must be fresh, or a cyclic NFA
+                    // could walk it forever.
+                    let fresh = [current, enter, loop_state]
+                        .iter()
+                        .all(|&id| visited.get(id as usize).is_some_and(|seen| !*seen));
+                    if fresh {
+                        steps.push(PatternStep::GreedyStar(ByteClass::new(ranges)));
+                        for id in [current, enter, loop_state] {
+                            if let Some(seen) = visited.get_mut(id as usize) {
+                                *seen = true;
+                            }
+                        }
+                        current = exit;
+                        continue;
+                    }
+                }
+            }
+
             // Multiple epsilon transitions = alternation or non-greedy star
             if state.epsilon.len() > 1 && state.transitions.is_empty() {
                 // Check for non-greedy star pattern: a*?

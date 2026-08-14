@@ -2086,6 +2086,39 @@ impl TaggedNfaJitCompiler {
                 current = state.epsilon[0];
                 continue;
             }
+            // Greedy nullable run (`\w*`): recognised structurally so it emits a
+            // single `GreedyStar` instead of an `Alt` that duplicates or drops a
+            // trailing assertion. Recognition is
+            // `crate::nfa::tagged::greedy_star_body`, shared with the
+            // interpreter's `StepExtractor` and the x86_64 backend so all three
+            // model `X*` identically. `X*?` (whose exit goes through a
+            // `NonGreedyExit` marker) and genuine alternations (whose branches
+            // do not converge on the split's own exit) are refused there and
+            // fall through unchanged.
+            // (Byte transitions are handled above and always leave the loop, so
+            // this state has none.)
+            if let [enter, exit] = state.epsilon.as_slice() {
+                let (enter, exit) = (*enter, *exit);
+                if let Some((ranges, loop_state)) =
+                    crate::nfa::tagged::greedy_star_body(&self.nfa, enter, exit)
+                {
+                    // Every state this step consumes must be fresh, or a cyclic
+                    // NFA could walk it forever.
+                    let fresh = [current, enter, loop_state]
+                        .iter()
+                        .all(|&id| visited.get(id as usize).is_some_and(|seen| !*seen));
+                    if fresh {
+                        steps.push(PatternStep::GreedyStar(ByteClass::new(ranges)));
+                        for id in [current, enter, loop_state] {
+                            if let Some(seen) = visited.get_mut(id as usize) {
+                                *seen = true;
+                            }
+                        }
+                        current = exit;
+                        continue;
+                    }
+                }
+            }
             if state.epsilon.len() > 1 && state.transitions.is_empty() {
                 if state.epsilon.len() == 2 {
                     let e0s = &self.nfa.states[state.epsilon[0] as usize];
