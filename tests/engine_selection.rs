@@ -389,8 +389,21 @@ fn nullable_repetition_matches_agree_with_the_reference() {
 // that cutoff. The haystacks stay short: `reference::find`/`captures` recurse
 // once per repetition of the pattern, not per haystack byte, so `n` (not
 // haystack length) is what has to stay stack-safe here.
+// The spec matcher recurses once per repetition, so at n = 500 it needs more
+// than the 2 MiB a test thread gets by default in an unoptimized build. Run it
+// on a thread sized for that, so this tests engine agreement rather than the
+// harness's thread defaults.
 #[test]
 fn nullable_repetition_matches_agree_with_the_reference_past_the_closure_budget() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(nullable_repetition_agreement_past_the_closure_budget)
+        .expect("spawn deep-recursion thread")
+        .join()
+        .expect("reference comparison panicked");
+}
+
+fn nullable_repetition_agreement_past_the_closure_budget() {
     use regexr::hir::translate;
     use regexr::parser::parse;
 

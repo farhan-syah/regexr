@@ -16,6 +16,12 @@
 //!   to line semantics; `\b`/`\B` use the ASCII word class `[0-9A-Za-z_]`.
 //!
 //! Operates on bytes; `UnicodeCpClass` decodes one UTF-8 codepoint.
+//!
+//! ## Stack
+//! Matching recurses once per node entered, so the pattern's size — not the
+//! haystack's — bounds the stack: `(?:a?){n}` costs `n` levels. Past a few
+//! hundred, run it on a thread with a stack sized for the pattern. The
+//! production engines have no such requirement.
 
 use crate::hir::{HirAnchor, HirExpr, HirLookaroundKind};
 
