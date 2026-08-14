@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use crate::dfa::{CacheCeilingExceeded, EagerDfa, EagerScanBudgetExceeded, LazyDfa};
 use crate::error::Result;
 use crate::hir::Hir;
-use crate::literal::{extract_literals, Prefilter};
+use crate::literal::{extract_literals, Prefilter, ReverseSuffixSearch};
 use crate::nfa::tagged::TaggedNfaEngine;
 use crate::nfa::{self, Nfa};
 use crate::vm::backtracking::{BudgetExhausted, CaptureSlots};
@@ -89,6 +89,15 @@ pub struct CompiledRegex {
     /// engine leaves this `false` and keeps the generic dispatch chain, which
     /// remains the only path that can answer for them.
     simple_eager_scan: bool,
+    /// The end-first search for patterns shaped like `\w+(?=ing\b)`, when the
+    /// gate accepts the pattern.
+    ///
+    /// Set only where a tagged-NFA engine is built — the shape the gate accepts
+    /// always contains a lookaround, so it is the only engine family such a
+    /// pattern reaches — and `None` everywhere else. Consulted by
+    /// [`CompiledRegex::find_from_inner`], whose anchored confirm is
+    /// [`CompiledRegex::find_at_pos`], i.e. the held engine's own `match_at`.
+    reverse_suffix: Option<ReverseSuffixSearch>,
     /// Fallback NFA for captures when using Shift-Or or LazyDfa.
     /// Populated at construction (or left permanently `None` for engines that
     /// extract captures themselves) — the `RwLock` exists for interior mutability
@@ -122,6 +131,9 @@ impl std::fmt::Debug for CompiledRegex {
         f.debug_struct("CompiledRegex")
             .field("engine", &self.engine_name())
             .field("prefilter", &self.prefilter)
+            // The prefilter alone misdescribes how these patterns are searched:
+            // the end-first search replaces it outright.
+            .field("reverse_suffix", &self.reverse_suffix.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -289,12 +301,35 @@ impl CompiledRegex {
         }
     }
 
+    /// Whether every search already scans the haystack for the pattern's
+    /// required literal, making an outside rejection scan for it redundant.
+    ///
+    /// True exactly when a reverse-suffix search is held: its first act is a
+    /// `memmem` scan for the lookahead's leading literal over the same text, and
+    /// it reports no match when that literal is absent. The two literals are the
+    /// same one by construction — for the shape the gate accepts,
+    /// `<class run>(?=<literal>…)`, the run contributes nothing to
+    /// [`crate::literal::required_literal`], so the lookahead's leading literal
+    /// is the only candidate it has to choose from, and the gate only accepts a
+    /// lookahead whose extraction yields exactly one prefix at offset zero,
+    /// which is the prefix `required_literal` takes.
+    ///
+    /// Answering true only ever removes a rejection scan, never a check that
+    /// decides which match is reported, so a caller is free to ignore it.
+    #[inline]
+    pub(crate) fn scans_for_required_literal(&self) -> bool {
+        self.reverse_suffix.is_some()
+    }
+
     /// Returns true if the pattern matches anywhere in the input.
     pub fn is_match(&self, input: &[u8]) -> bool {
-        // An offset prefilter's candidates are not match starts, so the loop
-        // below cannot verify them directly; `find_from_inner` owns that
-        // translation and answers the same question.
-        if self.prefix_offset != 0 {
+        // Neither of these searches is expressible as the candidate loop below,
+        // which verifies match *starts* one at a time: an offset prefilter's
+        // candidates are not match starts, and the reverse-suffix scan seeks the
+        // text a match must *end* at. `find_from_inner` owns both translations
+        // and answers the same question, so defer to it rather than restating
+        // either here — restating them is how the two entry points drift apart.
+        if self.prefix_offset != 0 || self.reverse_suffix.is_some() {
             return self.find(input).is_some();
         }
 
@@ -519,6 +554,19 @@ impl CompiledRegex {
         from: usize,
         mut dfa: Option<&mut LazyDfa>,
     ) -> Option<(usize, usize)> {
+        // The end-first search, before every prefilter branch. It must come
+        // first: the branches below are entered on `engine_searches_single_pass`,
+        // which is true for both tagged-NFA engines — the only ones that can
+        // hold a reverse-suffix search — so anything placed after them is
+        // unreachable for exactly the patterns this exists for.
+        //
+        // It replaces the search outright rather than filtering it: it visits
+        // one start per class run instead of one per position, and the confirm
+        // is anchored, so a failed run costs a single attempt.
+        if let Some(search) = &self.reverse_suffix {
+            return search.find(input, from, |start| self.find_at_pos(input, start, None));
+        }
+
         // Fast path: if prefilter can provide full match bounds (TeddyFull),
         // return directly without running the NFA
         if self.prefilter.is_full_match() {
@@ -671,6 +719,19 @@ impl CompiledRegex {
         if from > input.len() {
             return None;
         }
+        // With an end-first search, the forward scan every arm below performs is
+        // the cost this whole path exists to avoid. Locating the match first and
+        // resuming the capture pass *at* its start keeps the two in agreement
+        // for free: every arm searches at or after the position it is given, and
+        // the search already confirmed a match beginning exactly there, so the
+        // one they find is the one `find` reports.
+        let from = if self.reverse_suffix.is_some() {
+            // Only the tagged engines hold one of these searches, and neither
+            // has a lazy DFA to be handed.
+            self.find_from_with(input, from, None)?.0
+        } else {
+            from
+        };
         match &self.inner {
             CompiledInner::PikeVm(vm) => vm.captures_from(input, from),
             CompiledInner::CodepointClass(matcher) => matcher.captures_from(input, from),
@@ -941,11 +1002,11 @@ impl CompiledRegex {
                 matcher.find(slice).map(|(s, e)| (pos + s, pos + e))
             }
             CompiledInner::BacktrackingVm(vm) => vm.find_at(input, pos),
-            CompiledInner::TaggedNfaInterp(engine) => engine.find_at(input, pos),
+            CompiledInner::TaggedNfaInterp(engine) => engine.match_at(input, pos),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::Jit(jit) => jit.find_at(input, pos),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            CompiledInner::TaggedNfaJit(engine) => engine.find_at(input, pos),
+            CompiledInner::TaggedNfaJit(engine) => engine.match_at(input, pos),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             CompiledInner::Backtracking(jit) => jit.find_at(input, pos),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -1080,6 +1141,8 @@ pub fn compile(nfa: Nfa) -> Result<CompiledRegex> {
         prefilter: Prefilter::None, // Can't extract literals from NFA
         prefix_offset: 0,
         simple_eager_scan: false,
+        // No HIR here to run the gate on.
+        reverse_suffix: None,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1109,6 +1172,7 @@ fn compile_tagged_nfa_interp(hir: &Hir, nfa: Nfa) -> CompiledRegex {
         prefilter,
         prefix_offset: literals.prefix_offset,
         simple_eager_scan: false,
+        reverse_suffix: ReverseSuffixSearch::new(hir),
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1133,6 +1197,7 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
             prefilter: Prefilter::None,
             prefix_offset: 0,
             simple_eager_scan: false,
+            reverse_suffix: None,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1342,6 +1407,9 @@ pub fn compile_from_hir(hir: &Hir) -> Result<CompiledRegex> {
         prefilter,
         prefix_offset: literals.prefix_offset,
         simple_eager_scan,
+        // Not a tagged-NFA engine: the gate only accepts patterns with a
+        // lookaround, which never reach this far.
+        reverse_suffix: None,
         capture_nfa: RwLock::new(capture_nfa),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1373,6 +1441,7 @@ pub fn compile_with_pikevm(hir: &Hir) -> Result<CompiledRegex> {
         prefilter,
         prefix_offset: literals.prefix_offset,
         simple_eager_scan: false,
+        reverse_suffix: None,
         capture_nfa: RwLock::new(None),
         one_pass: OnceLock::new(),
         capture_vm: RwLock::new(None),
@@ -1403,6 +1472,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             prefilter: Prefilter::None,
             prefix_offset: 0,
             simple_eager_scan: false,
+            reverse_suffix: None,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1466,6 +1536,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     prefilter,
                     prefix_offset: literals.prefix_offset,
                     simple_eager_scan: false,
+                    reverse_suffix: ReverseSuffixSearch::new(hir),
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1503,6 +1574,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     prefilter,
                     prefix_offset: literals.prefix_offset,
                     simple_eager_scan: false,
+                    reverse_suffix: None,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1524,6 +1596,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     prefilter,
                     prefix_offset: literals.prefix_offset,
                     simple_eager_scan: false,
+                    reverse_suffix: None,
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1554,6 +1627,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     prefilter,
                     prefix_offset: literals.prefix_offset,
                     simple_eager_scan: false,
+                    reverse_suffix: ReverseSuffixSearch::new(hir),
                     capture_nfa: RwLock::new(None),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1600,6 +1674,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
             prefilter: Prefilter::from_literals(&literals),
             prefix_offset: literals.prefix_offset,
             simple_eager_scan: false,
+            reverse_suffix: None,
             capture_nfa: RwLock::new(None),
             one_pass: OnceLock::new(),
             capture_vm: RwLock::new(None),
@@ -1701,6 +1776,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                         prefilter,
                         prefix_offset: literals.prefix_offset,
                         simple_eager_scan: false,
+                        reverse_suffix: None,
                         capture_nfa: RwLock::new(capture_nfa),
                         one_pass: OnceLock::new(),
                         capture_vm: RwLock::new(None),
@@ -1738,6 +1814,7 @@ pub fn compile_with_jit(hir: &Hir) -> Result<CompiledRegex> {
                     prefilter,
                     prefix_offset: literals.prefix_offset,
                     simple_eager_scan: false,
+                    reverse_suffix: None,
                     capture_nfa: RwLock::new(capture_nfa),
                     one_pass: OnceLock::new(),
                     capture_vm: RwLock::new(None),
@@ -1775,6 +1852,165 @@ mod tests {
         let hir = translate(&ast).unwrap();
         let nfa = nfa_compile(&hir).unwrap();
         compile(nfa).unwrap()
+    }
+
+    /// Patterns the reverse-suffix gate accepts, one per accepted shape: a `+`
+    /// run, a `*` run (an empty run is still a match), an explicit class, and a
+    /// codepoint run walked one character at a time.
+    const END_FIRST_PATTERNS: &[&str] = &[
+        r"\w+(?=ing\b)",
+        r"\w*(?=ing)",
+        r"[a-z]+(?=xy)",
+        r"(?u:\w+(?=ing))",
+    ];
+
+    /// Haystacks covering every branch of the end-first loop: no literal at all,
+    /// a literal with no run before it (skipped, or matched empty), a literal
+    /// inside a run whose start is interior, several runs in sequence, a failed
+    /// run that must be skipped whole, and multi-byte characters.
+    const END_FIRST_INPUTS: &[&str] = &[
+        "",
+        "a",
+        "  ",
+        "ing",
+        " ing",
+        "ings",
+        "inging",
+        "sing ing",
+        "singing",
+        "singing ringing",
+        "ing ing ing",
+        "xy",
+        " xyxy",
+        "abxyxy",
+        "xyzing",
+        "naïveing",
+        "ï ing",
+        "中ing 中",
+        "中inging",
+    ];
+
+    fn compiled(pattern: &str, jit: bool) -> CompiledRegex {
+        let hir = translate(&parse(pattern).unwrap()).unwrap();
+        if jit {
+            compile_with_jit(&hir).unwrap()
+        } else {
+            compile_from_hir(&hir).unwrap()
+        }
+    }
+
+    /// The gate has to be consulted at every site that builds a tagged-NFA
+    /// engine, and refused everywhere else. Without this the feature can be
+    /// entirely dead — a declined or unwired gate leaves every behavioural test
+    /// passing on the forward scan.
+    #[test]
+    fn end_first_search_is_wired_at_every_tagged_site() {
+        for pattern in END_FIRST_PATTERNS {
+            for jit in [false, true] {
+                assert!(
+                    compiled(pattern, jit).reverse_suffix.is_some(),
+                    "gate declined {pattern:?} (jit={jit})"
+                );
+            }
+        }
+
+        // Refused shapes reach the same engines and must keep the forward scan.
+        for pattern in [
+            r"\w+(?=x)",
+            r"\w+(?!ing)",
+            r"\w+?(?=ing)",
+            r"\w+(?=ing|ed)",
+            r"(?:abcde|c)(?=d)",
+            r"\w+ing",
+            r"hello",
+        ] {
+            for jit in [false, true] {
+                assert!(
+                    compiled(pattern, jit).reverse_suffix.is_none(),
+                    "gate accepted {pattern:?} (jit={jit})"
+                );
+            }
+        }
+    }
+
+    /// The end-first search is an optimization, so it must answer exactly what
+    /// the forward scan answers — for every resume offset, which is what
+    /// `find_iter` walks through and what the reverse walk's floor clamps to.
+    ///
+    /// The baseline is the *same* compiled regex with the search taken away, so
+    /// the only difference between the two sides is the path under test.
+    #[test]
+    fn end_first_search_agrees_with_the_forward_scan() {
+        for pattern in END_FIRST_PATTERNS {
+            for jit in [false, true] {
+                let fast = compiled(pattern, jit);
+                let mut forward = compiled(pattern, jit);
+                assert!(fast.reverse_suffix.is_some(), "{pattern:?}");
+                forward.reverse_suffix = None;
+
+                for input in END_FIRST_INPUTS {
+                    let bytes = input.as_bytes();
+                    for from in 0..=bytes.len() {
+                        assert_eq!(
+                            fast.find_from(bytes, from),
+                            forward.find_from(bytes, from),
+                            "pattern={pattern:?} jit={jit} input={input:?} from={from}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other two entry points are routed through the same search, and each
+    /// used to reach the engine by a path of its own — a candidate loop in
+    /// `is_match`, a forward scan from the resume point in `captures_from`. Both
+    /// must now answer exactly what `find_from` answers, at every resume offset:
+    /// an entry point that keeps its own scan is not visibly broken, it just
+    /// disagrees with `find` on the inputs where the two searches differ.
+    #[test]
+    fn every_entry_point_agrees_with_the_end_first_search() {
+        for pattern in END_FIRST_PATTERNS {
+            for jit in [false, true] {
+                let fast = compiled(pattern, jit);
+                assert!(fast.reverse_suffix.is_some(), "{pattern:?}");
+
+                for input in END_FIRST_INPUTS {
+                    let bytes = input.as_bytes();
+                    let context = format!("pattern={pattern:?} jit={jit} input={input:?}");
+                    assert_eq!(
+                        fast.is_match(bytes),
+                        fast.find(bytes).is_some(),
+                        "is_match disagrees: {context}"
+                    );
+                    for from in 0..=bytes.len() {
+                        let found = fast.find_from(bytes, from);
+                        assert_eq!(
+                            fast.captures_from(bytes, from)
+                                .map(|slots| slots.first().copied().flatten()),
+                            found.map(Some),
+                            "captures_from disagrees: {context} from={from}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The counterexample the whole design rests on: the match's end is not the
+    /// literal occurrence the search found, and its start is not one the forward
+    /// scan would have reached first by accident.
+    #[test]
+    fn end_first_search_finds_the_leftmost_match() {
+        for jit in [false, true] {
+            let re = compiled(r"\w+(?=ing\b)", jit);
+            assert_eq!(re.find(b"singing"), Some((0, 4)), "jit={jit}");
+            assert_eq!(re.find_from(b"singing", 4), None, "jit={jit}");
+            assert_eq!(re.find(b"ings"), None, "jit={jit}");
+            // A start interior to a run, reached only because a later
+            // occurrence's run walked back into it.
+            assert_eq!(compiled(r"[a-z]+(?=xy)", jit).find(b" xyxy"), Some((1, 3)));
+        }
     }
 
     #[test]

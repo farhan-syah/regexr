@@ -130,6 +130,17 @@ const PATTERNS: &[&str] = &[
     // the handoff's output checked against the reference on ordinary-sized
     // inputs too, matching and non-matching alike.
     r"\b[a-y ]+\d",
+    // A class run before a literal lookahead, which the engines search end-first
+    // (seek the literal, walk the run back, confirm anchored). The reference
+    // scans forward from every position, so it is exactly the check that the
+    // shortcut did not change what is matched. `(?:abcde|c)(?=d)` is the shape
+    // the shortcut must REFUSE — its leftmost start jumps backwards as the
+    // literal advances — and is here so a gate that wrongly accepted it would
+    // show up as a divergence rather than as silence.
+    r"\w+(?=ing\b)",
+    r"\w*(?=ing)",
+    r"[a-z]+(?=xy)",
+    r"(?:abcde|c)(?=d)",
     // The real tiktoken split patterns.
     CL100K,
     O200K,
@@ -178,6 +189,24 @@ fn inputs() -> Vec<String> {
         "   x".into(),
         "hello   world".into(),
         "中文 \n  test".into(),
+        // The random inputs below are built one character at a time, so a
+        // multi-byte literal like `ing` or `xy` never arises by chance and the
+        // end-first patterns above would exercise nothing. These seed it: a
+        // literal with a run before it, with none, with a run that reaches back
+        // over an earlier occurrence, and one per skipped-run branch.
+        "singing".into(),
+        "singing ringing".into(),
+        "sing ing".into(),
+        "inging".into(),
+        "ings".into(),
+        "ing".into(),
+        " ing".into(),
+        "naïveing".into(),
+        " xyxy".into(),
+        "abxy".into(),
+        // The alternation counterexample: `d` occurs at 3 and at 5, and the
+        // leftmost match (0, 5) ends at the *later* one.
+        "abcded".into(),
     ];
     for _ in 0..4000 {
         let len = (next() % 24) as usize;

@@ -20,8 +20,4 @@ mod reverse_suffix;
 
 pub use extractor::*;
 pub use prefilter::*;
-// Nothing consumes these yet — the engine wiring lands in a follow-up unit.
-#[allow(unused_imports)]
-pub(crate) use reverse_suffix::{
-    reverse_suffix_plan, run_end, run_start, ReverseSuffixPlan, RunClass,
-};
+pub(crate) use reverse_suffix::ReverseSuffixSearch;

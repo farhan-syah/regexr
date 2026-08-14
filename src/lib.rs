@@ -354,6 +354,11 @@ impl Regex {
 
     /// Whether a required literal (if any) is present at all.
     pub(crate) fn can_match(&self, text: &str) -> bool {
+        // Skipped where the search scans for the same literal itself, so the
+        // haystack is not walked twice to answer one question.
+        if self.inner.scans_for_required_literal() {
+            return true;
+        }
         match self.required_literal {
             Some(ref finder) => finder.find(text.as_bytes()).is_some(),
             None => true,

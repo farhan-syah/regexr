@@ -6,14 +6,12 @@
 //! lookahead's literal with `memmem`, walk *back* over the preceding class run
 //! to find where the match can start, then confirm with an anchored engine run.
 //!
-//! This module holds the two pure pieces of that search: the applicability gate
-//! ([`reverse_suffix_plan`]) and the run scan ([`run_start`] / [`run_end`]).
-//! Neither is wired into the executor yet.
+//! This module holds the applicability gate ([`reverse_suffix_plan`]), the run
+//! scan ([`run_start`] / [`run_end`]) and the search that drives them
+//! ([`ReverseSuffixSearch`]). The executor consults the search from
+//! `find_from_inner`; the anchored confirm is the engine's own.
 
-// Nothing calls this module yet — the engine wiring lands in a follow-up unit.
-// Without this the build is not warning-clean, and a warning-clean build is
-// what makes a *real* warning visible.
-#![allow(dead_code)]
+use memchr::memmem::Finder;
 
 use crate::hir::{
     compute_capture_count, CodepointClass, Hir, HirClass, HirExpr, HirLookaroundKind, HirProps,
@@ -47,6 +45,78 @@ pub(crate) struct ReverseSuffixPlan {
     /// Whether the repetition's minimum was zero (`*`) rather than one (`+`),
     /// i.e. whether an empty run at a literal occurrence is still a match.
     pub(crate) allows_empty_run: bool,
+}
+
+/// A [`ReverseSuffixPlan`] plus the `memmem` finder for its literal, ready to
+/// search with.
+///
+/// Built once at compile time — the finder owns its needle, so it outlives the
+/// HIR the plan was derived from.
+#[derive(Debug)]
+pub(crate) struct ReverseSuffixSearch {
+    plan: ReverseSuffixPlan,
+    finder: Finder<'static>,
+}
+
+impl ReverseSuffixSearch {
+    /// The search for `hir`, or `None` when the gate refuses its shape.
+    pub(crate) fn new(hir: &Hir) -> Option<Self> {
+        let plan = reverse_suffix_plan(hir)?;
+        let finder = Finder::new(&plan.literal).into_owned();
+        Some(Self { plan, finder })
+    }
+
+    /// The leftmost match starting at or after `from`, found end-first.
+    ///
+    /// `confirm` is the engine's *anchored* match at a given start — it must
+    /// answer about that position alone, never search forward from it. The end
+    /// comes from `confirm`, never from the literal occurrence: on `"singing"`
+    /// the gate's `\w+(?=ing\b)` sees `ing` at 1 and at 4, yet the leftmost
+    /// match is `(0, 4)`, whose end the scan never proposed.
+    ///
+    /// Each iteration seeks the next literal occurrence `p` (every match ends at
+    /// one, since the lookahead is zero-width and its inner begins with the
+    /// literal), walks back over the class run to the leftmost start `s` a match
+    /// ending there can have, and confirms at `s`. A failed confirm kills the
+    /// whole run — every start inside it reaches only ends inside it, all of
+    /// which the confirm at `s` already explored — so the search resumes at the
+    /// run's end rather than at the next position, which is what keeps it
+    /// linear.
+    pub(crate) fn find(
+        &self,
+        input: &[u8],
+        from: usize,
+        mut confirm: impl FnMut(usize) -> Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        let mut pos = from;
+        loop {
+            let p = pos + self.finder.find(input.get(pos..)?)?;
+            let mut start = run_start(input, p, &self.plan.class, from);
+            // A match never begins inside a codepoint, and the engines refuse
+            // such a start outright. The walk can still land on one — a byte
+            // class whose members include continuation bytes has runs that begin
+            // mid-character — and confirming there would fail for the wrong
+            // reason, taking the whole run with it, since the skip below reads a
+            // failed confirm as proof that no start in the run can match. The
+            // first boundary at or after the walk's answer is the leftmost start
+            // that is viable at all, and it is never past `p`, whose byte the
+            // literal's own first byte matched.
+            while start < p && !crate::nfa::is_utf8_boundary(input, start) {
+                start += 1;
+            }
+            if start == p && !self.plan.allows_empty_run {
+                // A `C+` run cannot end at `p`, so `p` is not a match end. `p`
+                // itself may still be the start of a match ending later in the
+                // run ahead, so only this occurrence is skipped.
+                pos = p + 1;
+                continue;
+            }
+            if let Some(found) = confirm(start) {
+                return Some(found);
+            }
+            pos = (p + 1).max(run_end(input, p, &self.plan.class));
+        }
+    }
 }
 
 /// Recognises the one pattern shape a reverse-suffix search is sound for:
@@ -330,6 +400,92 @@ mod tests {
         let ast = crate::parser::parse(pattern).unwrap();
         let hir = crate::hir::translate(&ast).unwrap();
         reverse_suffix_plan(&hir)
+    }
+
+    fn search(pattern: &str) -> ReverseSuffixSearch {
+        let ast = crate::parser::parse(pattern).unwrap();
+        let hir = crate::hir::translate(&ast).unwrap();
+        ReverseSuffixSearch::new(&hir).expect("gate accepts this shape")
+    }
+
+    /// Records every start the search asks about, and answers `matches`.
+    fn confirms(
+        search: &ReverseSuffixSearch,
+        input: &[u8],
+        from: usize,
+        matches: Option<(usize, usize)>,
+    ) -> (Option<(usize, usize)>, Vec<usize>) {
+        let mut asked = Vec::new();
+        let found = search.find(input, from, |start| {
+            asked.push(start);
+            matches.filter(|&(match_start, _)| match_start == start)
+        });
+        (found, asked)
+    }
+
+    /// The search's two load-bearing properties, neither visible in the answer
+    /// alone: it confirms *one* start per class run (the dead-run skip, which is
+    /// what makes it linear), and the span it reports is the confirm's, not the
+    /// literal occurrence it walked back from.
+    #[test]
+    fn test_search_confirms_one_start_per_run() {
+        let ing = search(r"\w+(?=ing\b)");
+
+        // "ing" occurs at 1 and at 4, both inside one `\w` run. The confirm at
+        // that run's start answers (0, 4) — an end the literal scan proposed
+        // only as a candidate, and a run the second occurrence must not re-ask.
+        let (found, asked) = confirms(&ing, b"singing", 0, Some((0, 4)));
+        assert_eq!(found, Some((0, 4)));
+        assert_eq!(asked, vec![0]);
+
+        // The same haystack with nothing to find: still one confirm.
+        let (found, asked) = confirms(&ing, b"singing", 0, None);
+        assert_eq!(found, None);
+        assert_eq!(asked, vec![0]);
+
+        // Two runs, two confirms — one per run, in order.
+        let (found, asked) = confirms(&ing, b"singing ringing", 0, Some((8, 12)));
+        assert_eq!(found, Some((8, 12)));
+        assert_eq!(asked, vec![0, 8]);
+    }
+
+    /// An occurrence with no run before it is not a match end for a `+` run, so
+    /// it is never confirmed — but it is skipped by one position rather than by
+    /// the run ahead of it, which may still contain a match that starts there.
+    #[test]
+    fn test_search_skips_an_empty_run_only_when_the_repeat_needs_one() {
+        let ing = search(r"\w+(?=ing\b)");
+        assert_eq!(confirms(&ing, b"ings", 0, None), (None, vec![]));
+        assert_eq!(confirms(&ing, b" ing", 0, None), (None, vec![]));
+
+        // `[a-z]+(?=xy)`: the first `xy` is not a match end, yet position 1 is
+        // where the match ending at the second one begins.
+        let xy = search(r"[a-z]+(?=xy)");
+        assert_eq!(
+            confirms(&xy, b" xyxy", 0, Some((1, 3))),
+            (Some((1, 3)), vec![1])
+        );
+
+        // A `*` run may be empty, so the same occurrence is confirmed.
+        let star = search(r"\w*(?=ing)");
+        assert_eq!(
+            confirms(&star, b"ings", 0, Some((0, 0))),
+            (Some((0, 0)), vec![0])
+        );
+    }
+
+    /// The resume point is a floor on the reverse walk: iteration must never be
+    /// handed a start inside the text an earlier match already covered.
+    #[test]
+    fn test_search_never_confirms_a_start_before_the_resume_point() {
+        let ing = search(r"\w+(?=ing\b)");
+        // Resuming at 4 leaves no run before the occurrence there at all.
+        assert_eq!(confirms(&ing, b"singing", 4, None), (None, vec![]));
+        // Resuming mid-run clamps the start to the resume point.
+        assert_eq!(
+            confirms(&ing, b"singing", 2, Some((2, 4))),
+            (Some((2, 4)), vec![2])
+        );
     }
 
     fn bytes_class(ranges: &[(u8, u8)]) -> RunClass {

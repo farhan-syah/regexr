@@ -743,6 +743,30 @@ fn test_lookbehind_literal_prefix_at_end_of_input() {
     assert_eq!(re.find("@ab").map(|m| (m.start(), m.end())), Some((1, 3)));
 }
 
+/// The lookbehind's literal makes `@` a prefilter candidate, but the body must
+/// still match at the position it translates to. The first `@` here is followed
+/// by letters, not digits, so that candidate is rejected and the search
+/// continues to the real match much further along.
+#[test]
+fn test_lookbehind_prefix_candidate_rejected_before_real_match() {
+    let re = regex(r"(?<=@)\d+");
+    assert_eq!(
+        re.find("a@bcdefghijkl x@42").map(|m| (m.start(), m.end())),
+        Some((16, 18))
+    );
+    assert_eq!(spans(r"(?<=@)\d+", "a@bcdefghijkl x@42"), vec![(16, 18)]);
+}
+
+/// Every match of a leading-lookbehind pattern over a multi-match haystack,
+/// which is the path a literal prefilter drives candidate by candidate.
+#[test]
+fn test_lookbehind_prefix_multi_match_spans() {
+    assert_eq!(
+        spans(r"(?<=@)\w+", "a@one b@two c@three"),
+        vec![(2, 5), (8, 11), (14, 19)]
+    );
+}
+
 /// A NEGATIVE lookbehind's literal is the text that must be absent, so it must
 /// never become a prefilter: searching for `@` would skip to precisely the
 /// positions that cannot match.
@@ -755,4 +779,88 @@ fn test_negative_lookbehind_literal_is_not_a_prefix() {
     // Only the first `a` qualifies: every later position has an `a` behind it.
     assert_eq!(spans(r"(?<!a)\w", "aab"), vec![(0, 1)]);
     assert!(regex(r"(?<!@)\w+").is_match("abc"));
+}
+
+// =============================================================================
+// End-first search (`\w+(?=ing\b)`)
+// =============================================================================
+
+/// The end of a match is NOT the literal occurrence that led to it.
+///
+/// `ing` occurs at 1 and at 4 in `"singing"`, and `\b` only holds after the one
+/// at 4. The answer's end is 4 — a position the literal scan proposes only as a
+/// *candidate end*, never as the start it walks back to, and which the anchored
+/// engine run at the discovered start is what actually produces.
+#[test]
+fn test_end_first_search_reports_the_start_not_the_literal() {
+    let re = regex(r"\w+(?=ing\b)");
+    assert_eq!(
+        re.find("singing").map(|m| (m.start(), m.end())),
+        Some((0, 4))
+    );
+    assert_eq!(spans(r"\w+(?=ing\b)", "singing"), vec![(0, 4)]);
+}
+
+/// Every span of an end-first search over a multi-match haystack. Iteration
+/// resumes at the previous match's end, which the reverse walk must never step
+/// back past.
+#[test]
+fn test_end_first_search_iteration_spans() {
+    assert_eq!(
+        spans(r"\w+(?=ing\b)", "singing ringing"),
+        vec![(0, 4), (8, 12)]
+    );
+    // The run before the *second* `ing` stops at the space, so only the first
+    // word matches — and it matches at length one, since `ing` follows `s`.
+    assert_eq!(spans(r"\w+(?=ing\b)", "sing ing"), vec![(0, 1)]);
+    // A leading occurrence has no run before it, so it is not a match end; the
+    // one at 3 is, and its run reaches back to 0.
+    assert_eq!(spans(r"\w+(?=ing\b)", "inging"), vec![(0, 3)]);
+    assert_eq!(spans(r"\w+(?=ing\b)", "ings"), vec![]);
+    assert_eq!(spans(r"\w+(?=ing\b)", ""), vec![]);
+}
+
+/// The literal is present and every occurrence still fails: `\w+` needs at
+/// least one character before it, and there is none.
+#[test]
+fn test_end_first_search_literal_without_a_match() {
+    let re = regex(r"\w+(?=ing\b)");
+    assert!(re.find("ing").is_none());
+    assert!(re.find(" ing").is_none());
+    assert!(re.find("ings").is_none());
+}
+
+/// A match starting in the *interior* of a class run. The first `xy` is not a
+/// match end (nothing precedes it in the run), but it is inside the run that
+/// the second `xy` ends, so the position it sits at is still a viable start.
+#[test]
+fn test_end_first_search_start_inside_a_run() {
+    assert_eq!(spans(r"[a-z]+(?=xy)", " xyxy"), vec![(1, 3)]);
+    assert_eq!(spans(r"[a-z]+(?=xy)", "abxy"), vec![(0, 2)]);
+    assert_eq!(spans(r"[a-z]+(?=xy)", " xy"), vec![]);
+}
+
+/// A `*` run may be empty, so a literal occurrence with nothing before it is
+/// still a match — of width zero.
+#[test]
+fn test_end_first_search_allows_an_empty_run() {
+    let re = regex(r"\w*(?=ing)");
+    assert_eq!(re.find("ings").map(|m| (m.start(), m.end())), Some((0, 0)));
+    assert_eq!(
+        re.find("singing").map(|m| (m.start(), m.end())),
+        Some((0, 4))
+    );
+    assert!(re.find("abc").is_none());
+}
+
+/// A run of multi-byte characters is walked one whole character at a time.
+#[test]
+fn test_end_first_search_over_a_codepoint_run() {
+    let re = regex(r"(?u:\w+(?=ing))");
+    // n a ï v e i n g — `ï` is two bytes, so `ing` begins at byte 6.
+    assert_eq!(
+        re.find("naïveing").map(|m| (m.start(), m.end())),
+        Some((0, 6))
+    );
+    assert!(re.find("ï ing").is_none());
 }
