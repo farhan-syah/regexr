@@ -147,16 +147,13 @@ impl TaggedNfa {
                         pos += 1;
                     }
                     // Backtrack until lookahead succeeds
-                    loop {
-                        let lookahead_match = Self::check_lookahead(lookahead_steps, input, pos);
-                        if *is_positive == lookahead_match {
-                            break; // Lookahead succeeded
-                        }
-                        if pos <= min_pos {
-                            return None; // Can't backtrack more
-                        }
-                        pos -= 1;
-                    }
+                    pos = Self::backtrack_to_lookahead(
+                        lookahead_steps,
+                        *is_positive,
+                        input,
+                        pos,
+                        min_pos,
+                    )?;
                 }
                 PatternStep::GreedyStarLookahead(byte_class, lookahead_steps, is_positive) => {
                     let min_pos = pos;
@@ -169,16 +166,13 @@ impl TaggedNfa {
                         pos += 1;
                     }
                     // Backtrack until lookahead succeeds
-                    loop {
-                        let lookahead_match = Self::check_lookahead(lookahead_steps, input, pos);
-                        if *is_positive == lookahead_match {
-                            break;
-                        }
-                        if pos <= min_pos {
-                            return None;
-                        }
-                        pos -= 1;
-                    }
+                    pos = Self::backtrack_to_lookahead(
+                        lookahead_steps,
+                        *is_positive,
+                        input,
+                        pos,
+                        min_pos,
+                    )?;
                 }
                 PatternStep::PositiveLookahead(inner_steps) => {
                     if !Self::check_lookahead(inner_steps, input, pos) {
@@ -307,6 +301,76 @@ impl TaggedNfa {
         }
 
         Some(pos)
+    }
+
+    /// Walks a greedy run back from its end at `pos` down to `min_pos`, returning
+    /// the longest end at which the lookahead assertion holds.
+    ///
+    /// The scan runs downward and takes the first success because a greedy
+    /// quantifier prefers the longest run.
+    ///
+    /// When the assertion is positive and its pattern starts with a literal
+    /// byte, only positions holding that byte can satisfy it — the recursive
+    /// checker's `Byte` arm rejects every other position on its first step — so
+    /// those positions are jumped over with a reverse byte search instead of
+    /// being re-checked one at a time. A negative assertion is deliberately
+    /// excluded: it is satisfied at *most* positions, which are exactly the ones
+    /// such a skip would pass over.
+    fn backtrack_to_lookahead(
+        lookahead_steps: &[PatternStep],
+        is_positive: bool,
+        input: &[u8],
+        mut pos: usize,
+        min_pos: usize,
+    ) -> Option<usize> {
+        // One jump before the walk, never inside it. A positive assertion that
+        // opens on a literal byte cannot hold anywhere that byte is absent, so
+        // the stretch between the greedy end and the last occurrence is skipped
+        // outright. The walk itself is left exactly as it was: putting the skip
+        // in the loop measured slower than the decrement it replaced, because
+        // the runs being walked are short enough that the extra test per step
+        // costs more than the steps it saves.
+        if is_positive {
+            if let Some(PatternStep::Byte(b)) = lookahead_steps.first() {
+                if !Self::byte_at(input, pos, *b) {
+                    pos = Self::last_byte_in(input, *b, min_pos, pos)?;
+                }
+            }
+        }
+        loop {
+            let lookahead_match = Self::check_lookahead(lookahead_steps, input, pos);
+            if is_positive == lookahead_match {
+                return Some(pos); // Lookahead succeeded
+            }
+            if pos <= min_pos {
+                return None; // Can't backtrack more
+            }
+            pos -= 1;
+        }
+    }
+
+    /// Whether `input[pos]` is `needle`, false past the end of the input.
+    fn byte_at(input: &[u8], pos: usize, needle: u8) -> bool {
+        input.get(pos).is_some_and(|&b| b == needle)
+    }
+
+    /// The greatest index in `[min_pos, end)` holding `needle`, if any.
+    ///
+    /// `end` is clamped to the input length, since a greedy run may reach the
+    /// end of input, and an empty or inverted window yields `None` rather than
+    /// slicing out of range.
+    #[inline]
+    fn last_byte_in(input: &[u8], needle: u8, min_pos: usize, end: usize) -> Option<usize> {
+        let end = end.min(input.len());
+        if end <= min_pos {
+            return None;
+        }
+        let window = &input[min_pos..end];
+        #[cfg(feature = "simd")]
+        let offset = crate::simd::memrchr(needle, window);
+        #[cfg(not(feature = "simd"))]
+        let offset = window.iter().rposition(|&b| b == needle);
+        offset.map(|i| min_pos + i)
     }
 
     /// Checks if the lookahead pattern matches at the given position.
@@ -692,6 +756,125 @@ impl TaggedNfa {
             return Some((cp, 4));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod greedy_lookahead_skip_tests {
+    use super::*;
+    use crate::nfa::tagged::steps::StepExtractor;
+
+    /// Extracts the step program for `pattern`, asserting that it really uses a
+    /// combined greedy+lookahead step.
+    ///
+    /// Without that assertion the tests would be blind: if extraction declined
+    /// the pattern, or emitted a codepoint run instead, the engine would still
+    /// answer correctly through another path and the backtracking loop under
+    /// test would never execute.
+    fn combined_steps_for(pattern: &str) -> Vec<PatternStep> {
+        let ast = crate::parser::parse(pattern).unwrap();
+        let hir = crate::hir::translate(&ast).unwrap();
+        let nfa = crate::nfa::compile(&hir).unwrap();
+        let steps = StepExtractor::new(&nfa)
+            .extract()
+            .unwrap_or_else(|| panic!("step extraction declined {pattern:?}"));
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                PatternStep::GreedyPlusLookahead(_, _, _)
+                    | PatternStep::GreedyStarLookahead(_, _, _)
+            )),
+            "{pattern:?} extracted no combined greedy+lookahead step: {steps:?}"
+        );
+        steps
+    }
+
+    #[test]
+    fn backtrack_lands_on_the_occurrence_that_satisfies_the_assertion() {
+        // "ing" occurs at 1 and at 4, but only the one at 4 is followed by a
+        // word boundary, so a skip that lands on the wrong occurrence shows up
+        // here immediately.
+        let steps = combined_steps_for(r"\w+(?=ing\b)");
+        assert_eq!(TaggedNfa::find(&steps, b"singing"), Some((0, 4)));
+    }
+
+    #[test]
+    fn skip_does_not_overshoot_repeated_first_bytes() {
+        // The lookahead's first byte sits at 0, 2, 4 and 6 inside the run, and
+        // only the last of them is followed by "y" at the end of the haystack.
+        // A skip that searched the wrong window would settle on an earlier `x`
+        // and report a shorter match.
+        let steps = combined_steps_for(r"\w+(?=xy\b)");
+        assert_eq!(TaggedNfa::find(&steps, b"xaxaxaxy"), Some((0, 6)));
+    }
+
+    #[test]
+    fn greedy_prefers_the_longer_of_two_valid_ends() {
+        // "ing" follows both position 1 and position 4. Greedy semantics demand
+        // the longer run, so the scan must stay downward-from-the-end and take
+        // its first success.
+        let steps = combined_steps_for(r"\w+(?=ing)");
+        assert_eq!(TaggedNfa::find(&steps, b"iinging"), Some((0, 4)));
+    }
+
+    #[test]
+    fn negative_lookahead_with_a_literal_first_byte_still_backtracks() {
+        // At the greedy end (2) the assertion's "s" matches, so the negative
+        // lookahead fails and the run must shrink to 1, where "b" is not "s".
+        // Skipping to positions holding "s" would jump over exactly the
+        // positions that satisfy a negative assertion and report no match.
+        let steps = combined_steps_for(r"[a-r]+(?!s)");
+        assert_eq!(TaggedNfa::find(&steps, b"abs"), Some((0, 1)));
+        let steps = combined_steps_for(r"[a-r]+(?!s\b)");
+        assert_eq!(TaggedNfa::find(&steps, b"abs"), Some((0, 1)));
+    }
+
+    #[test]
+    fn negative_lookahead_satisfied_at_the_greedy_end_keeps_the_whole_run() {
+        let steps = combined_steps_for(r"\w+(?![s]\b)");
+        assert_eq!(TaggedNfa::find(&steps, b"cats"), Some((0, 4)));
+    }
+
+    #[test]
+    fn star_variant_skips_the_same_way() {
+        // The step program is built by hand rather than extracted: every
+        // `<class>*(?=<literal>)` spelling tried is declined by
+        // `StepExtractor` (a nullable run beside an assertion trips its
+        // soundness guard), so `GreedyStarLookahead` is unreachable from a
+        // pattern string and this arm would otherwise go untested.
+        use crate::nfa::state::{ByteClass, ByteRange};
+        let word = ByteClass::new(vec![
+            ByteRange::new(b'0', b'9'),
+            ByteRange::new(b'A', b'Z'),
+            ByteRange::new(b'_', b'_'),
+            ByteRange::new(b'a', b'z'),
+        ]);
+        let steps = vec![PatternStep::GreedyStarLookahead(
+            word,
+            vec![
+                PatternStep::Byte(b'i'),
+                PatternStep::Byte(b'n'),
+                PatternStep::Byte(b'g'),
+            ],
+            true,
+        )];
+        // Empty run: the assertion holds at the start position itself.
+        assert_eq!(TaggedNfa::find(&steps, b"ing"), Some((0, 0)));
+        // Longest valid run wins here too.
+        assert_eq!(TaggedNfa::find(&steps, b"singing"), Some((0, 4)));
+    }
+
+    #[test]
+    fn run_reaching_end_of_input_and_exhausted_windows() {
+        let steps = combined_steps_for(r"\w+(?=ing)");
+        // The run reaches `input.len()`, where the assertion cannot hold; the
+        // skip must step back to position 1, which is also the shortest run the
+        // `+` allows.
+        assert_eq!(TaggedNfa::find(&steps, b"sing"), Some((0, 1)));
+        // The literal never occurs, so every start position runs out of window.
+        let steps = combined_steps_for(r"\w+(?=zz)");
+        assert_eq!(TaggedNfa::find(&steps, b"ab"), None);
+        assert_eq!(TaggedNfa::find(&steps, b""), None);
     }
 }
 
