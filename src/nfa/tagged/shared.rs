@@ -314,7 +314,7 @@ pub enum PatternStep {
     /// The ByteClass has precomputed bitmap for O(1) matching.
     GreedyPlus(ByteClass),
     /// Greedy zero-or-more repetition of byte class.
-    #[allow(dead_code)]
+    /// The ByteClass has precomputed bitmap for O(1) matching.
     GreedyStar(ByteClass),
     /// Greedy one-or-more with lookahead: matches as many as possible, then backtracks
     /// until the lookahead succeeds. (byte_class, lookahead_steps, is_positive)
@@ -322,23 +322,19 @@ pub enum PatternStep {
     /// Greedy zero-or-more with lookahead: matches as many as possible, then backtracks
     /// until the lookahead succeeds. (byte_class, lookahead_steps, is_positive)
     ///
-    /// **No pattern string reaches this variant today**, which is what the
-    /// `dead_code` allowance is for. Both combiners build it from a `GreedyStar`
-    /// followed by a lookahead, but `StepExtractor::extract` runs its
-    /// assertion-tally guard *before* combining, and a nullable run beside an
-    /// assertion is exactly the shape that guard rejects — the quantifier split
-    /// duplicates the assertion into both branches. So extraction declines the
-    /// whole pattern and nothing is left to combine, in the interpreter and in
-    /// the JIT alike (the JIT's combiner also recurses into `Alt` branches, but
-    /// it is fed the same already-guarded program).
+    /// Reached by a nullable greedy run followed by a lookahead — `\w*(?=ing)`,
+    /// `[a-z]*(?!xy)` — which both combiners build from a `GreedyStar` and the
+    /// lookahead step after it.
     ///
-    /// The consequence is a performance one, not a correctness one:
-    /// `\w*(?=ing)` and friends get `steps == None` and fall back to the PikeVM
-    /// (see `TaggedNfaEngine::find_at`), the slowest engine available. This
-    /// variant is what would serve them if that guard were ever refined, so it
-    /// is kept rather than deleted. `steps::tests` pins the decline, so relaxing
-    /// the guard fails there first and says so.
-    #[allow(dead_code)]
+    /// That depends on `extract_from_state` recognising the `X*` split
+    /// *structurally* and emitting one `GreedyStar`. Modelled instead as an
+    /// `Alt` of "took some"/"took none", as any shape that recognition declines
+    /// still is, the pattern never gets here: a trailing lookaround is compiled
+    /// onto the match state, which the branch walk reads as unsupported, so
+    /// extraction returns nothing and the pattern falls back to the PikeVm (see
+    /// `TaggedNfaEngine::find_at`), the slowest engine available.
+    /// `steps::nullable_run_with_assertion_tests` pins which shapes reach this
+    /// variant and which still fall back.
     GreedyStarLookahead(ByteClass, Vec<PatternStep>, bool),
     /// Non-greedy one-or-more repetition of byte class.
     /// Contains the byte class to repeat and the following step(s) that terminate the loop.

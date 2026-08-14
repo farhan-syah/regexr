@@ -837,27 +837,12 @@ mod greedy_lookahead_skip_tests {
 
     #[test]
     fn star_variant_skips_the_same_way() {
-        // The step program is built by hand rather than extracted: every
-        // `<class>*(?=<literal>)` spelling tried is declined by
-        // `StepExtractor` (a nullable run beside an assertion trips its
-        // soundness guard), so `GreedyStarLookahead` is unreachable from a
-        // pattern string and this arm would otherwise go untested.
-        use crate::nfa::state::{ByteClass, ByteRange};
-        let word = ByteClass::new(vec![
-            ByteRange::new(b'0', b'9'),
-            ByteRange::new(b'A', b'Z'),
-            ByteRange::new(b'_', b'_'),
-            ByteRange::new(b'a', b'z'),
-        ]);
-        let steps = vec![PatternStep::GreedyStarLookahead(
-            word,
-            vec![
-                PatternStep::Byte(b'i'),
-                PatternStep::Byte(b'n'),
-                PatternStep::Byte(b'g'),
-            ],
-            true,
-        )];
+        // `StepExtractor` recognises the nullable run structurally and emits a
+        // `GreedyStar`, which the combiner folds into the star-shaped combined
+        // step — so this arm is exercised from a pattern string rather than
+        // from a hand-built program. `steps::nullable_run_with_assertion_tests`
+        // pins that it is the star form and not the plus form.
+        let steps = combined_steps_for(r"\w*(?=ing)");
         // Empty run: the assertion holds at the start position itself.
         assert_eq!(TaggedNfa::find(&steps, b"ing"), Some((0, 0)));
         // Longest valid run wins here too.

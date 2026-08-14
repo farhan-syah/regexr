@@ -631,6 +631,61 @@ impl<'a> StepExtractor<'a> {
         false
     }
 
+    /// Recognises the NFA shape a *greedy* `X*` over a byte class compiles to,
+    /// at a split state whose epsilons are exactly `[enter, exit]`.
+    ///
+    /// On success returns the repeated class's byte ranges and the loop state,
+    /// so the caller can emit one `GreedyStar` and continue the walk at `exit`.
+    ///
+    /// `ThompsonBuilder::build_star` emits, for the greedy form, a split state
+    /// preferring the body (`epsilon = [body.start, end]`) and a body-end state
+    /// preferring another iteration (`epsilon = [body.start, end]` again). The
+    /// non-greedy form reverses both orders *and* routes the exit through a
+    /// `NonGreedyExit` marker state, so demanding the greedy order exactly is
+    /// what keeps `X*?` out of this path — a marker carries an instruction and
+    /// no byte transitions, and is refused below.
+    ///
+    /// The demand that the loop's own exit is *the same state* as the split's
+    /// exit is what separates a quantifier split from a genuine alternation: in
+    /// `(?:a+|b)` the `a+` loop leaves to the plus fragment's end, not to the
+    /// state the `b` branch starts at, so this answers `None` and the caller
+    /// keeps its `Alt` treatment. Without that check the pattern would be
+    /// silently miscompiled as `a*b`.
+    ///
+    /// The body must be a bare byte class and nothing else: an instruction, an
+    /// epsilon or a match flag on it would mean something a `GreedyStar` does
+    /// not carry, so those shapes are declined too (`\p{L}*`, `(?:ab)*`, `\s*`
+    /// where the class expands to an alternation of UTF-8 shapes).
+    fn greedy_star_body(&self, enter: StateId, exit: StateId) -> Option<(Vec<ByteRange>, StateId)> {
+        let body = self.nfa.get(enter)?;
+        if !body.epsilon.is_empty() || body.instruction.is_some() || body.is_match {
+            return None;
+        }
+        let &(_, loop_id) = body.transitions.first()?;
+        if !body.transitions.iter().all(|(_, t)| *t == loop_id) {
+            return None;
+        }
+
+        let loop_state = self.nfa.get(loop_id)?;
+        if !loop_state.transitions.is_empty()
+            || loop_state.instruction.is_some()
+            || loop_state.is_match
+        {
+            return None;
+        }
+        // Greedy order: another iteration first, the exit second — and that
+        // exit is the split's own exit.
+        let [loop_back, loop_exit] = loop_state.epsilon.as_slice() else {
+            return None;
+        };
+        if *loop_back != enter || *loop_exit != exit {
+            return None;
+        }
+
+        let ranges = body.transitions.iter().map(|(r, _)| *r).collect();
+        Some((ranges, loop_id))
+    }
+
     fn extract_from_state(&self, start: StateId, visited: &mut [bool]) -> Vec<PatternStep> {
         let mut steps = Vec::new();
         let mut current = start;
@@ -806,6 +861,44 @@ impl<'a> StepExtractor<'a> {
                 visited[current as usize] = true;
                 current = state.epsilon[0];
                 continue;
+            }
+
+            // A nullable greedy run (`X*`) is a split state, and the generic
+            // alternation path below models it as a two-branch `Alt` with every
+            // trailing step duplicated into both branches. That duplication is
+            // what the assertion tally rejects (`\w*$`, `\w*\b`), and for a
+            // trailing lookaround it is worse: that assertion is compiled onto
+            // the match state, where `extract_branch` reads it as unsupported
+            // (`terminal_assertion`) and abandons the whole walk, so
+            // `\w*(?=ing)` extracts nothing at all.
+            // Recognising the shape here emits a single `GreedyStar` and keeps
+            // the walk linear, so the trailing steps are extracted exactly once
+            // and stay on this engine instead of falling back to the PikeVm.
+            //
+            // Only the exact greedy `X*` shape takes this path — see
+            // `greedy_star_body`. Anything else, a non-greedy `X*?` and a
+            // genuine alternation included, falls through to the `Alt` handling
+            // below unchanged.
+            if let [enter, exit] = state.epsilon.as_slice() {
+                let (enter, exit) = (*enter, *exit);
+                if let Some((ranges, loop_state)) = self.greedy_star_body(enter, exit) {
+                    // Same cycle rule as the `GreedyPlus` case above: every
+                    // state this step consumes must be fresh, or a cyclic NFA
+                    // could walk it forever.
+                    let fresh = [current, enter, loop_state]
+                        .iter()
+                        .all(|&id| visited.get(id as usize).is_some_and(|seen| !*seen));
+                    if fresh {
+                        steps.push(PatternStep::GreedyStar(ByteClass::new(ranges)));
+                        for id in [current, enter, loop_state] {
+                            if let Some(seen) = visited.get_mut(id as usize) {
+                                *seen = true;
+                            }
+                        }
+                        current = exit;
+                        continue;
+                    }
+                }
             }
 
             // Multiple epsilon = alternation
@@ -1680,27 +1773,26 @@ mod extraction_budget_tests {
     }
 }
 
-/// Pins the shapes `extract` declines, and what that costs.
+/// Pins which nullable runs beside an assertion extract, and which still do not.
 ///
-/// These are not tests of a feature; they are tripwires under
-/// [`PatternStep::GreedyStarLookahead`], which no pattern string can currently
-/// reach. Both combiners build that variant from a `GreedyStar` followed by a
-/// lookahead, but the assertion-tally guard above runs first and rejects a
-/// nullable run beside an assertion — the quantifier split duplicates the
-/// assertion into both branches — so extraction declines and there is nothing
-/// left to combine.
+/// A greedy `X*` over a byte class is recognised structurally by
+/// `greedy_star_body` and emitted as one [`PatternStep::GreedyStar`], so the
+/// steps after it are extracted once and the pattern stays on this engine —
+/// that is what makes [`PatternStep::GreedyStarLookahead`] reachable from a
+/// pattern string at all.
 ///
-/// Declining is correct, and the guard must not be "fixed" as a mis-model: an
-/// attempt to emit the trailing steps once instead of per branch produced 23
-/// reference divergences. But it is not free either. A declined pattern gets
-/// `steps == None` and falls back to the PikeVM, so `\w*(?=ing)` runs on the
-/// slowest engine while its non-nullable sibling `\w+(?=ing)` takes the fast
-/// combined path.
+/// Every other nullable shape is still modelled as an `Alt` of "took
+/// some"/"took none", which duplicates the trailing steps into both branches.
+/// That `Alt` must not be "fixed" by emitting the trailing steps once: an
+/// attempt to do so produced 23 reference divergences. So those shapes stay
+/// declined — a duplicated assertion trips the tally guard, and a *trailing*
+/// lookaround is compiled onto the match state, which `extract_branch` reads as
+/// unsupported and gives up on — and fall back to the PikeVm, the slowest
+/// engine available.
 ///
-/// If the guard is ever refined so these extract, these tests fail — and that
-/// failure is the signal that `GreedyStarLookahead` has become live and needs
-/// real coverage, because the only thing exercising its interpreter arm today
-/// is a hand-built step program.
+/// Both directions are pinned on purpose: the first test fails if the
+/// recognition stops firing, the rest if it starts firing on a shape it must
+/// leave alone.
 #[cfg(test)]
 mod nullable_run_with_assertion_tests {
     use super::*;
@@ -1714,8 +1806,14 @@ mod nullable_run_with_assertion_tests {
         StepExtractor::new(&nfa).extract()
     }
 
+    fn has_star_lookahead(steps: &[PatternStep]) -> bool {
+        steps
+            .iter()
+            .any(|s| matches!(s, PatternStep::GreedyStarLookahead(_, _, _)))
+    }
+
     #[test]
-    fn a_nullable_run_beside_an_assertion_is_declined() {
+    fn a_greedy_byte_class_run_beside_an_assertion_now_extracts() {
         // Bare, and with a consuming prefix so the run is not at the start.
         for pattern in [
             r"\w*(?=ing)",
@@ -1723,24 +1821,74 @@ mod nullable_run_with_assertion_tests {
             r"[a-z]*(?=xy)",
             r"\d[a-z]*(?=xy)",
             r"[a-z]*(?=x)",
-            // Nested in an alternation branch: the JIT's combiner recurses into
-            // `Alt`, so this is the shape that would reach it if any did.
-            r"(?:x|\w*(?=ing))",
-            r"(?:\w*(?=ing)|q)",
+            r"\w*(?!ing)",
         ] {
+            let steps =
+                extract(pattern).unwrap_or_else(|| panic!("{pattern:?} no longer extracts at all"));
             assert!(
-                extract(pattern).is_none(),
-                "{pattern:?} now extracts; GreedyStarLookahead may have become \
-                 reachable — see the type's doc comment"
+                has_star_lookahead(&steps),
+                "{pattern:?} extracted no combined greedy-star+lookahead step: {steps:?}"
             );
         }
     }
 
     #[test]
+    fn a_nullable_run_that_is_not_a_greedy_byte_class_is_still_declined() {
+        for (pattern, why) in [
+            // Non-greedy: the split prefers the exit and routes it through a
+            // `NonGreedyExit` marker, which is not the shape recognised.
+            (r"\w*?(?=ing)", "non-greedy star"),
+            // Multi-state body: the loop state carries byte transitions of its
+            // own, so it is not a single repeated class.
+            (r"(?:ab)*(?=x)", "multi-state body"),
+            // Codepoint-class body: the body state carries an instruction.
+            (r"\p{L}*(?=x)", "codepoint class body"),
+            // `X?` is a split whose body never loops back.
+            (r"\w?(?=ing)", "optional, not a repeat"),
+            // Nested in an alternation branch: the recognition lives in the
+            // top-level walk, and the branch walk refuses a split that can
+            // re-enter itself, so the inner run is never reached.
+            (r"(?:x|\w*(?=ing))", "nullable run inside an Alt branch"),
+            (r"(?:\w*(?=ing)|q)", "nullable run inside an Alt branch"),
+        ] {
+            assert!(
+                extract(pattern).is_none(),
+                "{pattern:?} ({why}) now extracts; the structural star check may \
+                 be too loose"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuine_alternation_is_not_recognised_as_a_star() {
+        // `(?:a+|b)` reaches the same split-with-two-epsilons shape, but the
+        // loop's exit is the plus fragment's end, not the state the `b` branch
+        // starts at. Recognising it as a star would silently compile `a*b`.
+        for pattern in [r"(?:a+|b)", r"(?:a+|b)c"] {
+            let steps =
+                extract(pattern).unwrap_or_else(|| panic!("{pattern:?} no longer extracts"));
+            assert!(
+                !steps
+                    .iter()
+                    .any(|s| matches!(s, PatternStep::GreedyStar(_)))
+                    && !has_star_lookahead(&steps),
+                "{pattern:?} was miscompiled as `a*b`: {steps:?}"
+            );
+        }
+        // The same shape with the trailing lookahead that makes the branch walk
+        // give up: it must stay declined rather than be rescued by a star
+        // recognition that ignores where the loop exits.
+        assert!(
+            extract(r"(?:\w+|x)(?=ing)").is_none(),
+            "an alternation was recognised as a star: the exit-convergence check \
+             is too loose"
+        );
+    }
+
+    #[test]
     fn the_non_nullable_sibling_still_takes_the_fast_path() {
-        // `+` instead of `*`: no zero-width branch, so nothing is duplicated,
-        // the tally matches, and the combined step is built. This is what the
-        // declined patterns above are missing out on.
+        // `+` instead of `*`: the loop is entered unconditionally, so there is
+        // no split to recognise and the plus-shaped combined step is built.
         let steps = extract(r"\w+(?=ing)").expect("plus form extracts");
         assert!(
             steps
