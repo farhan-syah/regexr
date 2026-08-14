@@ -272,6 +272,30 @@ fn tagged_jit_agrees_with_its_interpreter() {
     );
 }
 
+/// A pattern that can match empty must still end its search.
+///
+/// The unanchored loop bounds itself on `len - start_pos`, which wraps once
+/// `start_pos` passes the end. Only a zero minimum length gets that far, so a
+/// nullable pattern with no match anywhere is the one shape that can leave the
+/// generated code spinning — and it does so as a hang, which the agreement
+/// sweep above reports only as a timeout.
+#[test]
+fn a_nullable_pattern_that_never_matches_terminates() {
+    for pattern in [r"a*(?=b)", r"a*(?!a)b", r"[0-9]*(?=z)", r"\w*(?=ing\b)"] {
+        for input in ["", "x", "xxxxxxxx"] {
+            let jitted = RegexBuilder::new(pattern).jit(true).build().unwrap();
+            assert_eq!(
+                jitted.find(input).map(|m| (m.start(), m.end())),
+                Regex::new(pattern)
+                    .unwrap()
+                    .find(input)
+                    .map(|m| (m.start(), m.end())),
+                "{pattern:?} on {input:?}"
+            );
+        }
+    }
+}
+
 /// The shapes that stay deferred must actually stay deferred.
 ///
 /// Without this the guard could be loosened to nothing and the test above would

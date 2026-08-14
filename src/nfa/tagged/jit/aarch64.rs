@@ -1012,7 +1012,11 @@ impl TaggedNfaJitCompiler {
             ; =>start_loop
             ; sub x0, x20, x21
             ; cmp x0, min_len as u32
-            ; b.lo =>no_match
+            // Signed: once start_pos passes the end, `len - start_pos` wraps,
+            // and an unsigned test would read that as room to spare and keep
+            // searching forever. Reachable only when min_len is 0, since any
+            // larger minimum stops the loop at start_pos == len.
+            ; b.lt =>no_match
             ; mov x22, x21
         );
 
@@ -1683,7 +1687,8 @@ impl TaggedNfaJitCompiler {
             ; =>start_loop
             ; sub x0, x20, x21
             ; cmp x0, min_len as u32
-            ; b.lo =>no_match
+            // Signed, for the wrap described in `emit_match_fn`.
+            ; b.lt =>no_match
             ; mov x22, x21
             ; str x21, [x23]  // group 0 start
         );
