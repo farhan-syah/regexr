@@ -3,7 +3,7 @@
 use super::ast::*;
 use super::lexer::{EscapeKind, TokenKind};
 use super::state::Parser;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorKind, Result, Span};
 use crate::hir::unicode_data;
 use crate::hir::HORIZONTAL_WHITESPACE;
 
@@ -29,23 +29,37 @@ impl Parser<'_> {
 
     fn parse_class_inner(&mut self) -> Result<Expr> {
         let start_span = self.current.span;
+        let negated = self.open_class()?;
+
+        let mut ranges = self.leading_class_members()?;
+        ranges.extend(self.parse_class_term()?);
+        ranges = self.apply_class_set_ops(ranges)?;
+
+        self.close_class(start_span, ranges, negated)
+    }
+
+    /// Consumes `[` and any `^`, reporting whether the class is negated.
+    #[inline(never)]
+    fn open_class(&mut self) -> Result<bool> {
         // Set in_class BEFORE advancing so the next token is lexed correctly
         self.lexer.set_in_class(true);
         self.advance()?; // consume '['
 
         // Check for negation
-        let negated = if matches!(self.current.kind, TokenKind::Caret) {
+        if matches!(self.current.kind, TokenKind::Caret) {
             self.advance()?;
-            true
+            Ok(true)
         } else {
-            false
-        };
+            Ok(false)
+        }
+    }
 
+    /// Handles a leading `]` or `-`, which are literal members there — but not
+    /// the leading `-` of a `--` operator, which has no left operand and must
+    /// be rejected rather than read as a hyphen.
+    #[inline(never)]
+    fn leading_class_members(&mut self) -> Result<Vec<ClassRange>> {
         let mut ranges = Vec::new();
-
-        // Handle leading ] or - (but not the leading '-' of a `--` operator,
-        // which has no left operand and must be rejected, not read as a
-        // literal hyphen).
         if matches!(self.current.kind, TokenKind::CloseBracket) {
             ranges.push(ClassRange::single(']'));
             self.advance()?;
@@ -53,9 +67,43 @@ impl Parser<'_> {
             ranges.push(ClassRange::single('-'));
             self.advance()?;
         }
+        Ok(ranges)
+    }
 
-        ranges.extend(self.parse_class_term()?);
+    /// Consumes the closing `]` and builds the class node.
+    #[inline(never)]
+    fn close_class(
+        &mut self,
+        start_span: Span,
+        ranges: Vec<ClassRange>,
+        negated: bool,
+    ) -> Result<Expr> {
+        self.lexer.set_in_class(false);
 
+        if matches!(self.current.kind, TokenKind::Eof) {
+            return Err(Error::with_span(
+                ErrorKind::UnmatchedOpenBracket,
+                self.pattern,
+                start_span,
+            ));
+        }
+
+        self.advance()?; // consume ']'
+
+        if ranges.is_empty() {
+            return Err(Error::with_span(
+                ErrorKind::EmptyClass,
+                self.pattern,
+                start_span,
+            ));
+        }
+
+        Ok(Expr::Class(Box::new(Class::new(ranges, negated))))
+    }
+
+    /// Applies any `&&`/`--`/`~~` operators following the first term.
+    #[inline(never)]
+    fn apply_class_set_ops(&mut self, mut ranges: Vec<ClassRange>) -> Result<Vec<ClassRange>> {
         while let Some(op) = self.peek_set_op() {
             let op_span = self.current.span;
             if ranges.is_empty() {
@@ -83,28 +131,7 @@ impl Parser<'_> {
 
             ranges = op.apply(&ranges, &rhs);
         }
-
-        self.lexer.set_in_class(false);
-
-        if matches!(self.current.kind, TokenKind::Eof) {
-            return Err(Error::with_span(
-                ErrorKind::UnmatchedOpenBracket,
-                self.pattern,
-                start_span,
-            ));
-        }
-
-        self.advance()?; // consume ']'
-
-        if ranges.is_empty() {
-            return Err(Error::with_span(
-                ErrorKind::EmptyClass,
-                self.pattern,
-                start_span,
-            ));
-        }
-
-        Ok(Expr::Class(Box::new(Class::new(ranges, negated))))
+        Ok(ranges)
     }
 
     /// Detects a doubled set-operator (`&&`, `--`, `~~`) starting at the
@@ -140,179 +167,200 @@ impl Parser<'_> {
             // alternation `[^(\s|[.,!])]`. Parse it recursively and union its
             // members into the parent (complementing a negated nested class).
             if matches!(self.current.kind, TokenKind::OpenBracket) {
-                if let Expr::Class(c) = self.parse_class()? {
-                    if c.negated {
-                        ranges.extend(complement_ranges(&c.ranges));
-                    } else {
-                        ranges.extend(c.ranges);
-                    }
-                }
+                self.extend_with_nested_class(&mut ranges)?;
                 continue;
             }
 
-            let item = self.parse_class_item()?;
-
-            match item {
-                ClassItem::Char(start_char) => {
-                    // Check for range, but not when the hyphen is actually
-                    // the start of a `--` (difference) operator — e.g. in
-                    // `[aeiou--a]` the `u` must not try to start a `u-?`
-                    // range and swallow half the operator.
-                    if matches!(self.current.kind, TokenKind::Hyphen)
-                        && self.peek_set_op().is_none()
-                    {
-                        self.advance()?;
-
-                        // Trailing hyphen
-                        if matches!(self.current.kind, TokenKind::CloseBracket) {
-                            ranges.push(ClassRange::single(start_char));
-                            ranges.push(ClassRange::single('-'));
-                            break;
-                        }
-
-                        let end_item = self.parse_class_item()?;
-                        match end_item {
-                            ClassItem::Char(end_char) => {
-                                if start_char > end_char {
-                                    return Err(Error::with_span(
-                                        ErrorKind::InvalidClassRange {
-                                            start: start_char,
-                                            end: end_char,
-                                        },
-                                        self.pattern,
-                                        self.current.span,
-                                    ));
-                                }
-                                ranges.push(ClassRange::new(start_char, end_char));
-                            }
-                            ClassItem::Ranges(r) => {
-                                // Can't have a range ending with a Perl class like [a-\d]
-                                // Just add start_char, hyphen, and the ranges
-                                ranges.push(ClassRange::single(start_char));
-                                ranges.push(ClassRange::single('-'));
-                                ranges.extend(r);
-                            }
-                            ClassItem::UnicodeProperty { name, negated: _ } => {
-                                // Can't have a range ending with a Unicode property like [a-\p{P}]
-                                // Just add start_char, hyphen, and expand the property
-                                ranges.push(ClassRange::single(start_char));
-                                ranges.push(ClassRange::single('-'));
-                                if let Some(code_point_ranges) = unicode_data::get_property(&name) {
-                                    for &(start, end) in code_point_ranges {
-                                        if (0xD800..=0xDFFF).contains(&start) {
-                                            continue;
-                                        }
-                                        let start = start.min(0x10FFFF);
-                                        let end = end.min(0x10FFFF);
-                                        if let (Some(s), Some(e)) =
-                                            (char::from_u32(start), char::from_u32(end))
-                                        {
-                                            ranges.push(ClassRange::new(s, e));
-                                        }
-                                    }
-                                } else {
-                                    return Err(Error::with_span(
-                                        ErrorKind::UnknownUnicodeProperty(name.clone()),
-                                        self.pattern,
-                                        self.current.span,
-                                    ));
-                                }
-                            }
-                        }
-                    } else {
-                        ranges.push(ClassRange::single(start_char));
-                    }
-                }
-                ClassItem::Ranges(r) => {
-                    // Perl class like \d, \w, \s - just add all ranges
-                    ranges.extend(r);
-                }
-                ClassItem::UnicodeProperty { name, negated } => {
-                    // Look up Unicode property and expand to ranges
-                    if let Some(code_point_ranges) = unicode_data::get_property(&name) {
-                        // Convert (u32, u32) code point ranges to ClassRange (char-based)
-                        for &(start, end) in code_point_ranges {
-                            // Skip surrogate range (U+D800-U+DFFF) since they're not valid chars
-                            if (0xD800..=0xDFFF).contains(&start) {
-                                continue;
-                            }
-                            // Clamp end to valid char range
-                            let start = start.min(0x10FFFF);
-                            let end = end.min(0x10FFFF);
-
-                            // Handle ranges that span across surrogates
-                            if start < 0xD800 && end > 0xDFFF {
-                                // Split into two ranges: before and after surrogates
-                                if let (Some(s), Some(e)) =
-                                    (char::from_u32(start), char::from_u32(0xD7FF))
-                                {
-                                    ranges.push(ClassRange::new(s, e));
-                                }
-                                if let (Some(s), Some(e)) =
-                                    (char::from_u32(0xE000), char::from_u32(end))
-                                {
-                                    ranges.push(ClassRange::new(s, e));
-                                }
-                            } else if start <= 0xD7FF && (0xD800..=0xDFFF).contains(&end) {
-                                // Range ends in surrogates, truncate
-                                if let (Some(s), Some(e)) =
-                                    (char::from_u32(start), char::from_u32(0xD7FF))
-                                {
-                                    ranges.push(ClassRange::new(s, e));
-                                }
-                            } else if (0xD800..=0xDFFF).contains(&start) && end > 0xDFFF {
-                                // Range starts in surrogates, start from after
-                                if let (Some(s), Some(e)) =
-                                    (char::from_u32(0xE000), char::from_u32(end))
-                                {
-                                    ranges.push(ClassRange::new(s, e));
-                                }
-                            } else if let (Some(s), Some(e)) =
-                                (char::from_u32(start), char::from_u32(end))
-                            {
-                                ranges.push(ClassRange::new(s, e));
-                            }
-                        }
-
-                        // Handle negation: compute complement for \P{} inside class
-                        if negated {
-                            // Compute complement: all characters NOT in the property ranges
-                            // The ranges we just added are the positive ranges, we need their complement
-                            let count_to_drain = code_point_ranges
-                                .iter()
-                                .filter(|&&(start, _)| {
-                                    // Count how many ranges we actually added
-                                    !(0xD800..=0xDFFF).contains(&start)
-                                })
-                                .map(|&(start, end)| {
-                                    let start = start.min(0x10FFFF);
-                                    let end = end.min(0x10FFFF);
-                                    if start < 0xD800 && end > 0xDFFF {
-                                        2
-                                    } else {
-                                        1
-                                    }
-                                })
-                                .sum::<usize>();
-                            let drain_start = ranges.len().saturating_sub(count_to_drain);
-                            let positive_ranges: Vec<ClassRange> =
-                                ranges.drain(drain_start..).collect();
-
-                            // Compute complement of positive_ranges
-                            ranges.extend(complement_ranges(&positive_ranges));
-                        }
-                    } else {
-                        return Err(Error::with_span(
-                            ErrorKind::UnknownUnicodeProperty(name.clone()),
-                            self.pattern,
-                            self.current.span,
-                        ));
-                    }
-                }
+            if !self.push_class_member(&mut ranges)? {
+                break;
             }
         }
 
         Ok(ranges)
+    }
+
+    /// Parses a nested class and unions its members into `ranges`. Separate
+    /// from `parse_class_term` to keep the frame held across the recursion
+    /// small; see [`DEFAULT_NEST_LIMIT`](super::DEFAULT_NEST_LIMIT).
+    #[inline(never)]
+    fn extend_with_nested_class(&mut self, ranges: &mut Vec<ClassRange>) -> Result<()> {
+        if let Expr::Class(c) = self.parse_class()? {
+            if c.negated {
+                ranges.extend(complement_ranges(&c.ranges));
+            } else {
+                ranges.extend(c.ranges);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses one non-nested class member — a character, a range, a Perl
+    /// class, a Unicode property — and pushes what it contributes onto
+    /// `ranges`. Returns `false` when the member ends the term, which a
+    /// trailing hyphen (`[a-]`) does. Out of line for the same stack reason as
+    /// [`Parser::extend_with_nested_class`].
+    #[inline(never)]
+    fn push_class_member(&mut self, ranges: &mut Vec<ClassRange>) -> Result<bool> {
+        let item = self.parse_class_item()?;
+
+        match item {
+            ClassItem::Char(start_char) => {
+                // Check for range, but not when the hyphen is actually
+                // the start of a `--` (difference) operator — e.g. in
+                // `[aeiou--a]` the `u` must not try to start a `u-?`
+                // range and swallow half the operator.
+                if matches!(self.current.kind, TokenKind::Hyphen) && self.peek_set_op().is_none() {
+                    self.advance()?;
+
+                    // Trailing hyphen
+                    if matches!(self.current.kind, TokenKind::CloseBracket) {
+                        ranges.push(ClassRange::single(start_char));
+                        ranges.push(ClassRange::single('-'));
+                        return Ok(false);
+                    }
+
+                    let end_item = self.parse_class_item()?;
+                    match end_item {
+                        ClassItem::Char(end_char) => {
+                            if start_char > end_char {
+                                return Err(Error::with_span(
+                                    ErrorKind::InvalidClassRange {
+                                        start: start_char,
+                                        end: end_char,
+                                    },
+                                    self.pattern,
+                                    self.current.span,
+                                ));
+                            }
+                            ranges.push(ClassRange::new(start_char, end_char));
+                        }
+                        ClassItem::Ranges(r) => {
+                            // Can't have a range ending with a Perl class like [a-\d]
+                            // Just add start_char, hyphen, and the ranges
+                            ranges.push(ClassRange::single(start_char));
+                            ranges.push(ClassRange::single('-'));
+                            ranges.extend(r);
+                        }
+                        ClassItem::UnicodeProperty { name, negated: _ } => {
+                            // Can't have a range ending with a Unicode property like [a-\p{P}]
+                            // Just add start_char, hyphen, and expand the property
+                            ranges.push(ClassRange::single(start_char));
+                            ranges.push(ClassRange::single('-'));
+                            if let Some(code_point_ranges) = unicode_data::get_property(&name) {
+                                for &(start, end) in code_point_ranges {
+                                    if (0xD800..=0xDFFF).contains(&start) {
+                                        continue;
+                                    }
+                                    let start = start.min(0x10FFFF);
+                                    let end = end.min(0x10FFFF);
+                                    if let (Some(s), Some(e)) =
+                                        (char::from_u32(start), char::from_u32(end))
+                                    {
+                                        ranges.push(ClassRange::new(s, e));
+                                    }
+                                }
+                            } else {
+                                return Err(Error::with_span(
+                                    ErrorKind::UnknownUnicodeProperty(name.clone()),
+                                    self.pattern,
+                                    self.current.span,
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    ranges.push(ClassRange::single(start_char));
+                }
+            }
+            ClassItem::Ranges(r) => {
+                // Perl class like \d, \w, \s - just add all ranges
+                ranges.extend(r);
+            }
+            ClassItem::UnicodeProperty { name, negated } => {
+                // Look up Unicode property and expand to ranges
+                if let Some(code_point_ranges) = unicode_data::get_property(&name) {
+                    // Convert (u32, u32) code point ranges to ClassRange (char-based)
+                    for &(start, end) in code_point_ranges {
+                        // Skip surrogate range (U+D800-U+DFFF) since they're not valid chars
+                        if (0xD800..=0xDFFF).contains(&start) {
+                            continue;
+                        }
+                        // Clamp end to valid char range
+                        let start = start.min(0x10FFFF);
+                        let end = end.min(0x10FFFF);
+
+                        // Handle ranges that span across surrogates
+                        if start < 0xD800 && end > 0xDFFF {
+                            // Split into two ranges: before and after surrogates
+                            if let (Some(s), Some(e)) =
+                                (char::from_u32(start), char::from_u32(0xD7FF))
+                            {
+                                ranges.push(ClassRange::new(s, e));
+                            }
+                            if let (Some(s), Some(e)) =
+                                (char::from_u32(0xE000), char::from_u32(end))
+                            {
+                                ranges.push(ClassRange::new(s, e));
+                            }
+                        } else if start <= 0xD7FF && (0xD800..=0xDFFF).contains(&end) {
+                            // Range ends in surrogates, truncate
+                            if let (Some(s), Some(e)) =
+                                (char::from_u32(start), char::from_u32(0xD7FF))
+                            {
+                                ranges.push(ClassRange::new(s, e));
+                            }
+                        } else if (0xD800..=0xDFFF).contains(&start) && end > 0xDFFF {
+                            // Range starts in surrogates, start from after
+                            if let (Some(s), Some(e)) =
+                                (char::from_u32(0xE000), char::from_u32(end))
+                            {
+                                ranges.push(ClassRange::new(s, e));
+                            }
+                        } else if let (Some(s), Some(e)) =
+                            (char::from_u32(start), char::from_u32(end))
+                        {
+                            ranges.push(ClassRange::new(s, e));
+                        }
+                    }
+
+                    // Handle negation: compute complement for \P{} inside class
+                    if negated {
+                        // Compute complement: all characters NOT in the property ranges
+                        // The ranges we just added are the positive ranges, we need their complement
+                        let count_to_drain = code_point_ranges
+                            .iter()
+                            .filter(|&&(start, _)| {
+                                // Count how many ranges we actually added
+                                !(0xD800..=0xDFFF).contains(&start)
+                            })
+                            .map(|&(start, end)| {
+                                let start = start.min(0x10FFFF);
+                                let end = end.min(0x10FFFF);
+                                if start < 0xD800 && end > 0xDFFF {
+                                    2
+                                } else {
+                                    1
+                                }
+                            })
+                            .sum::<usize>();
+                        let drain_start = ranges.len().saturating_sub(count_to_drain);
+                        let positive_ranges: Vec<ClassRange> =
+                            ranges.drain(drain_start..).collect();
+
+                        // Compute complement of positive_ranges
+                        ranges.extend(complement_ranges(&positive_ranges));
+                    }
+                } else {
+                    return Err(Error::with_span(
+                        ErrorKind::UnknownUnicodeProperty(name.clone()),
+                        self.pattern,
+                        self.current.span,
+                    ));
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     /// Parses a class item which can be a single char, a range, or a Perl class.

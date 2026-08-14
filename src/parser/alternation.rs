@@ -18,30 +18,40 @@ pub const MAX_REPETITION: u32 = 65535;
 /// costs roughly 5 stack frames across `parse_atom` / `parse_group` /
 /// `parse_alternation` / `parse_concat` / `parse_repeat` — so an unbounded
 /// pattern like `"(?:".repeat(50_000)` overflows the stack, which in Rust is
-/// an uncatchable SIGSEGV/abort rather than an `Err`. 250 levels costs about
-/// 1,250 frames, comfortably inside the 2 MiB stack Rust gives test threads
-/// even in debug builds, while still matching the depth other engines accept:
-/// both the `regex` crate's `nest_limit` and PCRE2's `parens_nest_limit`
-/// default to 250.
+/// an uncatchable SIGSEGV/abort rather than an `Err`.
+///
+/// The limit only helps if those frames stay small, which is why the group,
+/// class and atom parsers keep each branch in its own function: an unoptimized
+/// build gives every branch of a function its own stack slots. 250 is what
+/// `regex` and PCRE2 default to.
 pub const DEFAULT_NEST_LIMIT: u32 = 250;
 
 impl Parser<'_> {
     /// Parses alternation (lowest precedence): a|b|c
+    ///
+    /// Held across the nesting recursion, so the branch list is built in
+    /// `parse_alternation_rest` instead of here.
     pub(super) fn parse_alternation(&mut self) -> Result<Expr> {
-        let mut left = self.parse_concat()?;
+        let left = self.parse_concat()?;
 
         if matches!(self.current.kind, TokenKind::Pipe) {
-            let mut alternatives = vec![left];
+            self.parse_alternation_rest(left)
+        } else {
+            Ok(left)
+        }
+    }
 
-            while matches!(self.current.kind, TokenKind::Pipe) {
-                self.advance()?;
-                alternatives.push(self.parse_concat()?);
-            }
+    /// Collects `|`-separated branches after the first, positioned on the `|`.
+    #[inline(never)]
+    fn parse_alternation_rest(&mut self, first: Expr) -> Result<Expr> {
+        let mut alternatives = vec![first];
 
-            left = Expr::Alt(alternatives);
+        while matches!(self.current.kind, TokenKind::Pipe) {
+            self.advance()?;
+            alternatives.push(self.parse_concat()?);
         }
 
-        Ok(left)
+        Ok(Expr::Alt(alternatives))
     }
 
     /// Parses concatenation: abc
@@ -58,23 +68,7 @@ impl Parser<'_> {
             // only reach the AST's single global flag set, and would silently
             // apply to the whole pattern instead of the part after it.
             if self.flags != outer_flags {
-                // Capture before recursing: a later `(?flags)` in the rest of
-                // the branch moves `self.flags` on again.
-                let scoped_flags = self.flags;
-                // This is the parser's one self-recursion outside the
-                // group/class constructs: each `(?flags)` opens a new flag
-                // scope over the rest of the branch, so a run of them
-                // (`(?i)(?-i)(?i)...`) recurses one level per flag change
-                // with nothing bounding it otherwise. Only this call is
-                // wrapped — the recursion below `parse_alternation` already
-                // counts through `parse_group`/`parse_class`, and wrapping
-                // every `parse_concat` call (including once per alternative)
-                // would count sideways breadth as if it were depth.
-                let rest = self.with_nesting(Self::parse_concat)?;
-                exprs.push(Expr::Group(Box::new(Group {
-                    expr: rest,
-                    kind: GroupKind::Flagged(scoped_flags),
-                })));
+                exprs.push(self.parse_flag_scope()?);
                 break;
             }
         }
@@ -84,6 +78,22 @@ impl Parser<'_> {
             1 => exprs.pop().unwrap(),
             _ => Expr::Concat(exprs),
         })
+    }
+
+    /// Parses the rest of the branch under the flags a bare `(?flags)` just
+    /// set, wrapped in a group carrying them. The parser's one self-recursion
+    /// outside groups and classes, so the nesting count is taken here;
+    /// counting every `parse_concat` would read breadth as depth.
+    #[inline(never)]
+    fn parse_flag_scope(&mut self) -> Result<Expr> {
+        // Capture before recursing: a later `(?flags)` in the rest of the
+        // branch moves `self.flags` on again.
+        let scoped_flags = self.flags;
+        let rest = self.with_nesting(Self::parse_concat)?;
+        Ok(Expr::Group(Box::new(Group {
+            expr: rest,
+            kind: GroupKind::Flagged(scoped_flags),
+        })))
     }
 
     /// Returns true if the current token terminates concatenation.

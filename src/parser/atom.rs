@@ -6,8 +6,21 @@ use super::state::Parser;
 use crate::error::{Error, ErrorKind, Result};
 
 impl Parser<'_> {
-    /// Parses an atom (the smallest unit).
+    /// Parses an atom (the smallest unit). The two that recurse — group and
+    /// class — are dispatched here and the rest parsed in `parse_simple_atom`,
+    /// keeping the frame held across the recursion small; see
+    /// [`DEFAULT_NEST_LIMIT`](super::DEFAULT_NEST_LIMIT).
     pub(super) fn parse_atom(&mut self) -> Result<Expr> {
+        match self.current.kind {
+            TokenKind::OpenParen => self.parse_group(),
+            TokenKind::OpenBracket => self.parse_class(),
+            _ => self.parse_simple_atom(),
+        }
+    }
+
+    /// Every atom that cannot contain another expression.
+    #[inline(never)]
+    fn parse_simple_atom(&mut self) -> Result<Expr> {
         match &self.current.kind {
             TokenKind::Literal(c) => {
                 let c = *c;
@@ -36,8 +49,6 @@ impl Parser<'_> {
                 };
                 Ok(Expr::Anchor(anchor))
             }
-            TokenKind::OpenParen => self.parse_group(),
-            TokenKind::OpenBracket => self.parse_class(),
             TokenKind::Escape(esc) => self.parse_escape(esc.clone()),
             TokenKind::Digit(d) => {
                 let c = char::from_digit(*d, 10).unwrap();
