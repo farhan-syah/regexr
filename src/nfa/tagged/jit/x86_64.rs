@@ -5264,13 +5264,21 @@ impl TaggedNfaJitCompiler {
     /// may consume characters that are needed by the lookahead. This function
     /// combines them into GreedyPlusLookahead/GreedyStarLookahead which emit
     /// code that backtracks when the lookahead fails.
+    ///
+    /// Only folds a lookahead that ENDS the program (`i + 2 == steps.len()`):
+    /// the combined step yields a single position with no way to reconsider it,
+    /// which is wrong when steps still follow — see the sibling copy in
+    /// `steps::combine_greedy_with_lookahead` for the `[ab]+(?=b)bb` case this
+    /// guards against. This copy also recurses into `Alt` branches (below),
+    /// which the shared one deliberately does not; that divergence is
+    /// intentional, not a discrepancy to "fix" by unifying the two.
     fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep> {
         let mut result = Vec::with_capacity(steps.len());
         let mut i = 0;
 
         while i < steps.len() {
             match &steps[i] {
-                PatternStep::GreedyPlus(ranges) if i + 1 < steps.len() => {
+                PatternStep::GreedyPlus(ranges) if i + 2 == steps.len() => {
                     // Check if followed by lookahead
                     match &steps[i + 1] {
                         PatternStep::PositiveLookahead(inner) => {
@@ -5294,7 +5302,7 @@ impl TaggedNfaJitCompiler {
                         _ => {}
                     }
                 }
-                PatternStep::GreedyStar(ranges) if i + 1 < steps.len() => {
+                PatternStep::GreedyStar(ranges) if i + 2 == steps.len() => {
                     // Check if followed by lookahead
                     match &steps[i + 1] {
                         PatternStep::PositiveLookahead(inner) => {

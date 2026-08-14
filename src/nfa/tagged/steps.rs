@@ -7,13 +7,23 @@ use crate::nfa::{ByteClass, ByteRange, Nfa, NfaInstruction, NfaState, StateId};
 
 /// Combines greedy quantifiers followed by lookahead into combined variants.
 /// This is needed for both JIT and interpreter to handle backtracking correctly.
+///
+/// Only a lookahead that ENDS the program is folded in. The combined step
+/// resolves the run and the assertion together and yields one position — the
+/// largest the assertion accepts — with no way to reconsider it. That is
+/// complete when nothing follows, and wrong when something does: `[ab]+(?=b)bb`
+/// on `"abbabb"` settles the run at 5, fails `bb` off the end of the input, and
+/// reports no match where `(0, 6)` is correct. Left uncombined, the plain
+/// `GreedyPlus` step retries the whole remainder at each backtrack position and
+/// finds it. The lookahead-terminated shape this exists to accelerate —
+/// `\w+(?=ing\b)` — is unaffected, since there the assertion is the last step.
 pub fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep> {
     let mut result = Vec::with_capacity(steps.len());
     let mut i = 0;
 
     while i < steps.len() {
         match &steps[i] {
-            PatternStep::GreedyPlus(ranges) if i + 1 < steps.len() => match &steps[i + 1] {
+            PatternStep::GreedyPlus(ranges) if i + 2 == steps.len() => match &steps[i + 1] {
                 PatternStep::PositiveLookahead(inner) => {
                     result.push(PatternStep::GreedyPlusLookahead(
                         ranges.clone(),
@@ -34,7 +44,7 @@ pub fn combine_greedy_with_lookahead(steps: Vec<PatternStep>) -> Vec<PatternStep
                 }
                 _ => {}
             },
-            PatternStep::GreedyStar(ranges) if i + 1 < steps.len() => match &steps[i + 1] {
+            PatternStep::GreedyStar(ranges) if i + 2 == steps.len() => match &steps[i + 1] {
                 PatternStep::PositiveLookahead(inner) => {
                     result.push(PatternStep::GreedyStarLookahead(
                         ranges.clone(),
