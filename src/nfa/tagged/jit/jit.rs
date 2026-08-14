@@ -391,6 +391,27 @@ impl TaggedNfaJit {
         self.stride
     }
 
+    /// Finds a match beginning exactly at `pos`, returning (pos, end).
+    ///
+    /// The anchored counterpart of [`TaggedNfaJit::find_at`]. The generated code
+    /// has no anchored entry point — `find_fn` scans forward from the pointer it
+    /// is handed — so this runs the interpreter, which matches at an absolute
+    /// position with the full input visible.
+    pub(crate) fn match_at(&self, input: &[u8], pos: usize) -> Option<(usize, usize)> {
+        if pos > input.len() {
+            return None;
+        }
+        // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`).
+        if !crate::nfa::is_utf8_boundary(input, pos) {
+            return None;
+        }
+        if let Some(ref steps) = self.fallback_steps {
+            return TaggedNfa::match_at(steps, input, pos).map(|end| (pos, end));
+        }
+        // `find_at`, not `find_from`: the match must begin at `pos`.
+        self.fallback_vm.find_at(input, pos)
+    }
+
     /// Finds a match starting at or after the given position.
     pub fn find_at(&self, input: &[u8], start: usize) -> Option<(usize, usize)> {
         if start > input.len() {
@@ -484,4 +505,32 @@ pub fn compile_tagged_nfa(nfa: &Nfa) -> Result<TaggedNfaJit> {
 /// Compiles an NFA with pre-computed liveness analysis.
 pub fn compile_tagged_nfa_with_liveness(nfa: Nfa, liveness: NfaLiveness) -> Result<TaggedNfaJit> {
     TaggedNfaJitCompiler::compile(nfa, liveness)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn compile_jit(pattern: &str) -> TaggedNfaJit {
+        let ast = parse(pattern).unwrap();
+        let hir = translate(&ast).unwrap();
+        let nfa = crate::nfa::compile(&hir).unwrap();
+        compile_tagged_nfa(&nfa).expect("failed to JIT-compile pattern")
+    }
+
+    /// `match_at` answers about `pos` alone, unlike `find_at`, which searches
+    /// forward from it.
+    #[test]
+    fn match_at_is_anchored_to_the_position() {
+        // A greedy repeat next to a lookaround is deferred to the interpreter,
+        // so this stays a single class to exercise the JIT wrapper itself.
+        let jit = compile_jit(r"(?<=@)\w");
+        let input: &[u8] = b"user @name";
+        assert_eq!(jit.match_at(input, 0), None);
+        assert_eq!(jit.match_at(input, 6), Some((6, 7)));
+        assert_eq!(jit.find_at(input, 0), Some((6, 7)));
+        assert_eq!(jit.match_at(input, input.len() + 1), None);
+    }
 }

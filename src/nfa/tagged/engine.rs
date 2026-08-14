@@ -71,6 +71,29 @@ impl TaggedNfaEngine {
         self.pike_vm.find_from(input, start)
     }
 
+    /// Finds a match beginning exactly at `pos`, returning (pos, end).
+    ///
+    /// The anchored counterpart of [`TaggedNfaEngine::find_at`]: no later start
+    /// is tried, so a caller verifying prefilter candidates one at a time gets
+    /// an answer about `pos` alone instead of a scan to the end of the input.
+    pub(crate) fn match_at(&self, input: &[u8], pos: usize) -> Option<(usize, usize)> {
+        if pos > input.len() {
+            return None;
+        }
+        // Only start at UTF-8 codepoint boundaries (see `is_utf8_boundary`);
+        // `find_at`'s loop applies the same rule to every start it tries.
+        if !crate::nfa::is_utf8_boundary(input, pos) {
+            return None;
+        }
+        // Use fast step-based interpreter if pattern steps were extracted
+        if let Some(ref steps) = self.steps {
+            return TaggedNfa::match_at(steps, input, pos).map(|end| (pos, end));
+        }
+        // Fall back to PikeVm. `find_at`, not `find_from`: this method requires
+        // the match to begin at `pos`, which is what `PikeVm::find_at` tries.
+        self.pike_vm.find_at(input, pos)
+    }
+
     /// Returns capture groups for the first match.
     pub fn captures(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         self.captures_from(input, 0)
@@ -88,5 +111,45 @@ impl TaggedNfaEngine {
         let mut ctx = self.pike_ctx.write().unwrap();
         self.pike_vm
             .captures_unanchored_with_context(input, &mut ctx, start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn engine(pattern: &str) -> TaggedNfaEngine {
+        let ast = parse(pattern).unwrap();
+        let hir = translate(&ast).unwrap();
+        let nfa = crate::nfa::compile(&hir).unwrap();
+        TaggedNfaEngine::new(nfa)
+    }
+
+    /// `match_at` answers about `pos` alone. `find_at` searches forward from it,
+    /// which is why a prefilter driven through `find_at` never filters: the
+    /// first candidate scans to the end of the input.
+    #[test]
+    fn match_at_is_anchored_to_the_position() {
+        let engine = engine(r"\d+");
+        let input: &[u8] = b"abc 42";
+        assert_eq!(engine.match_at(input, 0), None);
+        assert_eq!(engine.match_at(input, 4), Some((4, 6)));
+        assert_eq!(engine.find_at(input, 0), Some((4, 6)));
+        assert_eq!(engine.match_at(input, input.len() + 1), None);
+    }
+
+    /// The same, for a lookbehind pattern — the shape that reaches this engine
+    /// with a literal prefilter in front of it.
+    #[test]
+    fn match_at_is_anchored_with_lookbehind() {
+        let engine = engine(r"(?<=@)\w+");
+        let input: &[u8] = b"user @name";
+        // `\w+` alone would match at 0; the lookbehind is what rejects it, and
+        // no later start is tried.
+        assert_eq!(engine.match_at(input, 0), None);
+        assert_eq!(engine.match_at(input, 6), Some((6, 10)));
+        assert_eq!(engine.find_at(input, 0), Some((6, 10)));
     }
 }

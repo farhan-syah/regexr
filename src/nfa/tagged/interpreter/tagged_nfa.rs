@@ -40,7 +40,11 @@ impl TaggedNfa {
     }
 
     /// Attempts to match at a specific position, returning the end position on success.
-    fn match_at(steps: &[PatternStep], input: &[u8], start: usize) -> Option<usize> {
+    ///
+    /// Anchored: only `start` is tried, so a pattern whose match begins later
+    /// reports `None`. Callers that want a search use [`TaggedNfa::find_at`],
+    /// which is this method run over each candidate start in turn.
+    pub(crate) fn match_at(steps: &[PatternStep], input: &[u8], start: usize) -> Option<usize> {
         Self::match_steps(steps, input, start)
     }
 
