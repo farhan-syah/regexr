@@ -321,6 +321,23 @@ pub enum PatternStep {
     GreedyPlusLookahead(ByteClass, Vec<PatternStep>, bool),
     /// Greedy zero-or-more with lookahead: matches as many as possible, then backtracks
     /// until the lookahead succeeds. (byte_class, lookahead_steps, is_positive)
+    ///
+    /// **No pattern string reaches this variant today**, which is what the
+    /// `dead_code` allowance is for. Both combiners build it from a `GreedyStar`
+    /// followed by a lookahead, but `StepExtractor::extract` runs its
+    /// assertion-tally guard *before* combining, and a nullable run beside an
+    /// assertion is exactly the shape that guard rejects — the quantifier split
+    /// duplicates the assertion into both branches. So extraction declines the
+    /// whole pattern and nothing is left to combine, in the interpreter and in
+    /// the JIT alike (the JIT's combiner also recurses into `Alt` branches, but
+    /// it is fed the same already-guarded program).
+    ///
+    /// The consequence is a performance one, not a correctness one:
+    /// `\w*(?=ing)` and friends get `steps == None` and fall back to the PikeVM
+    /// (see `TaggedNfaEngine::find_at`), the slowest engine available. This
+    /// variant is what would serve them if that guard were ever refined, so it
+    /// is kept rather than deleted. `steps::tests` pins the decline, so relaxing
+    /// the guard fails there first and says so.
     #[allow(dead_code)]
     GreedyStarLookahead(ByteClass, Vec<PatternStep>, bool),
     /// Non-greedy one-or-more repetition of byte class.

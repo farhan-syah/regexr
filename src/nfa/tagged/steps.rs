@@ -1669,3 +1669,74 @@ mod extraction_budget_tests {
         assert!(StepExtractor::new(&nfa).extract().is_none());
     }
 }
+
+/// Pins the shapes `extract` declines, and what that costs.
+///
+/// These are not tests of a feature; they are tripwires under
+/// [`PatternStep::GreedyStarLookahead`], which no pattern string can currently
+/// reach. Both combiners build that variant from a `GreedyStar` followed by a
+/// lookahead, but the assertion-tally guard above runs first and rejects a
+/// nullable run beside an assertion — the quantifier split duplicates the
+/// assertion into both branches — so extraction declines and there is nothing
+/// left to combine.
+///
+/// Declining is correct, and the guard must not be "fixed" as a mis-model: an
+/// attempt to emit the trailing steps once instead of per branch produced 23
+/// reference divergences. But it is not free either. A declined pattern gets
+/// `steps == None` and falls back to the PikeVM, so `\w*(?=ing)` runs on the
+/// slowest engine while its non-nullable sibling `\w+(?=ing)` takes the fast
+/// combined path.
+///
+/// If the guard is ever refined so these extract, these tests fail — and that
+/// failure is the signal that `GreedyStarLookahead` has become live and needs
+/// real coverage, because the only thing exercising its interpreter arm today
+/// is a hand-built step program.
+#[cfg(test)]
+mod nullable_run_with_assertion_tests {
+    use super::*;
+    use crate::hir::translate;
+    use crate::parser::parse;
+
+    fn extract(pattern: &str) -> Option<Vec<PatternStep>> {
+        let ast = parse(pattern).unwrap();
+        let hir = translate(&ast).unwrap();
+        let nfa = crate::nfa::compile(&hir).unwrap();
+        StepExtractor::new(&nfa).extract()
+    }
+
+    #[test]
+    fn a_nullable_run_beside_an_assertion_is_declined() {
+        // Bare, and with a consuming prefix so the run is not at the start.
+        for pattern in [
+            r"\w*(?=ing)",
+            r"a\w*(?=ing)",
+            r"[a-z]*(?=xy)",
+            r"\d[a-z]*(?=xy)",
+            r"[a-z]*(?=x)",
+            // Nested in an alternation branch: the JIT's combiner recurses into
+            // `Alt`, so this is the shape that would reach it if any did.
+            r"(?:x|\w*(?=ing))",
+            r"(?:\w*(?=ing)|q)",
+        ] {
+            assert!(
+                extract(pattern).is_none(),
+                "{pattern:?} now extracts; GreedyStarLookahead may have become \
+                 reachable — see the type's doc comment"
+            );
+        }
+    }
+
+    #[test]
+    fn the_non_nullable_sibling_still_takes_the_fast_path() {
+        // `+` instead of `*`: no zero-width branch, so nothing is duplicated,
+        // the tally matches, and the combined step is built. This is what the
+        // declined patterns above are missing out on.
+        let steps = extract(r"\w+(?=ing)").expect("plus form extracts");
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, PatternStep::GreedyPlusLookahead(_, _, _))),
+            "expected a combined greedy+lookahead step, got {steps:?}"
+        );
+    }
+}
