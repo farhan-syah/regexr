@@ -58,8 +58,8 @@ impl EagerDfa {
     /// Creates an EagerDfa by materializing all states from a LazyDfa.
     ///
     /// Declines with [`EagerMaterializationBudgetExceeded`] if the BFS's
-    /// cumulative work (see [`MATERIALIZATION_WORK_BUDGET`]) crosses the
-    /// budget before finishing — the caller should fall back to `LazyDfa`,
+    /// cumulative work crosses `MATERIALIZATION_WORK_BUDGET` before
+    /// finishing — the caller should fall back to `LazyDfa`,
     /// which computes the identical states/transitions on demand instead of
     /// paying for all of them upfront.
     pub fn from_lazy(lazy: &mut LazyDfa) -> Result<Self, EagerMaterializationBudgetExceeded> {

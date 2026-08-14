@@ -64,7 +64,7 @@ pub struct StateMetadata {
 pub const MATERIALIZATION_WORK_BUDGET: usize = 200_000;
 
 /// `EagerDfa::from_lazy` declined to finish materializing because its
-/// cumulative work crossed [`MATERIALIZATION_WORK_BUDGET`] — see that
+/// cumulative work crossed `MATERIALIZATION_WORK_BUDGET` — see that
 /// constant's doc for the Θ(n³) reasoning. The caller should fall back to
 /// `LazyDfa`, which computes the exact same states/transitions on demand
 /// (same `compute_all_transitions_simple`/`epsilon_closure` code), just
