@@ -4,11 +4,36 @@ All notable changes to this project are documented here. The format is based on 
 
 Each release must have a non-empty section here before it can be tagged — `.github/workflows/release-validate.yml` refuses a tag whose version has no entry, and the GitHub Release body is this file's section for that version.
 
+## [0.5.0] - 2026-08-14
+
+### Fixed
+
+- Deeply nested patterns overflowed the stack; the parser now refuses them past a nesting limit.
+- Compilation or search blew up on nested alternations, repeated zero-width groups, and shapes like `(?:a?){n}`.
+- A class could match code points it never named, and a negated class exclude them.
+- `\w`, `\W`, `\d` and `\D` in a bracketed class now honour Unicode mode, so `[\w]` and `\w` agree.
+- A lazy-DFA cache flush mid-search could truncate or drop a match, in both the interpreter and JIT-compiled code.
+- Concurrent searches on one `Regex` no longer serialize on a shared lazy DFA.
+- A greedy run before a lookahead settled too early: `[ab]+(?=b)bb` found no match in `abbabb`.
+
+### Added
+
+- `RegexBuilder::nest_limit`, the parser's nesting cap (default 250).
+- Anchored `match_at` on the tagged-NFA interpreter and its JIT.
+- `dfa::CacheCeilingExceeded`, returned when a lazy DFA outgrows its cache mid-search.
+
+### Changed
+
+- `EagerDfa::from_lazy` and `EagerDfaEngine::new`/`from_lazy` return `Result`, declining patterns too costly to materialize.
+- Lookbehind over a class of mixed UTF-8 width, like `(?<=\s)x`, is supported by the tagged-NFA interpreter.
+- `\w+(?=ing\b)` searches its lookahead literal end-first; `(?<=@)\w+` prefilters on the lookbehind literal.
+- Codepoint-class patterns like `\p{L}+` run on the tagged NFA rather than the PikeVM.
+
 ## [0.4.0] - 2026-08-13
 
 ### Fixed
 
-- A lookbehind holds when *any* path through its inner pattern ends at the current position, not only the path that pattern prefers. `(?<=..?)b` failed on `ab` and `(?<!..?)b` matched it; `(?<=\w\w?)x` and `(?<=a.*)x` failed likewise, and `(?<=ab|a)b` failed on `ab` because only the longer branch was tried.
+- A lookbehind holds when _any_ path through its inner pattern ends at the current position, not only the path that pattern prefers. `(?<=..?)b` failed on `ab` and `(?<!..?)b` matched it; `(?<=\w\w?)x` and `(?<=a.*)x` failed likewise, and `(?<=ab|a)b` failed on `ab` because only the longer branch was tried.
 - A zero-width assertion at the end of a lookaround is part of it. `(?<=a\b)`, `(?<=a$)`, `(?=a$)` and `(?!a\b)` evaluated as `(?<=a)`, `(?=a)` and `(?!a)`, so `(?<=a$)b` matched `ab` and `x(?=a$)` matched `xab`. `\b`, `$`, `\Z` and multiline `$` were all affected, in positive and negative lookahead and lookbehind alike.
 - `find` and `captures` no longer disagree on those patterns, in either direction: on `ax`, `(?<=a\b)x` reported a match from `find` and none from `captures`; on `xab`, `x(?!a\b)` reported none from `find` and a match from `captures`.
 - An assertion following a quantifier is no longer lost to it: `a*(?=b)(?=c)` matched `ab`, ignoring the second lookahead.
